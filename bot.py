@@ -35,10 +35,8 @@ intents.reactions = True        # Отслеживание звёзд
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# База данных SQLite (с поддержкой постоянного хранилища хостинга DATA_DIR)
-DATA_DIR = os.getenv("DATA_DIR", ".")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
+# База данных SQLite
+DB_PATH = "bot_database.db"
 
 def init_db():
     """Инициализация базы данных и создание таблиц."""
@@ -572,4 +570,8 @@ if __name__ == "__main__":
         print("1. Зайди на https://discord.com/developers/applications")
         print("2. Выбери своего бота -> вкладка 'Bot' слева.")
         print("3. Прокрути страницу вниз до 'Privileged Gateway Intents'.")
-        print("4. Включи
+        print("4. Включи Server Members Intent и Message Content Intent.")
+        print("5. Нажми 'Save Changes' внизу страницы.")
+        print("=" * 65 + "\n")
+    except Exception as e:
+        print(f"[Критическая ошибка запуска]: {e}")
