@@ -19,29 +19,13 @@ def ensure_package(package_name: str, import_name: str = None):
             sys.exit(1)
 
 ensure_package("discord.py", "discord")
-ensure_package("python-dotenv", "dotenv")
-
-from dotenv import load_dotenv
-
-# Загружаем переменные из локального файла .env
-load_dotenv()
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-# Токен бота загружается строго из переменной окружения или локального файла .env
-TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    print("\n" + "=" * 60)
-    print("❌ [ОШИБКА БЕЗОПАСНОСТИ] Переменная DISCORD_TOKEN не найдена!")
-    print("=" * 60)
-    print("1. Создай рядом с ботом файл с именем: .env")
-    print("2. Запиши в него строчку:")
-    print("   DISCORD_TOKEN=твой_новый_токен_из_developer_portal")
-    print("3. Перезапусти бота.")
-    print("=" * 60 + "\n")
-    sys.exit(1)
+# Токен бота (поддерживает запуск как из переменной окружения, так и прямое значение)
+TOKEN = os.getenv("DISCORD_TOKEN") or "MTU1NzY3NDgxOTUwMjM0NjMxMQ.GBQdOE.COam3N1jaIKBgvDK9soDvrVwt_tsDaYdPPKgsY"
 
 # Настройка интентов шлюза
 intents = discord.Intents.default()
@@ -51,8 +35,10 @@ intents.reactions = True        # Отслеживание звёзд
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# База данных SQLite
-DB_PATH = "bot_database.db"
+# База данных SQLite (с поддержкой постоянного хранилища хостинга DATA_DIR)
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
 
 def init_db():
     """Инициализация базы данных и создание таблиц."""
@@ -577,4 +563,13 @@ async def on_ready():
     print(banner)
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except discord.errors.PrivilegedIntentsRequired:
+        print("\n" + "=" * 65)
+        print("❌ [КРИТИЧЕСКАЯ НАСТРОЙКА DISCORD] НЕ ВКЛЮЧЕНЫ INTENTS!")
+        print("=" * 65)
+        print("1. Зайди на https://discord.com/developers/applications")
+        print("2. Выбери своего бота -> вкладка 'Bot' слева.")
+        print("3. Прокрути страницу вниз до 'Privileged Gateway Intents'.")
+        print("4. Включи
