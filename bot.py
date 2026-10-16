@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import asyncio
 import subprocess
 import sqlite3
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ except ImportError:
     pass
 
 # -------------------------------------------------------------
-# 2. SQLite Database with Persistent Storage Support
+# 2. SQLite Database with Persistent Storage & Auto-Migration
 # -------------------------------------------------------------
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -42,7 +43,7 @@ def get_db():
 
 
 def init_db():
-    """Initialize all database tables synchronously on startup."""
+    """Initialize all database tables and migrate schema synchronously on startup."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -52,10 +53,17 @@ def init_db():
                 ideas_channel_id INTEGER,
                 showcase_channel_id INTEGER,
                 star_threshold INTEGER DEFAULT 12,
-                booster_role_id INTEGER
+                booster_role_id INTEGER,
+                autorole_id INTEGER
             )
             """
         )
+        # Safe migration for existing databases that don't have autorole_id yet
+        try:
+            cursor.execute("ALTER TABLE guild_settings ADD COLUMN autorole_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS starboard_entries (
@@ -104,7 +112,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT ideas_channel_id, showcase_channel_id, star_threshold, booster_role_id
+            SELECT ideas_channel_id, showcase_channel_id, star_threshold, booster_role_id, autorole_id
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -116,12 +124,14 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
                 "showcase_channel_id": row[1],
                 "star_threshold": row[2] if row[2] is not None else 12,
                 "booster_role_id": row[3],
+                "autorole_id": row[4],
             }
         return {
             "ideas_channel_id": None,
             "showcase_channel_id": None,
             "star_threshold": 12,
             "booster_role_id": None,
+            "autorole_id": None,
         }
 
 
@@ -132,13 +142,16 @@ def update_guild_settings(guild_id: int, **kwargs):
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO guild_settings (guild_id, ideas_channel_id, showcase_channel_id, star_threshold, booster_role_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO guild_settings (
+                guild_id, ideas_channel_id, showcase_channel_id, star_threshold, booster_role_id, autorole_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
                 star_threshold = excluded.star_threshold,
-                booster_role_id = excluded.booster_role_id
+                booster_role_id = excluded.booster_role_id,
+                autorole_id = excluded.autorole_id
             """,
             (
                 guild_id,
@@ -146,6 +159,7 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["showcase_channel_id"],
                 current["star_threshold"],
                 current["booster_role_id"],
+                current["autorole_id"],
             ),
         )
         conn.commit()
@@ -409,7 +423,6 @@ def extract_post_data_from_message(message: discord.Message) -> Dict[str, Any]:
     if saved:
         return saved
 
-    # Fallback: extract directly from embed & components
     style = "announcement"
     title = ""
     content = message.content or ""
@@ -429,14 +442,12 @@ def extract_post_data_from_message(message: discord.Message) -> Dict[str, Any]:
         if emb.footer and emb.footer.text:
             footer_text = emb.footer.text
 
-        # Match color to style if possible
         if emb.color:
             for key, preset in POST_STYLES.items():
                 if preset["color"] == emb.color.value:
                     style = key
                     break
 
-    # Check if there is a link button attached
     if message.components:
         for row in message.components:
             for child in getattr(row, "children", []):
@@ -860,13 +871,87 @@ def build_jump_view(message: discord.Message, total_stars: int) -> discord.ui.Vi
 
 
 # -------------------------------------------------------------
-# 7. Interactive Control Panel (/panel) with Live Refresh
+# 7. Mass Role Assignment Helper
+# -------------------------------------------------------------
+async def execute_mass_role(interaction: discord.Interaction, role: discord.Role):
+    """Assigns a role to all human members on the server with a live progress bar."""
+    guild = interaction.guild
+    if not guild:
+        return
+
+    if guild.me.top_role <= role:
+        return await interaction.response.send_message(
+            f"❌ **Role Hierarchy Error!**\n"
+            f"My highest role ({guild.me.top_role.mention}) must be dragged **above** {role.mention} in **Server Settings ➔ Roles**.",
+            ephemeral=True,
+        )
+
+    if role.managed:
+        return await interaction.response.send_message(
+            f"❌ {role.mention} is managed by an external integration/bot and cannot be assigned manually.",
+            ephemeral=True,
+        )
+
+    members_to_update = [m for m in guild.members if not m.bot and role not in m.roles]
+    total = len(members_to_update)
+
+    if total == 0:
+        return await interaction.response.send_message(
+            f"✅ All human members on the server already have the {role.mention} role!",
+            ephemeral=True,
+        )
+
+    embed = discord.Embed(
+        title="⏳ Mass Role Assignment in Progress...",
+        description=(
+            f"Assigning {role.mention} to **{total}** members.\n"
+            f"`[░░░░░░░░░░] 0%` (`0/{total}`)"
+        ),
+        color=0x5865F2,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    added = 0
+    failed = 0
+
+    for idx, member in enumerate(members_to_update, start=1):
+        try:
+            await member.add_roles(role, reason=f"Mass role assigned by {interaction.user}")
+            added += 1
+        except discord.DiscordException:
+            failed += 1
+
+        if idx % 10 == 0 or idx == total:
+            pct = int((idx / total) * 100)
+            filled = int(pct / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            progress_embed = discord.Embed(
+                title="⏳ Mass Role Assignment in Progress..." if idx < total else "🎉 Mass Role Assignment Complete!",
+                description=(
+                    f"Target Role: {role.mention}\n"
+                    f"`[{bar}] {pct}%` (`{idx}/{total}`)\n\n"
+                    f"✅ **Assigned:** `{added}`  •  ⚠️ **Failed:** `{failed}`"
+                ),
+                color=0x5865F2 if idx < total else 0x10B981,
+                timestamp=datetime.now(timezone.utc),
+            )
+            try:
+                await interaction.edit_original_response(embed=progress_embed)
+            except discord.DiscordException:
+                pass
+
+        await asyncio.sleep(0.6)
+
+
+# -------------------------------------------------------------
+# 8. Interactive Control Panel (/panel) with Live Refresh
 # -------------------------------------------------------------
 def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     settings = get_guild_settings(guild.id)
     ideas_ch = f"<#{settings['ideas_channel_id']}>" if settings["ideas_channel_id"] else "🔴 *Not configured*"
     showcase_ch = f"<#{settings['showcase_channel_id']}>" if settings["showcase_channel_id"] else "🔴 *Not configured*"
-    role_info = f"<@&{settings['booster_role_id']}>" if settings["booster_role_id"] else "🔴 *Not configured*"
+    booster_role = f"<@&{settings['booster_role_id']}>" if settings["booster_role_id"] else "🔴 *Not configured*"
+    autorole = f"<@&{settings['autorole_id']}>" if settings["autorole_id"] else "🔴 *Not configured*"
 
     ready_status = (
         "🟢 **System Active**"
@@ -886,10 +971,11 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="💡 Ideas Channel", value=ideas_ch, inline=True)
     embed.add_field(name="🏆 Showcase Channel", value=showcase_ch, inline=True)
     embed.add_field(name="⭐ Star Threshold", value=f"**`{settings['star_threshold']} ⭐`**", inline=True)
-    embed.add_field(name="💎 Monitored Booster Role", value=role_info, inline=True)
+    embed.add_field(name="💎 Monitored Booster Role", value=booster_role, inline=True)
+    embed.add_field(name="👋 Auto-Role on Join", value=autorole, inline=True)
     embed.add_field(
-        name="📢 Post Studio",
-        value="Use `/post` to publish styled messages or right-click any bot post (**Apps ➔ ✏️ Edit Bot Post**).",
+        name="📢 Post Studio & Mass Role",
+        value="Use `/post` to publish styled messages, `/massrole` to give any role to everyone, or click the buttons below.",
         inline=False,
     )
     embed.set_footer(text=f"{guild.name} • Live Configuration", icon_url=guild.icon.url if guild.icon else None)
@@ -961,16 +1047,43 @@ class ControlPanelView(discord.ui.View):
         placeholder="💎 Select Monitored Booster Role...",
         row=2,
     )
-    async def select_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+    async def select_booster_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         role = select.values[0]
         update_guild_settings(self.guild_id, booster_role_id=role.id)
         await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
 
-    @discord.ui.button(label="Star Threshold", style=discord.ButtonStyle.primary, emoji="⭐", row=3)
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="👋 Select Auto-Role for New Members (On Join)...",
+        row=3,
+    )
+    async def select_autorole(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role = select.values[0]
+        update_guild_settings(self.guild_id, autorole_id=role.id)
+        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="Star Threshold", style=discord.ButtonStyle.primary, emoji="⭐", row=4)
     async def change_threshold(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ThresholdModal(self.guild_id, self))
 
-    @discord.ui.button(label="Create New Post", style=discord.ButtonStyle.success, emoji="📢", row=3)
+    @discord.ui.button(label="Give Auto-Role to All", style=discord.ButtonStyle.secondary, emoji="👥", row=4)
+    async def give_autorole_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = get_guild_settings(self.guild_id)
+        role_id = settings.get("autorole_id")
+        if not role_id:
+            return await interaction.response.send_message(
+                "❌ Please select an **Auto-Role for New Members** in the dropdown above first, or use `/massrole`!",
+                ephemeral=True,
+            )
+        role = interaction.guild.get_role(role_id)
+        if not role:
+            return await interaction.response.send_message(
+                "❌ The configured Auto-Role no longer exists on this server.",
+                ephemeral=True,
+            )
+        await execute_mass_role(interaction, role)
+
+    @discord.ui.button(label="Create New Post", style=discord.ButtonStyle.success, emoji="📢", row=4)
     async def quick_post(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message(
@@ -986,7 +1099,7 @@ class ControlPanelView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 8. Reaction Handling & Two-Way Star Sync
+# 9. Reaction Handling & Two-Way Star Sync
 # -------------------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
@@ -1116,10 +1229,35 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 
 # -------------------------------------------------------------
-# 9. Booster Role Revocation System
+# 10. Auto-Role on Join & Booster Role Revocation System
 # -------------------------------------------------------------
 @bot.event
+async def on_member_join(member: discord.Member):
+    """Automatically assigns the configured Auto-Role to new human members."""
+    if member.bot:
+        return
+
+    settings = get_guild_settings(member.guild.id)
+    autorole_id = settings.get("autorole_id")
+    if not autorole_id:
+        return
+
+    role = member.guild.get_role(autorole_id)
+    if not role:
+        return
+
+    try:
+        await member.add_roles(role, reason="Auto-Role assigned on server join")
+        print(f"[Auto-Role] Assigned '{role.name}' to new member {member.display_name}")
+    except discord.Forbidden:
+        print(f"[Hierarchy Warning] Cannot assign Auto-Role '{role.name}' — move bot role higher in Server Settings!")
+    except Exception as e:
+        print(f"[Auto-Role Error] {e}")
+
+
+@bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    """Automatically revokes the monitored booster role when a member's boost expires."""
     settings = get_guild_settings(after.guild.id)
     booster_role_id = settings["booster_role_id"]
     if not booster_role_id:
@@ -1140,7 +1278,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 
 # -------------------------------------------------------------
-# 10. Slash Commands & Context Menus
+# 11. Slash Commands & Context Menus
 # -------------------------------------------------------------
 @bot.tree.command(name="panel", description="Open the interactive bot control center")
 @app_commands.default_permissions(administrator=True)
@@ -1150,6 +1288,13 @@ async def panel_command(interaction: discord.Interaction):
         view=ControlPanelView(interaction.guild.id),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="massrole", description="Give a specific role to all current human members on the server")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(role="Select the role to assign to all human members")
+async def massrole_command(interaction: discord.Interaction, role: discord.Role):
+    await execute_mass_role(interaction, role)
 
 
 @bot.tree.command(name="post", description="Create and publish a styled bot message")
@@ -1215,7 +1360,6 @@ async def edit_command(
     raw = message_id_or_link.strip()
     target_msg: Optional[discord.Message] = None
 
-    # Parse full Discord jump URL: https://discord.com/channels/GUILD/CHANNEL/MESSAGE
     link_match = re.search(r"channels/\d+/(\d+)/(\d+)", raw)
     if link_match:
         ch_id = int(link_match.group(1))
@@ -1353,7 +1497,7 @@ async def on_ready():
 
 
 # -------------------------------------------------------------
-# 11. Startup Entrypoint
+# 12. Startup Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_TOKEN")
