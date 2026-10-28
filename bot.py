@@ -114,6 +114,15 @@ def init_db():
             """
         )
         cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_followers (
+                message_id INTEGER,
+                user_id INTEGER,
+                PRIMARY KEY (message_id, user_id)
+            )
+            """
+        )
+        cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_showcase_msg ON starboard_entries(showcase_message_id)"
         )
         cursor.execute(
@@ -427,6 +436,43 @@ def get_pending_events():
         return result
 
 
+def is_user_following_event(message_id: int, user_id: int) -> bool:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM event_followers WHERE message_id = ? AND user_id = ?",
+            (message_id, user_id),
+        )
+        return cursor.fetchone() is not None
+
+
+def set_event_follower(message_id: int, user_id: int, follow: bool) -> int:
+    """Adds or removes a follower in SQLite and immediately returns the updated total count."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if follow:
+            cursor.execute(
+                "INSERT OR IGNORE INTO event_followers (message_id, user_id) VALUES (?, ?)",
+                (message_id, user_id),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM event_followers WHERE message_id = ? AND user_id = ?",
+                (message_id, user_id),
+            )
+        cursor.execute(
+            "SELECT COUNT(*) FROM event_followers WHERE message_id = ?",
+            (message_id,),
+        )
+        count = cursor.fetchone()[0]
+        cursor.execute(
+            "UPDATE scheduled_events SET followers_count = ? WHERE message_id = ?",
+            (count, message_id),
+        )
+        conn.commit()
+        return count
+
+
 # -------------------------------------------------------------
 # 3. Discord Bot Setup
 # -------------------------------------------------------------
@@ -447,21 +493,51 @@ bot = commands.Bot(
 # 4. Event Scheduler Builders, Date Parser & Persistent View
 # -------------------------------------------------------------
 def parse_msk_datetime(raw: str) -> Optional[int]:
-    """Parses a Moscow Time (UTC+3) date string into a Unix timestamp."""
-    cleaned = raw.strip()
-    formats = [
+    """
+    Parses a Moscow Time (UTC+3) date/time string into a Unix timestamp.
+    Supports full dates (DD.MM.YYYY HH:MM), short dates (DD.MM HH:MM), or time today (HH:MM).
+    """
+    cleaned = " ".join(raw.strip().split())
+    now_msk = datetime.now(MSK_TZ)
+
+    full_formats = [
         "%d.%m.%Y %H:%M",
         "%Y-%m-%d %H:%M",
         "%d/%m/%Y %H:%M",
         "%d.%m.%y %H:%M",
         "%d-%m-%Y %H:%M",
     ]
-    for fmt in formats:
+    for fmt in full_formats:
         try:
             dt = datetime.strptime(cleaned, fmt).replace(tzinfo=MSK_TZ)
             return int(dt.timestamp())
         except ValueError:
             continue
+
+    # Support DD.MM HH:MM (assumes current year in MSK)
+    for short_fmt in ("%d.%m %H:%M", "%d/%m %H:%M", "%d-%m %H:%M"):
+        try:
+            parsed = datetime.strptime(cleaned, short_fmt)
+            dt = parsed.replace(year=now_msk.year, tzinfo=MSK_TZ)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+
+    # Support HH:MM (assumes today in MSK, or tomorrow if time already passed)
+    try:
+        parsed_time = datetime.strptime(cleaned, "%H:%M")
+        dt = now_msk.replace(
+            hour=parsed_time.hour,
+            minute=parsed_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if dt.timestamp() <= time.time():
+            dt += timedelta(days=1)
+        return int(dt.timestamp())
+    except ValueError:
+        pass
+
     return None
 
 
@@ -483,7 +559,7 @@ def build_event_embed(
     started: int = 0,
     followers_count: int = 0,
 ) -> discord.Embed:
-    """Builds the rich interactive Event Card with local timezone & countdown."""
+    """Builds the rich interactive Event Card with tight subtitle & no role display."""
     now = int(time.time())
     if started or now >= start_ts:
         color = 0x2ECC71
@@ -495,10 +571,11 @@ def build_event_embed(
         color = 0xEB459E
         status_badge = "📅 UPCOMING SERVER EVENT"
 
-    full_desc = ""
-    if subtitle.strip():
-        full_desc += f"### {subtitle.strip()}\n\n"
-    full_desc += f"{description.strip()}\n\n"
+    # Place subtitle directly at the very top of description without heading top-margin
+    if subtitle and subtitle.strip():
+        full_desc = f"-# {subtitle.strip()}\n\n{description.strip()}"
+    else:
+        full_desc = description.strip()
 
     embed = discord.Embed(
         title=title.strip(),
@@ -522,21 +599,18 @@ def build_event_embed(
         value="🔴 **LIVE NOW!**" if started else f"<t:{start_ts}:R>",
         inline=True,
     )
-    embed.add_field(
-        name="🔔 Notification Role",
-        value=f"<@&{role_id}> • **{followers_count}** following\n*(Ping {remind_minutes}m before start)*",
-        inline=False,
-    )
 
     if image_url and image_url.startswith(("http://", "https://")):
         embed.set_image(url=image_url.strip())
 
-    embed.set_footer(text=f"{guild.name if guild else 'Event System'} • Click 'Follow' below to get notified")
+    embed.set_footer(
+        text=f"🔔 {followers_count} following • Click 'Follow' below to get notified {remind_minutes}m before start"
+    )
     return embed
 
 
 class EventFollowView(discord.ui.View):
-    """Persistent view allowing users to toggle the event role with 1 click."""
+    """Persistent view allowing users to toggle the event role with 1 click and instant counter update."""
 
     def __init__(self, followers_count: int = 0, started: bool = False):
         super().__init__(timeout=None)
@@ -573,25 +647,28 @@ class EventFollowView(discord.ui.View):
             )
 
         member = interaction.user
+        already_following = is_user_following_event(interaction.message.id, member.id) or (role in member.roles)
+
         try:
-            if role in member.roles:
-                await member.remove_roles(role, reason=f"Unfollowed event: {ev['title']}")
-                action_msg = f"🔕 You unfollowed **{ev['title']}**. Role {role.mention} removed."
+            if already_following:
+                if role in member.roles:
+                    await member.remove_roles(role, reason=f"Unfollowed event: {ev['title']}")
+                followers_count = set_event_follower(interaction.message.id, member.id, follow=False)
+                action_msg = f"🔕 You unfollowed **{ev['title']}**. You will no longer be notified."
             else:
-                await member.add_roles(role, reason=f"Followed event: {ev['title']}")
+                if role not in member.roles:
+                    await member.add_roles(role, reason=f"Followed event: {ev['title']}")
+                followers_count = set_event_follower(interaction.message.id, member.id, follow=True)
                 action_msg = (
-                    f"🔔 You are now following **{ev['title']}**! "
-                    f"You were given {role.mention} and will be notified **{ev['remind_minutes']} minutes** before the start."
+                    f"✅ **You are now following {ev['title']}!**\n"
+                    f"🔔 You will be mentioned **{ev['remind_minutes']} minutes** before the event starts (<t:{ev['start_timestamp']}:R>)."
                 )
         except discord.Forbidden:
             return await interaction.response.send_message(
-                "❌ I don't have permission to manage that role.", ephemeral=True
+                "❌ I don't have permission to assign that role. Check role hierarchy!", ephemeral=True
             )
 
-        # Count current human members with this role
-        followers_count = sum(1 for m in role.members if not m.bot)
         ev["followers_count"] = followers_count
-        save_scheduled_event(**ev)
 
         new_embed = build_event_embed(
             guild=interaction.guild,
@@ -611,7 +688,7 @@ class EventFollowView(discord.ui.View):
 
 
 class EventComposerModal(discord.ui.Modal):
-    """Modal for creating or editing a Scheduled Event."""
+    """Modal for creating or editing a Scheduled Event with pre-filled MSK Date/Time."""
 
     title_input = discord.ui.TextInput(
         label="Event Title",
@@ -620,15 +697,15 @@ class EventComposerModal(discord.ui.Modal):
         required=True,
     )
     subtitle_input = discord.ui.TextInput(
-        label="Subtitle (Optional)",
+        label="Subtitle (Shown right under the title)",
         placeholder="e.g., Special Weekend Tournament • 2x Rewards",
         max_length=150,
         required=False,
     )
     datetime_input = discord.ui.TextInput(
-        label="Start Date & Time in MSK (DD.MM.YYYY HH:MM)",
-        placeholder="e.g., 28.10.2026 19:30 (Moscow Time UTC+3)",
-        max_length=30,
+        label="Start Date & Time in MSK (Day.Month.Year Time)",
+        placeholder="DD.MM.YYYY HH:MM (e.g., 15.11.2026 18:30)",
+        max_length=40,
         required=True,
     )
     description_input = discord.ui.TextInput(
@@ -640,7 +717,7 @@ class EventComposerModal(discord.ui.Modal):
     )
     image_input = discord.ui.TextInput(
         label="Banner Image URL (Leave blank if uploaded)",
-        placeholder="https://... (or upload from gallery via command)",
+        placeholder="https://... (or upload from gallery via /event)",
         max_length=500,
         required=False,
     )
@@ -654,7 +731,7 @@ class EventComposerModal(discord.ui.Modal):
         existing_event: Optional[Dict[str, Any]] = None,
         target_message: Optional[discord.Message] = None,
     ):
-        modal_title = "✏️ Edit Scheduled Event" if existing_event else "📅 Create Scheduled Event"
+        modal_title = "✏️ Edit Scheduled Event" if existing_event else "📅 Schedule New Event (MSK)"
         super().__init__(title=modal_title)
         self.target_channel = target_channel
         self.role = role
@@ -669,20 +746,27 @@ class EventComposerModal(discord.ui.Modal):
             self.datetime_input.default = format_msk_datetime(existing_event["start_timestamp"])
             self.description_input.default = existing_event["description"]
             self.image_input.default = uploaded_image_url or existing_event["image_url"]
-        elif uploaded_image_url:
-            self.image_input.default = uploaded_image_url
+        else:
+            # Pre-fill with a sample date 1 hour from now in MSK so it's easy to edit Day/Month/Year/Time
+            default_msk = (datetime.now(MSK_TZ) + timedelta(hours=1)).replace(minute=0, second=0)
+            self.datetime_input.default = default_msk.strftime("%d.%m.%Y %H:%M")
+            if uploaded_image_url:
+                self.image_input.default = uploaded_image_url
 
     async def on_submit(self, interaction: discord.Interaction):
         start_ts = parse_msk_datetime(self.datetime_input.value)
         if not start_ts:
             return await interaction.response.send_message(
                 "❌ **Invalid Date/Time format!**\n"
-                "Please enter Moscow Time using format `DD.MM.YYYY HH:MM` (for example: `28.10.2026 19:30`).",
+                "You can enter any Day, Month, Year, and Time in Moscow Time (MSK):\n"
+                "• Full date: `DD.MM.YYYY HH:MM` (e.g., `15.11.2026 18:30`)\n"
+                "• Short date: `DD.MM HH:MM` (e.g., `15.11 18:30`)\n"
+                "• Today/Tomorrow time: `HH:MM` (e.g., `18:30`)",
                 ephemeral=True,
             )
 
         final_image = self.uploaded_image_url or self.image_input.value.strip()
-        followers_count = sum(1 for m in self.role.members if not m.bot)
+        followers_count = self.existing_event["followers_count"] if self.existing_event else 0
         now = int(time.time())
         is_started = 1 if now >= start_ts else 0
         is_reminded = 1 if now >= start_ts - (self.remind_minutes * 60) else 0
@@ -739,15 +823,14 @@ class EventComposerModal(discord.ui.Modal):
                     remind_minutes=self.remind_minutes,
                     reminded=is_reminded,
                     started=is_started,
-                    followers_count=followers_count,
+                    followers_count=0,
                     author_id=interaction.user.id,
                 )
                 await interaction.response.send_message(
                     f"🎉 **Event Published in {self.target_channel.mention}!**\n"
                     f"• **Start Time (Local):** <t:{start_ts}:F> (<t:{start_ts}:R>)\n"
-                    f"• **Follow Role:** {self.role.mention} (Ping **{self.remind_minutes} min** before start)\n"
-                    f"• **Message ID:** `{sent.id}`\n"
-                    f"💡 *Tip: Use `/event_image` anytime to upload a new photo from your gallery, or right-click the message ➔ `Apps` ➔ `📅 Edit Event`.*",
+                    f"• **Hidden Follow Role:** {self.role.mention} (Ping **{self.remind_minutes} min** before start)\n"
+                    f"• **Message ID:** `{sent.id}`",
                     ephemeral=True,
                 )
         except discord.Forbidden:
@@ -1228,14 +1311,40 @@ async def check_scheduled_events():
 
         role = guild.get_role(ev["role_id"])
         role_mention = role.mention if role else ""
-        followers_count = sum(1 for m in role.members if not m.bot) if role else ev["followers_count"]
+        followers_count = ev["followers_count"]
 
         remind_ts = ev["start_timestamp"] - (ev["remind_minutes"] * 60)
 
         # 1) Send 10-minute (or custom) pre-start reminder
         if not ev["reminded"] and now >= remind_ts and now < ev["start_timestamp"]:
             ev["reminded"] = 1
-            ev["followers_count"] = followers_count
+            save_scheduled_event(**ev)
+
+            jump_url = f"https://discord.com/channels/{ev['guild_id']}/{ev['channel_id']}/{ev['message_id']}"
+            remind_embed = discord.Embed(
+                title=f"⏰ Starting Soon: {ev['title']}",
+                description=(
+                    f"Get ready! **{ev['title']}** begins <t:{ev['start_timestamp']}:R>!\n"
+                    f"🕒 **Start Time:** <t:{ev['start_timestamp']}:t>"
+                ),
+                color=0xE67E22,
+            )
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="View Event Card", style=discord.ButtonStyle.link, url=jump_url, emoji="📅"))
+            try:
+                await channel.send(
+                    content=f"🔔 {role_mention} — **Event starts in {ev['remind_minutes']} minutes!**",
+                    embed=remind_embed,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            except Exception as e:
+                print(f"[Event Reminder Error] {e}")
+
+        # 2) Trigger Event Start when countdown hits 0
+        if not ev["started"] and now >= ev["start_timestamp"]:
+            ev["started"] = 1
+            ev["reminded"] = 1
             save_scheduled_event(**ev)
 
             jump_url = f"https://discord.com/channels/{ev['guild_id']}/{ev['channel_id']}/{ev['message_id']}"
@@ -1474,12 +1583,12 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # -------------------------------------------------------------
 # 10. Slash Commands & Right-Click Context Menus
 # -------------------------------------------------------------
-@bot.tree.command(name="event", description="Create an interactive scheduled event with Follow button & auto-ping")
+@bot.tree.command(name="event", description="Open the Event Creator to set Day/Month/Year/Time (MSK), photo, and Follow role")
 @app_commands.describe(
     channel="Channel where the event card will be published",
-    role="Existing role given to followers & pinged before the event starts",
+    role="Role given when clicking Follow & pinged before the event starts",
     image="Upload an image directly from your gallery (optional)",
-    remind_before="Minutes before start to ping the role (Default: 10)",
+    ping_minutes_before="How many minutes before start to ping followers (Default: 10)",
 )
 @app_commands.default_permissions(administrator=True)
 async def event_command(
@@ -1487,7 +1596,7 @@ async def event_command(
     channel: discord.TextChannel,
     role: discord.Role,
     image: Optional[discord.Attachment] = None,
-    remind_before: app_commands.Range[int, 1, 120] = 10,
+    ping_minutes_before: app_commands.Range[int, 1, 120] = 10,
 ):
     if interaction.guild.me.top_role <= role:
         return await interaction.response.send_message(
@@ -1507,7 +1616,7 @@ async def event_command(
         EventComposerModal(
             target_channel=channel,
             role=role,
-            remind_minutes=remind_before,
+            remind_minutes=ping_minutes_before,
             uploaded_image_url=uploaded_url,
         )
     )
@@ -1665,9 +1774,11 @@ async def stats_command(interaction: discord.Interaction):
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def sync_guild(ctx: commands.Context):
-    bot.tree.copy_global_to(guild=ctx.guild)
-    synced = await bot.tree.sync(guild=ctx.guild)
-    await ctx.send(f"⚡ Instantly synced **{len(synced)}** commands & menus to this server!")
+    # Clear guild-level copies first so commands never duplicate with global commands
+    bot.tree.clear_commands(guild=ctx.guild)
+    await bot.tree.sync(guild=ctx.guild)
+    synced = await bot.tree.sync()
+    await ctx.send(f"⚡ Cleared duplicate guild commands and synced **{len(synced)}** global commands!")
 
 
 if __name__ == "__main__":
