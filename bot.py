@@ -697,13 +697,13 @@ class EventComposerModal(discord.ui.Modal):
         required=True,
     )
     subtitle_input = discord.ui.TextInput(
-        label="Subtitle (Shown right under the title)",
+        label="Subtitle (Right under title)",
         placeholder="e.g., Special Weekend Tournament • 2x Rewards",
         max_length=150,
         required=False,
     )
     datetime_input = discord.ui.TextInput(
-        label="Start Date & Time in MSK (Day.Month.Year Time)",
+        label="Start Date & Time (MSK / UTC+3)",
         placeholder="DD.MM.YYYY HH:MM (e.g., 15.11.2026 18:30)",
         max_length=40,
         required=True,
@@ -716,9 +716,9 @@ class EventComposerModal(discord.ui.Modal):
         required=True,
     )
     image_input = discord.ui.TextInput(
-        label="Banner Image URL (Leave blank if uploaded)",
-        placeholder="https://... (or upload from gallery via /event)",
-        max_length=500,
+        label="Banner Image URL (Optional)",
+        placeholder="Leave blank if you attached an image in /event",
+        max_length=1000,
         required=False,
     )
 
@@ -741,17 +741,16 @@ class EventComposerModal(discord.ui.Modal):
         self.target_message = target_message
 
         if existing_event:
-            self.title_input.default = existing_event["title"]
-            self.subtitle_input.default = existing_event["subtitle"]
+            self.title_input.default = existing_event["title"][:120]
+            self.subtitle_input.default = existing_event["subtitle"][:150]
             self.datetime_input.default = format_msk_datetime(existing_event["start_timestamp"])
-            self.description_input.default = existing_event["description"]
-            self.image_input.default = uploaded_image_url or existing_event["image_url"]
+            self.description_input.default = existing_event["description"][:2500]
+            if not uploaded_image_url and existing_event["image_url"]:
+                self.image_input.default = existing_event["image_url"][:1000]
         else:
             # Pre-fill with a sample date 1 hour from now in MSK so it's easy to edit Day/Month/Year/Time
             default_msk = (datetime.now(MSK_TZ) + timedelta(hours=1)).replace(minute=0, second=0)
             self.datetime_input.default = default_msk.strftime("%d.%m.%Y %H:%M")
-            if uploaded_image_url:
-                self.image_input.default = uploaded_image_url
 
     async def on_submit(self, interaction: discord.Interaction):
         start_ts = parse_msk_datetime(self.datetime_input.value)
@@ -1345,33 +1344,6 @@ async def check_scheduled_events():
         if not ev["started"] and now >= ev["start_timestamp"]:
             ev["started"] = 1
             ev["reminded"] = 1
-            save_scheduled_event(**ev)
-
-            jump_url = f"https://discord.com/channels/{ev['guild_id']}/{ev['channel_id']}/{ev['message_id']}"
-            remind_embed = discord.Embed(
-                title=f"⏰ Starting Soon: {ev['title']}",
-                description=(
-                    f"Get ready! **{ev['title']}** begins <t:{ev['start_timestamp']}:R>!\n"
-                    f"🕒 **Start Time:** <t:{ev['start_timestamp']}:t>"
-                ),
-                color=0xE67E22,
-            )
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label="View Event Card", style=discord.ButtonStyle.link, url=jump_url, emoji="📅"))
-            try:
-                await channel.send(
-                    content=f"🔔 {role_mention} — **Event starts in {ev['remind_minutes']} minutes!**",
-                    embed=remind_embed,
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions(roles=True),
-                )
-            except Exception as e:
-                print(f"[Event Reminder Error] {e}")
-
-        # 2) Trigger Event Start when countdown hits 0
-        if not ev["started"] and now >= ev["start_timestamp"]:
-            ev["started"] = 1
-            ev["reminded"] = 1
             ev["followers_count"] = followers_count
             save_scheduled_event(**ev)
 
@@ -1583,12 +1555,19 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # -------------------------------------------------------------
 # 10. Slash Commands & Right-Click Context Menus
 # -------------------------------------------------------------
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[AppCommand Error] {error}")
+    if not interaction.response.is_done():
+        await interaction.response.send_message(f"❌ Command error: `{error}`", ephemeral=True)
+
+
 @bot.tree.command(name="event", description="Open the Event Creator to set Day/Month/Year/Time (MSK), photo, and Follow role")
 @app_commands.describe(
     channel="Channel where the event card will be published",
     role="Role given when clicking Follow & pinged before the event starts",
     image="Upload an image directly from your gallery (optional)",
-    ping_minutes_before="How many minutes before start to ping followers (Default: 10)",
+    remind_before="How many minutes before start to ping followers (Default: 10)",
 )
 @app_commands.default_permissions(administrator=True)
 async def event_command(
@@ -1596,9 +1575,9 @@ async def event_command(
     channel: discord.TextChannel,
     role: discord.Role,
     image: Optional[discord.Attachment] = None,
-    ping_minutes_before: app_commands.Range[int, 1, 120] = 10,
+    remind_before: app_commands.Range[int, 1, 120] = 10,
 ):
-    if interaction.guild.me.top_role <= role:
+    if interaction.guild and interaction.guild.me.top_role <= role:
         return await interaction.response.send_message(
             f"❌ My highest role ({interaction.guild.me.top_role.mention}) must be placed **above** {role.mention} in **Server Settings ➔ Roles** so I can give it to followers!",
             ephemeral=True,
@@ -1616,7 +1595,7 @@ async def event_command(
         EventComposerModal(
             target_channel=channel,
             role=role,
-            remind_minutes=ping_minutes_before,
+            remind_minutes=remind_before,
             uploaded_image_url=uploaded_url,
         )
     )
