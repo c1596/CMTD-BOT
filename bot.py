@@ -48,6 +48,11 @@ WFL_EMOJI_CACHE: Dict[int, List[discord.Emoji]] = {}
 STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 
+# Temporary Voice RAM State
+TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
+VOICE_CREATE_COOLDOWNS: Dict[int, float] = {}
+VOICE_INACTIVITY_SECONDS = 300  # 5 minutes of inactivity
+
 WFL_EMOJI_NAMES = ("w1_win", "w1_fair", "w1_lose")
 POLL_NUM_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 
@@ -72,15 +77,32 @@ def init_db():
                 star_threshold INTEGER DEFAULT 12,
                 booster_role_id INTEGER,
                 autorole_id INTEGER,
-                wfl_channel_id INTEGER
+                wfl_channel_id INTEGER,
+                jtc_channel_id INTEGER
             )
             """
         )
         c.execute("PRAGMA table_info(guild_settings)")
         cols = {row[1] for row in c.fetchall()}
-        for col_name in ("booster_role_id", "autorole_id", "wfl_channel_id"):
+        for col_name in ("booster_role_id", "autorole_id", "wfl_channel_id", "jtc_channel_id"):
             if col_name not in cols:
                 c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} INTEGER")
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temp_voices (
+                channel_id INTEGER PRIMARY KEY,
+                guild_id INTEGER,
+                owner_id INTEGER,
+                control_message_id INTEGER DEFAULT 0,
+                created_at INTEGER,
+                last_active_at INTEGER,
+                last_renamed_at INTEGER DEFAULT 0,
+                is_locked INTEGER DEFAULT 0,
+                is_hidden INTEGER DEFAULT 0
+            )
+            """
+        )
 
         c.execute(
             """
@@ -225,7 +247,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
         c.execute(
             """
             SELECT ideas_channel_id, showcase_channel_id, star_threshold,
-                   booster_role_id, autorole_id, wfl_channel_id
+                   booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -238,6 +260,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "booster_role_id": row[3] if row else None,
             "autorole_id": row[4] if row else None,
             "wfl_channel_id": row[5] if row else None,
+            "jtc_channel_id": row[6] if row else None,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -253,16 +276,17 @@ def update_guild_settings(guild_id: int, **kwargs):
             """
             INSERT INTO guild_settings (
                 guild_id, ideas_channel_id, showcase_channel_id,
-                star_threshold, booster_role_id, autorole_id, wfl_channel_id
+                star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
                 star_threshold = excluded.star_threshold,
                 booster_role_id = excluded.booster_role_id,
                 autorole_id = excluded.autorole_id,
-                wfl_channel_id = excluded.wfl_channel_id
+                wfl_channel_id = excluded.wfl_channel_id,
+                jtc_channel_id = excluded.jtc_channel_id
             """,
             (
                 guild_id,
@@ -272,6 +296,7 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["booster_role_id"],
                 current["autorole_id"],
                 current["wfl_channel_id"],
+                current["jtc_channel_id"],
             ),
         )
         conn.commit()
@@ -310,6 +335,7 @@ class CommunityBot(commands.Bot):
         intents.message_content = True
         intents.members = True
         intents.reactions = True
+        intents.voice_states = True
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -320,6 +346,7 @@ class CommunityBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(PollView(option_count=5, closed=False))
         self.add_view(EventFollowView(count=0, disabled=False))
+        self.add_view(VoiceControlView())
         if not background_scheduler.is_running():
             background_scheduler.start()
 
@@ -328,7 +355,460 @@ bot = CommunityBot()
 
 
 # -------------------------------------------------------------
-# 4. Post Studio Presets & Builders
+# 4. Private Temporary Voice Channels (Join to Create)
+# -------------------------------------------------------------
+def load_temp_voices_from_db():
+    TEMP_VOICE_CACHE.clear()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT channel_id, guild_id, owner_id, control_message_id,
+                   created_at, last_active_at, last_renamed_at, is_locked, is_hidden
+            FROM temp_voices
+            """
+        )
+        for row in c.fetchall():
+            TEMP_VOICE_CACHE[row[0]] = {
+                "channel_id": row[0],
+                "guild_id": row[1],
+                "owner_id": row[2],
+                "control_message_id": row[3] or 0,
+                "created_at": row[4] or int(time.time()),
+                "last_active_at": row[5] or int(time.time()),
+                "last_renamed_at": row[6] or 0,
+                "is_locked": bool(row[7]),
+                "is_hidden": bool(row[8]),
+            }
+
+
+load_temp_voices_from_db()
+
+
+def save_temp_voice(room: Dict[str, Any]):
+    TEMP_VOICE_CACHE[room["channel_id"]] = room
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO temp_voices (
+                channel_id, guild_id, owner_id, control_message_id,
+                created_at, last_active_at, last_renamed_at, is_locked, is_hidden
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                room["channel_id"],
+                room["guild_id"],
+                room["owner_id"],
+                room.get("control_message_id", 0),
+                room["created_at"],
+                room["last_active_at"],
+                room.get("last_renamed_at", 0),
+                1 if room.get("is_locked") else 0,
+                1 if room.get("is_hidden") else 0,
+            ),
+        )
+        conn.commit()
+
+
+def touch_temp_voice_activity(channel_id: int):
+    room = TEMP_VOICE_CACHE.get(channel_id)
+    if not room:
+        return
+    now_ts = int(time.time())
+    # Throttle DB writes to once every 10 seconds while keeping RAM instant
+    should_persist = (now_ts - room.get("last_active_at", 0)) >= 10
+    room["last_active_at"] = now_ts
+    if should_persist:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE temp_voices SET last_active_at = ? WHERE channel_id = ?",
+                (now_ts, channel_id),
+            )
+            conn.commit()
+
+
+def remove_temp_voice_record(channel_id: int):
+    TEMP_VOICE_CACHE.pop(channel_id, None)
+    with get_db() as conn:
+        conn.execute("DELETE FROM temp_voices WHERE channel_id = ?", (channel_id,))
+        conn.commit()
+
+
+async def delete_temp_voice_channel(channel: discord.VoiceChannel, reason: str):
+    remove_temp_voice_record(channel.id)
+    try:
+        await channel.delete(reason=reason)
+    except Exception:
+        pass
+
+
+def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any]) -> discord.Embed:
+    status_badges = []
+    status_badges.append("🔒 **Locked**" if room.get("is_locked") else "🔓 **Open**")
+    status_badges.append("🙈 **Hidden**" if room.get("is_hidden") else "👁️ **Visible**")
+    limit_str = f"`{channel.user_limit}` slots" if channel.user_limit > 0 else "`Unlimited`"
+    status_badges.append(f"👥 {limit_str}")
+
+    embed = discord.Embed(
+        title="🎛️ Private Voice Room Controls",
+        description=(
+            f"**Room Owner:** <@{room['owner_id']}>\n"
+            f"**Status:** {' • '.join(status_badges)}\n\n"
+            "Use the buttons and menus below to customize access, user limit, or room name.\n"
+            "-# ⏱️ Rooms auto-delete immediately when everyone leaves or after **5 minutes** of inactivity."
+        ),
+        color=0xE74C3C if room.get("is_locked") else 0x2ECC71,
+    )
+    embed.set_footer(text=f"Room ID: {channel.id}")
+    return embed
+
+
+async def refresh_voice_control_panel(channel: discord.VoiceChannel, room: Dict[str, Any]):
+    msg_id = room.get("control_message_id", 0)
+    if not msg_id:
+        return
+    try:
+        msg = await channel.fetch_message(msg_id)
+        await msg.edit(embed=build_voice_control_embed(channel, room), view=VoiceControlView())
+    except Exception:
+        pass
+
+
+class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
+    name_input = discord.ui.TextInput(
+        label="New Room Name",
+        style=discord.TextStyle.short,
+        required=True,
+        min_length=2,
+        max_length=40,
+        placeholder="e.g. Ranked Squad | Need 2",
+    )
+
+    def __init__(self, channel: discord.VoiceChannel, room: Dict[str, Any]):
+        super().__init__()
+        self.channel = channel
+        self.room = room
+        self.name_input.default = channel.name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        now_ts = int(time.time())
+        last_ren = self.room.get("last_renamed_at", 0)
+        if now_ts - last_ren < 300:
+            ready_ts = last_ren + 300
+            return await interaction.response.send_message(
+                f"⏳ Discord limits channel renames. You can rename again <t:{ready_ts}:R>.",
+                ephemeral=True,
+            )
+        new_name = self.name_input.value.strip()
+        try:
+            await self.channel.edit(name=new_name, reason=f"Renamed by room owner {interaction.user}")
+            self.room["last_renamed_at"] = now_ts
+            self.room["last_active_at"] = now_ts
+            save_temp_voice(self.room)
+            await interaction.response.send_message(f"✅ Room renamed to **{new_name}**!", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Could not rename room: `{e}`", ephemeral=True)
+
+
+class VoiceLimitModal(discord.ui.Modal, title="Set Room User Limit"):
+    limit_input = discord.ui.TextInput(
+        label="Max Members (0 = Unlimited, 1 - 99)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=2,
+        placeholder="e.g. 4",
+    )
+
+    def __init__(self, channel: discord.VoiceChannel, room: Dict[str, Any]):
+        super().__init__()
+        self.channel = channel
+        self.room = room
+        self.limit_input.default = str(channel.user_limit)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.limit_input.value.strip()
+        if not val.isdigit() or not (0 <= int(val) <= 99):
+            return await interaction.response.send_message("❌ Enter a number from `0` to `99`.", ephemeral=True)
+        limit = int(val)
+        await self.channel.edit(user_limit=limit, reason=f"Limit updated by {interaction.user}")
+        self.room["last_active_at"] = int(time.time())
+        save_temp_voice(self.room)
+        await refresh_voice_control_panel(self.channel, self.room)
+        msg = "👥 User limit removed (`Unlimited`)." if limit == 0 else f"👥 User limit set to **{limit}**."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+class VoiceControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _get_room_and_verify_owner(
+        self, interaction: discord.Interaction
+    ) -> Tuple[Optional[discord.VoiceChannel], Optional[Dict[str, Any]], Optional[str]]:
+        if not interaction.guild or not isinstance(interaction.channel, discord.VoiceChannel):
+            return None, None, "❌ This control panel only works inside a temporary voice channel."
+        room = TEMP_VOICE_CACHE.get(interaction.channel.id)
+        if not room:
+            return None, None, "❌ Room data not found."
+        if interaction.user.id != room["owner_id"]:
+            return None, None, f"❌ Only the room owner (<@{room['owner_id']}>) can change room settings."
+        return interaction.channel, room, None
+
+    @discord.ui.button(label="Lock / Unlock", style=discord.ButtonStyle.secondary, emoji="🔒", custom_id="vc_ctrl:lock", row=0)
+    async def lock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        new_locked = not room.get("is_locked", False)
+        everyone = vc.guild.default_role
+        ow = vc.overwrites_for(everyone)
+        ow.connect = False if new_locked else None
+        await vc.set_permissions(everyone, overwrite=ow, reason="Room lock toggled")
+
+        owner_member = vc.guild.get_member(room["owner_id"])
+        if owner_member:
+            await vc.set_permissions(owner_member, connect=True, view_channel=True, manage_channels=True)
+
+        room["is_locked"] = new_locked
+        room["last_active_at"] = int(time.time())
+        save_temp_voice(room)
+        await refresh_voice_control_panel(vc, room)
+        await interaction.response.send_message(
+            "🔒 Room **locked**! Only trusted users can join." if new_locked else "🔓 Room **unlocked** for everyone!",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Hide / Show", style=discord.ButtonStyle.secondary, emoji="👁️", custom_id="vc_ctrl:hide", row=0)
+    async def hide_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        new_hidden = not room.get("is_hidden", False)
+        everyone = vc.guild.default_role
+        ow = vc.overwrites_for(everyone)
+        ow.view_channel = False if new_hidden else None
+        await vc.set_permissions(everyone, overwrite=ow, reason="Room visibility toggled")
+
+        owner_member = vc.guild.get_member(room["owner_id"])
+        if owner_member:
+            await vc.set_permissions(owner_member, connect=True, view_channel=True, manage_channels=True)
+
+        room["is_hidden"] = new_hidden
+        room["last_active_at"] = int(time.time())
+        save_temp_voice(room)
+        await refresh_voice_control_panel(vc, room)
+        await interaction.response.send_message(
+            "🙈 Room is now **hidden** from the channel list." if new_hidden else "👁️ Room is now **visible** to everyone.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Rename", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id="vc_ctrl:rename", row=0)
+    async def rename_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await interaction.response.send_modal(VoiceRenameModal(vc, room))
+
+    @discord.ui.button(label="Limit", style=discord.ButtonStyle.secondary, emoji="👥", custom_id="vc_ctrl:limit", row=0)
+    async def limit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await interaction.response.send_modal(VoiceLimitModal(vc, room))
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, emoji="👑", custom_id="vc_ctrl:claim", row=0)
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.channel, discord.VoiceChannel):
+            return
+        vc = interaction.channel
+        room = TEMP_VOICE_CACHE.get(vc.id)
+        if not room:
+            return await interaction.response.send_message("❌ Room data not found.", ephemeral=True)
+
+        if interaction.user.id == room["owner_id"]:
+            return await interaction.response.send_message("👑 You already own this room!", ephemeral=True)
+
+        if not isinstance(interaction.user, discord.Member) or interaction.user not in vc.members:
+            return await interaction.response.send_message("❌ You must be connected to this voice channel to claim it.", ephemeral=True)
+
+        current_owner = vc.guild.get_member(room["owner_id"])
+        if current_owner and current_owner in vc.members:
+            return await interaction.response.send_message(
+                f"❌ Current owner {current_owner.mention} is still in the voice channel!",
+                ephemeral=True,
+            )
+
+        room["owner_id"] = interaction.user.id
+        room["last_active_at"] = int(time.time())
+        save_temp_voice(room)
+        await vc.set_permissions(interaction.user, connect=True, view_channel=True, manage_channels=True)
+        await refresh_voice_control_panel(vc, room)
+        await interaction.response.send_message(f"👑 {interaction.user.mention} claimed ownership of this voice room!")
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="✅ Allow / Trust Users (can join even if locked)...",
+        min_values=1,
+        max_values=5,
+        custom_id="vc_ctrl:allow",
+        row=1,
+    )
+    async def allow_users_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        allowed_mentions = []
+        for target in select.values:
+            if target.bot:
+                continue
+            await vc.set_permissions(target, connect=True, view_channel=True, reason="Trusted by room owner")
+            allowed_mentions.append(target.mention)
+
+        room["last_active_at"] = int(time.time())
+        save_temp_voice(room)
+        if not allowed_mentions:
+            return await interaction.response.send_message("⚠️ Please select human members.", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ Granted access to: {', '.join(allowed_mentions)}",
+            ephemeral=True,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="🚫 Kick & Block Users from connecting...",
+        min_values=1,
+        max_values=5,
+        custom_id="vc_ctrl:block",
+        row=2,
+    )
+    async def block_users_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        blocked_mentions = []
+        for target in select.values:
+            if target.bot or target.id == room["owner_id"]:
+                continue
+            await vc.set_permissions(target, connect=False, reason="Blocked by room owner")
+            if isinstance(target, discord.Member) and target in vc.members:
+                try:
+                    await target.move_to(None, reason="Kicked by room owner")
+                except Exception:
+                    pass
+            blocked_mentions.append(target.mention)
+
+        room["last_active_at"] = int(time.time())
+        save_temp_voice(room)
+        if not blocked_mentions:
+            return await interaction.response.send_message("⚠️ Cannot block yourself or bots.", ephemeral=True)
+        await interaction.response.send_message(
+            f"🚫 Kicked & blocked: {', '.join(blocked_mentions)}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Delete Room", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="vc_ctrl:delete", row=3)
+    async def delete_room_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await interaction.response.send_message("🗑️ Closing voice room...", ephemeral=True)
+        await delete_temp_voice_channel(vc, reason=f"Closed by owner {interaction.user}")
+
+
+async def handle_join_to_create(member: discord.Member, trigger_channel: discord.VoiceChannel):
+    guild = member.guild
+    now = time.time()
+
+    # Check if user already owns an active room in this guild
+    for ch_id, room in list(TEMP_VOICE_CACHE.items()):
+        if room["guild_id"] == guild.id and room["owner_id"] == member.id:
+            existing_vc = guild.get_channel(ch_id)
+            if isinstance(existing_vc, discord.VoiceChannel):
+                try:
+                    await member.move_to(existing_vc, reason="Moved to existing temporary voice room")
+                    touch_temp_voice_activity(existing_vc.id)
+                except Exception:
+                    pass
+                return
+            else:
+                remove_temp_voice_record(ch_id)
+
+    # Anti-spam cooldown (15 seconds per user)
+    last_created = VOICE_CREATE_COOLDOWNS.get(member.id, 0.0)
+    if now - last_created < 15.0:
+        return
+    VOICE_CREATE_COOLDOWNS[member.id] = now
+
+    overwrites = {
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            manage_channels=True,
+            move_members=True,
+            send_messages=True,
+        ),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            manage_channels=True,
+        ),
+    }
+
+    room_name = f"🔊 {member.display_name}'s Room"[:95]
+    try:
+        new_vc = await guild.create_voice_channel(
+            name=room_name,
+            category=trigger_channel.category,
+            overwrites=overwrites,
+            reason=f"Join-to-Create room for {member}",
+        )
+    except Exception as e:
+        print(f"[TempVoice] Failed to create voice channel: {e}")
+        return
+
+    try:
+        await member.move_to(new_vc, reason="Moved to newly created voice room")
+    except Exception:
+        # User disconnected before move completed -> cleanup immediately
+        try:
+            await new_vc.delete(reason="User disconnected before move")
+        except Exception:
+            pass
+        return
+
+    now_ts = int(time.time())
+    room_data = {
+        "channel_id": new_vc.id,
+        "guild_id": guild.id,
+        "owner_id": member.id,
+        "control_message_id": 0,
+        "created_at": now_ts,
+        "last_active_at": now_ts,
+        "last_renamed_at": 0,
+        "is_locked": False,
+        "is_hidden": False,
+    }
+    save_temp_voice(room_data)
+
+    try:
+        ctrl_msg = await new_vc.send(
+            content=f"👋 Welcome {member.mention}!",
+            embed=build_voice_control_embed(new_vc, room_data),
+            view=VoiceControlView(),
+        )
+        room_data["control_message_id"] = ctrl_msg.id
+        save_temp_voice(room_data)
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------
+# 5. Post Studio Presets & Builders
 # -------------------------------------------------------------
 POST_STYLES: Dict[str, Dict[str, Any]] = {
     "announcement": {
@@ -694,7 +1174,7 @@ class StyleSwitcherView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 5. Live Interactive Polls System (/poll)
+# 6. Live Interactive Polls System (/poll)
 # -------------------------------------------------------------
 def pack_options(options: List[str]) -> str:
     return "\n".join(opt.replace("\n", " ").strip() for opt in options if opt.strip())
@@ -1042,7 +1522,7 @@ class PollCreatorModal(discord.ui.Modal, title="Create Community Poll"):
 
 
 # -------------------------------------------------------------
-# 6. Event Scheduling System (/event, /event_image, Follow)
+# 7. Event Scheduling System (/event, /event_image, Follow)
 # -------------------------------------------------------------
 def parse_msk_datetime(raw: str) -> Optional[int]:
     raw = raw.strip()
@@ -1331,7 +1811,7 @@ class EventComposerModal(discord.ui.Modal):
 
 
 # -------------------------------------------------------------
-# 7. Starboard / Ideas Showcase System (O(1) Deduplication)
+# 8. Starboard / Ideas Showcase System (O(1) Deduplication)
 # -------------------------------------------------------------
 def build_showcase_embed(message: discord.Message, stars: int) -> discord.Embed:
     if stars >= 50:
@@ -1499,7 +1979,7 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 
 
 # -------------------------------------------------------------
-# 8. Admin Control Panel (/panel)
+# 9. Admin Control Panel (/panel)
 # -------------------------------------------------------------
 class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
     threshold_input = discord.ui.TextInput(
@@ -1520,11 +2000,43 @@ class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
         await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=ControlPanelView())
 
 
+class TempVoiceSetupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.voice],
+        placeholder="🔊 Select Join-to-Create Trigger Voice Channel...",
+        row=0,
+    )
+    async def select_jtc_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        if not interaction.guild:
+            return
+        chosen = select.values[0]
+        update_guild_settings(interaction.guild.id, jtc_channel_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Members joining it will get a private customizable room.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Disable Temp Voice", style=discord.ButtonStyle.danger, emoji="🧹", row=1)
+    async def disable_jtc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        update_guild_settings(interaction.guild.id, jtc_channel_id=None)
+        await interaction.response.edit_message(
+            content="🧹 Join-to-Create Private Voice Channels disabled.",
+            view=None,
+        )
+
+
 def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     s = get_guild_settings(guild.id)
     ideas = f"<#{s['ideas_channel_id']}>" if s["ideas_channel_id"] else "`Not Set`"
     showcase = f"<#{s['showcase_channel_id']}>" if s["showcase_channel_id"] else "`Not Set`"
     wfl = f"<#{s['wfl_channel_id']}>" if s["wfl_channel_id"] else "`Not Set`"
+    jtc = f"<#{s['jtc_channel_id']}>" if s["jtc_channel_id"] else "`Not Set`"
     booster = f"<@&{s['booster_role_id']}>" if s["booster_role_id"] else "`Not Set`"
     autorole = f"<@&{s['autorole_id']}>" if s["autorole_id"] else "`Not Set`"
 
@@ -1533,7 +2045,7 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L auto-reactions, Booster Guard, and Auto-Role below.",
+        description="Configure Starboard, W/F/L auto-reactions, Private Voice Rooms, Booster Guard, and Auto-Role below.",
         color=0x5865F2,
     )
     embed.add_field(name="💡 Ideas Channel", value=ideas, inline=True)
@@ -1541,6 +2053,7 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="⭐ Star Threshold", value=f"**{s['star_threshold']}** stars", inline=True)
     embed.add_field(name="⚖️ W/F/L Channel", value=wfl, inline=True)
     embed.add_field(name="🎯 W/F/L Emojis", value=wfl_status, inline=True)
+    embed.add_field(name="🔊 Join-to-Create", value=jtc, inline=True)
     embed.add_field(name="🚀 Booster Role", value=booster, inline=True)
     embed.add_field(name="👋 Join Auto-Role", value=autorole, inline=True)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members")
@@ -1591,9 +2104,19 @@ class ControlPanelView(discord.ui.View):
         update_guild_settings(interaction.guild.id, autorole_id=select.values[0].id)
         await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
 
-    @discord.ui.button(label="Set Star Threshold", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
+    @discord.ui.button(label="Star Threshold", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
     async def set_threshold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ThresholdModal())
+
+    @discord.ui.button(label="Temp Voice", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
+    async def setup_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "🔊 **Private Voice Rooms Setup**\n"
+            "Select a voice channel below. Whenever someone joins it, the bot will create a personal room for them "
+            "(auto-deleted when empty or after **5 minutes** of inactivity):",
+            view=TempVoiceSetupView(),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Create Post", style=discord.ButtonStyle.primary, emoji="📢", row=4)
     async def quick_post_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1602,14 +2125,14 @@ class ControlPanelView(discord.ui.View):
                 PostComposerModal(style_key="announcement", target_channel=interaction.channel)
             )
 
-    @discord.ui.button(label="Clear W/F/L & Auto-Role", style=discord.ButtonStyle.danger, emoji="🧹", row=4)
+    @discord.ui.button(label="Reset Extra", style=discord.ButtonStyle.danger, emoji="🧹", row=4)
     async def clear_optional_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(interaction.guild.id, wfl_channel_id=None, autorole_id=None)
+        update_guild_settings(interaction.guild.id, wfl_channel_id=None, autorole_id=None, jtc_channel_id=None)
         await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
 
 
 # -------------------------------------------------------------
-# 9. Slash Commands & Context Menus
+# 10. Slash Commands & Context Menus
 # -------------------------------------------------------------
 @bot.tree.command(name="panel", description="Open the server configuration panel")
 @app_commands.default_permissions(administrator=True)
@@ -1865,7 +2388,7 @@ async def stats_cmd(interaction: discord.Interaction):
     embed.add_field(name="🌟 Showcased Ideas", value=f"`{total_ideas}`", inline=True)
     embed.add_field(name="📊 Active Polls", value=f"`{active_polls}`", inline=True)
     embed.add_field(name="📅 Upcoming Events", value=f"`{active_events}`", inline=True)
-    embed.add_field(name="⚡ Cache", value="`WAL + RAM Active`", inline=True)
+    embed.add_field(name="🔊 Active Temp Voices", value=f"`{len(TEMP_VOICE_CACHE)}`", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1937,11 +2460,22 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 
 
 # -------------------------------------------------------------
-# 10. Event Listeners & Background Scheduler
+# 11. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
 @bot.event
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
+    # Reconcile temporary voice rooms on startup
+    now_ts = int(time.time())
+    for ch_id, room in list(TEMP_VOICE_CACHE.items()):
+        guild = bot.get_guild(room["guild_id"])
+        ch = guild.get_channel(ch_id) if guild else None
+        if not isinstance(ch, discord.VoiceChannel):
+            remove_temp_voice_record(ch_id)
+            continue
+        humans = [m for m in ch.members if not m.bot]
+        if not humans or (now_ts - room["last_active_at"] >= VOICE_INACTIVITY_SECONDS):
+            await delete_temp_voice_channel(ch, reason="Startup cleanup of empty/inactive temp voice")
 
 
 @bot.event
@@ -1950,11 +2484,42 @@ async def on_guild_emojis_update(guild: discord.Guild, before, after):
 
 
 @bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    guild = member.guild
+    settings = get_guild_settings(guild.id)
+    jtc_id = settings.get("jtc_channel_id")
+
+    # 1. User left or changed state in an existing temporary voice channel
+    if before.channel and before.channel.id in TEMP_VOICE_CACHE:
+        humans_left = [m for m in before.channel.members if not m.bot]
+        if len(humans_left) == 0:
+            await delete_temp_voice_channel(before.channel, reason="All members left temporary voice channel")
+        else:
+            touch_temp_voice_activity(before.channel.id)
+
+    # 2. User joined or changed state (unmute/stream/video) inside a temporary voice channel
+    if after.channel and after.channel.id in TEMP_VOICE_CACHE:
+        touch_temp_voice_activity(after.channel.id)
+
+    # 3. User joined the Join-to-Create trigger channel
+    if jtc_id and after.channel and after.channel.id == jtc_id:
+        if not before.channel or before.channel.id != jtc_id:
+            await handle_join_to_create(member, after.channel)
+
+
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     if message.guild:
+        # Track text chat activity inside temporary voice channels
+        if message.channel.id in TEMP_VOICE_CACHE:
+            touch_temp_voice_activity(message.channel.id)
+
         settings = get_guild_settings(message.guild.id)
 
         if settings["ideas_channel_id"] and message.channel.id == settings["ideas_channel_id"]:
@@ -2016,7 +2581,20 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def background_scheduler():
     now_ts = int(time.time())
 
-    # 1. Check expired polls
+    # 1. Check temporary voice rooms for empty state or 5-minute inactivity
+    for ch_id, room in list(TEMP_VOICE_CACHE.items()):
+        guild = bot.get_guild(room["guild_id"])
+        ch = guild.get_channel(ch_id) if guild else None
+        if not isinstance(ch, discord.VoiceChannel):
+            remove_temp_voice_record(ch_id)
+            continue
+        humans = [m for m in ch.members if not m.bot]
+        if len(humans) == 0:
+            await delete_temp_voice_channel(ch, reason="Temporary voice channel empty")
+        elif now_ts - room["last_active_at"] >= VOICE_INACTIVITY_SECONDS:
+            await delete_temp_voice_channel(ch, reason="Temporary voice channel inactive for 5 minutes")
+
+    # 2. Check expired polls
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
@@ -2040,7 +2618,7 @@ async def background_scheduler():
             except Exception:
                 pass
 
-    # 2. Check scheduled events reminders & start
+    # 3. Check scheduled events reminders & start
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
@@ -2130,7 +2708,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # -------------------------------------------------------------
-# 11. Entrypoint
+# 12. Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
