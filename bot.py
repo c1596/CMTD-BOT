@@ -245,8 +245,13 @@ def update_guild_settings(guild_id: int, **kwargs):
 def get_wfl_emojis(guild: discord.Guild) -> List[discord.Emoji]:
     if guild.id in WFL_EMOJI_CACHE:
         return WFL_EMOJI_CACHE[guild.id]
-    emoji_map = {e.name.lower(): e for e in guild.emojis}
-    found = [emoji_map[name] for name in WFL_EMOJI_NAMES if name in emoji_map]
+    guild_map = {e.name.lower(): e for e in guild.emojis}
+    bot_map = {e.name.lower(): e for e in bot.emojis}
+    found = []
+    for name in WFL_EMOJI_NAMES:
+        em = guild_map.get(name) or bot_map.get(name)
+        if em:
+            found.append(em)
     WFL_EMOJI_CACHE[guild.id] = found
     return found
 
@@ -270,7 +275,6 @@ class CommunityBot(commands.Bot):
         intents.message_content = True
         intents.members = True
         intents.reactions = True
-        intents.emojis = True
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -281,7 +285,8 @@ class CommunityBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(PollView(option_count=5, closed=False))
         self.add_view(EventFollowView(count=0, disabled=False))
-        self.background_scheduler.start()
+        if not background_scheduler.is_running():
+            background_scheduler.start()
 
 
 bot = CommunityBot()
@@ -432,7 +437,6 @@ def load_post_data_from_message(message: discord.Message) -> Dict[str, Any]:
             "button_label": row[5] or "",
             "button_url": row[6] or "",
         }
-    # Fallback: extract directly from existing bot embed
     emb = message.embeds[0] if message.embeds else None
     btn_label, btn_url = "", ""
     for row_comp in message.components:
@@ -501,7 +505,11 @@ class PostComposerModal(discord.ui.Modal):
             default=d.get("footer_text", ""),
             placeholder="Leave empty for server name",
         )
-        default_btn = f"{d['button_label']} | {d['button_url']}" if d.get("button_label") and d.get("button_url") else ""
+        default_btn = (
+            f"{d['button_label']} | {d['button_url']}"
+            if d.get("button_label") and d.get("button_url")
+            else ""
+        )
         self.button_input = discord.ui.TextInput(
             label="Link Button: Label | URL",
             style=discord.TextStyle.short,
@@ -628,6 +636,18 @@ class StyleSwitcherView(discord.ui.View):
             content=f"✅ Style changed to **{POST_STYLES[new_style]['name']}**!",
             view=None,
         )
+
+    @discord.ui.button(label="Pin / Unpin", style=discord.ButtonStyle.secondary, emoji="📌", row=1)
+    async def pin_post_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if self.target_message.pinned:
+                await self.target_message.unpin()
+                await interaction.response.send_message("📌 Post unpinned.", ephemeral=True)
+            else:
+                await self.target_message.pin()
+                await interaction.response.send_message("📌 Post pinned!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Missing `Manage Messages` permission to pin.", ephemeral=True)
 
     @discord.ui.button(label="Delete Post", style=discord.ButtonStyle.danger, emoji="🗑️", row=1)
     async def delete_post_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1363,7 +1383,6 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
                 row = c.fetchone()
                 showcase_msg_id = row[0] if row else None
 
-                # Already showcased -> lock voting on original post
                 if showcase_msg_id and is_add:
                     try:
                         ch = guild.get_channel(ideas_ch_id)
@@ -1841,7 +1860,7 @@ async def ctx_style_post(interaction: discord.Interaction, message: discord.Mess
         return await interaction.response.send_message("❌ Select a message sent by this bot.", ephemeral=True)
     data = load_post_data_from_message(message)
     await interaction.response.send_message(
-        "🎨 Choose a new style or delete this post:",
+        "🎨 Choose a new style, pin, or delete this post:",
         view=StyleSwitcherView(message, data),
         ephemeral=True,
     )
@@ -1902,6 +1921,13 @@ async def on_message(message: discord.Message):
 
     if message.guild:
         settings = get_guild_settings(message.guild.id)
+
+        if settings["ideas_channel_id"] and message.channel.id == settings["ideas_channel_id"]:
+            try:
+                await message.add_reaction("⭐")
+            except Exception:
+                pass
+
         if settings["wfl_channel_id"] and message.channel.id == settings["wfl_channel_id"]:
             for emoji in get_wfl_emojis(message.guild):
                 try:
