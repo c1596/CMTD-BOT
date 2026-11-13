@@ -136,6 +136,41 @@ def init_db():
             )
             """
         )
+        c.execute("PRAGMA table_info(scheduled_events)")
+        ev_cols = {row[1] for row in c.fetchall()}
+        ev_migrations = {
+            "channel_id": "INTEGER",
+            "guild_id": "INTEGER",
+            "role_id": "INTEGER",
+            "title": "TEXT",
+            "subtitle": "TEXT",
+            "description": "TEXT",
+            "image_url": "TEXT",
+            "start_ts": "INTEGER DEFAULT 0",
+            "remind_minutes": "INTEGER DEFAULT 10",
+            "reminded": "INTEGER DEFAULT 0",
+            "started": "INTEGER DEFAULT 0",
+        }
+        for col_name, col_def in ev_migrations.items():
+            if col_name not in ev_cols:
+                c.execute(f"ALTER TABLE scheduled_events ADD COLUMN {col_name} {col_def}")
+        for legacy_ts_col in ("starts_at", "start_time", "event_time", "timestamp"):
+            if legacy_ts_col in ev_cols:
+                c.execute(
+                    f"UPDATE scheduled_events SET start_ts = COALESCE({legacy_ts_col}, 0) "
+                    "WHERE start_ts IS NULL OR start_ts = 0"
+                )
+                break
+        if "remind_before" in ev_cols:
+            c.execute(
+                "UPDATE scheduled_events SET remind_minutes = COALESCE(remind_before, 10) "
+                "WHERE remind_minutes IS NULL"
+            )
+        if "is_started" in ev_cols:
+            c.execute(
+                "UPDATE scheduled_events SET started = COALESCE(is_started, 0) "
+                "WHERE started IS NULL"
+            )
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS event_followers (
@@ -2019,6 +2054,10 @@ async def background_scheduler():
 
         for ev in events:
             msg_id, ch_id, guild_id, role_id, title, subtitle, desc, img_url, start_ts, rem_min, reminded, started = ev
+            start_ts = start_ts or 0
+            rem_min = rem_min or 10
+            if start_ts <= 0:
+                continue
             guild = bot.get_guild(guild_id)
             ch = guild.get_channel(ch_id) if guild else None
 
@@ -2072,6 +2111,13 @@ async def sync_commands(ctx: commands.Context):
         await bot.tree.sync(guild=ctx.guild)
     synced = await bot.tree.sync()
     await msg.edit(content=f"✅ Successfully synced **{len(synced)}** global commands (duplicates cleared)!")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    raise error
 
 
 @bot.tree.error
