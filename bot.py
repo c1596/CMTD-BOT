@@ -52,6 +52,8 @@ DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
 SETTINGS_CACHE: Dict[int, Dict[str, Any]] = {}
 WFL_EMOJI_CACHE: Dict[int, List[Any]] = {}
 APP_EMOJIS_CACHE: List[Any] = []
+WFL_QUEUES: Dict[int, asyncio.Queue] = {}
+WFL_WORKERS: Dict[int, asyncio.Task] = {}
 STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 VALUE_VOTE_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
@@ -1339,25 +1341,60 @@ async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) 
     return found
 
 
-async def apply_wfl_reactions(message: discord.Message):
+async def _wfl_queue_worker(guild_id: int):
+    queue = WFL_QUEUES[guild_id]
+    while True:
+        message, enqueued_at = await queue.get()
+        try:
+            # Skip stale messages if a massive chat flood occurred
+            if time.time() - enqueued_at > 60:
+                continue
+            if not message.guild:
+                continue
+
+            emojis = await resolve_wfl_emojis(message.guild)
+            if not emojis:
+                continue
+
+            for emoji in emojis:
+                try:
+                    await message.add_reaction(emoji)
+                    # Paced at ~3.1 req/s to stay safely under Discord's 4 req/s reaction bucket
+                    await asyncio.sleep(0.32)
+                except (discord.NotFound, discord.Forbidden):
+                    break
+                except discord.HTTPException:
+                    await asyncio.sleep(1.0)
+        except Exception:
+            pass
+        finally:
+            queue.task_done()
+
+
+def enqueue_wfl_reactions(message: discord.Message):
     if not message.guild:
         return
-    emojis = await resolve_wfl_emojis(message.guild)
-    if not emojis:
-        return
+    guild_id = message.guild.id
+    queue = WFL_QUEUES.get(guild_id)
+    if queue is None:
+        queue = asyncio.Queue(maxsize=35)
+        WFL_QUEUES[guild_id] = queue
 
-    for emoji in emojis:
-        for attempt in range(3):
-            try:
-                await message.add_reaction(emoji)
-                await asyncio.sleep(0.25)
-                break
-            except discord.NotFound:
-                return
-            except discord.Forbidden:
-                return
-            except discord.HTTPException:
-                await asyncio.sleep(0.6 * (attempt + 1))
+    worker = WFL_WORKERS.get(guild_id)
+    if worker is None or worker.done():
+        WFL_WORKERS[guild_id] = asyncio.create_task(_wfl_queue_worker(guild_id))
+
+    if queue.full():
+        try:
+            queue.get_nowait()
+            queue.task_done()
+        except asyncio.QueueEmpty:
+            pass
+
+    try:
+        queue.put_nowait((message, time.time()))
+    except asyncio.QueueFull:
+        pass
 
 
 # -------------------------------------------------------------
@@ -4611,7 +4648,7 @@ async def on_message(message: discord.Message):
                 pass
 
         if settings["wfl_channel_id"] and message.channel.id == settings["wfl_channel_id"]:
-            asyncio.create_task(apply_wfl_reactions(message))
+            enqueue_wfl_reactions(message)
 
     await bot.process_commands(message)
 
