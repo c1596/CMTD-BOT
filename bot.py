@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import difflib
 import html as html_lib
 import time
 import asyncio
@@ -72,7 +73,7 @@ DEFAULT_VALUE_LIST_URL = "https://cameraman-td.vaultedvaluesx.com/value-list"
 
 # Trade Calculator Anti-Spam Cooldowns (User ID -> Last Timestamp)
 CALC_COOLDOWNS: Dict[int, float] = {}
-CALC_COOLDOWN_SECONDS = 6.0
+CALC_COOLDOWN_SECONDS = 10.0
 
 # Temporary Voice RAM State (Deletes only when empty or closed by owner)
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -726,6 +727,10 @@ def find_value_item(query: str) -> Optional[Dict[str, Any]]:
     for alias, key in VALUE_ALIAS_MAP.items():
         if q in alias:
             return VALUE_ITEMS_CACHE.get(key)
+    if len(q) >= 4 and VALUE_ALIAS_MAP:
+        close = difflib.get_close_matches(q, list(VALUE_ALIAS_MAP.keys()), n=1, cutoff=0.78)
+        if close:
+            return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[close[0]])
     return None
 
 
@@ -1172,24 +1177,43 @@ def check_calc_cooldown(user_id: int) -> float:
 
 
 def parse_trade_side(raw_text: str) -> Dict[str, Any]:
-    tokens = [t.strip() for t in re.split(r"[\n,;]+", raw_text) if t.strip()]
+    tokens = [t.strip() for t in re.split(r"[\n,;+]+", raw_text) if t.strip()]
     matched: List[Tuple[Dict[str, Any], int]] = []
     unknown: List[str] = []
 
     for token in tokens:
         qty = 1
         name_part = token
-        low_tok = token.lower()
+        low_tok = normalize_unit_key(token)
 
-        if low_tok not in ("2x money", "2x lucky", "2x speed", "x2 candy"):
-            m_pre = re.match(r"^(\d+)\s*x?\s+(.+)$", token, re.IGNORECASE)
-            m_suf = re.match(r"^(.+?)\s+x?(\d+)$", token, re.IGNORECASE)
-            if m_pre:
-                qty = min(max(int(m_pre.group(1)), 1), 99)
-                name_part = m_pre.group(2).strip()
-            elif m_suf:
-                name_part = m_suf.group(1).strip()
-                qty = min(max(int(m_suf.group(2)), 1), 99)
+        # Check direct exact unit/gamepass match first (e.g. "2x money", "2x lucky", "x2 candy")
+        direct_unit = VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[low_tok]) if low_tok in VALUE_ALIAS_MAP else None
+        if direct_unit:
+            matched.append((direct_unit, 1))
+            continue
+
+        # Support ALL multiplier formats (Latin x & Cyrillic х, *, parentheses, prefix & suffix):
+        # e.g. "x2 hacked", "2x hacked", "x 2 hacked", "2 hacked", "*2 hacked", "(2x) hacked",
+        #      "hacked x2", "hacked 2x", "hacked 2", "hacked (2)", "hacked(x2)"
+        m_pre = re.match(r"^(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)\s+(.+)$", token, re.IGNORECASE)
+        m_pre_paren = re.match(r"^\(\s*[xх*]?\s*(\d+)\s*[xх*]?\s*\)\s*(.+)$", token, re.IGNORECASE)
+        m_suf = re.match(r"^(.+?)\s+(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)$", token, re.IGNORECASE)
+        m_suf_paren = re.match(r"^(.+?)\s*\(\s*[xх*]?\s*(\d+)\s*[xх*]?\s*\)$", token, re.IGNORECASE)
+
+        if m_pre:
+            raw_qty = m_pre.group(1) or m_pre.group(2)
+            qty = min(max(int(raw_qty), 1), 99)
+            name_part = m_pre.group(3).strip()
+        elif m_pre_paren:
+            qty = min(max(int(m_pre_paren.group(1)), 1), 99)
+            name_part = m_pre_paren.group(2).strip()
+        elif m_suf:
+            name_part = m_suf.group(1).strip()
+            raw_qty = m_suf.group(2) or m_suf.group(3)
+            qty = min(max(int(raw_qty), 1), 99)
+        elif m_suf_paren:
+            name_part = m_suf_paren.group(1).strip()
+            qty = min(max(int(m_suf_paren.group(2)), 1), 99)
 
         unit = find_value_item(name_part)
         if unit:
@@ -1248,15 +1272,137 @@ def format_trade_side_total(side: Dict[str, Any]) -> str:
 
 
 class TradeCalcResultView(discord.ui.View):
-    def __init__(self, give_raw: str, get_raw: str):
+    def __init__(self, author_id: int, give_raw: str, get_raw: str):
         super().__init__(timeout=300)
+        self.author_id = author_id
         self.give_raw = give_raw
         self.get_raw = get_raw
 
     @discord.ui.button(label="Edit Offer", style=discord.ButtonStyle.secondary, emoji="✏️")
     async def edit_offer_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message(
+                "❌ Only the user who started this calculation can edit it.",
+                ephemeral=True,
+            )
         await interaction.response.send_modal(
-            TradeCalcModal(default_give=self.give_raw, default_get=self.get_raw)
+            TradeCalcModal(
+                author_id=self.author_id,
+                default_give=self.give_raw,
+                default_get=self.get_raw,
+                orig_message=interaction.message,
+            )
+        )
+
+
+class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
+    give_input = discord.ui.TextInput(
+        label="You Give (e.g. x2 hacked, UTTV)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+        placeholder="x2 hacked, UTTV, Scientist Crate",
+    )
+    get_input = discord.ui.TextInput(
+        label="You Get (e.g. Pharaoh Cameraman)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+        placeholder="Pharaoh Cameraman, 2x Lucky",
+    )
+
+    def __init__(
+        self,
+        author_id: int,
+        default_give: str = "",
+        default_get: str = "",
+        orig_message: Optional[discord.Message] = None,
+    ):
+        super().__init__()
+        self.author_id = author_id
+        self.orig_message = orig_message
+        if default_give:
+            self.give_input.default = default_give
+        if default_get:
+            self.get_input.default = default_get
+
+    async def on_submit(self, interaction: discord.Interaction):
+        give_side = parse_trade_side(self.give_input.value)
+        get_side = parse_trade_side(self.get_input.value)
+
+        if not give_side["matched"] and not get_side["matched"]:
+            return await interaction.response.send_message(
+                "❌ Could not recognize any units. Check unit names or shortcuts (`UTTV`, `UTC`, `Hacked`, `Pharaoh`, `Engineer`, etc.).",
+                ephemeral=True,
+            )
+
+        diff = get_side["avg_val"] - give_side["avg_val"]
+        denom = max(give_side["avg_val"], get_side["avg_val"], 1.0)
+        pct_diff = abs(diff / denom) * 100.0
+
+        if diff > 0:
+            diff_summary = f"📥 **You Get** is **`+{diff:,.0f}`** (`{pct_diff:.1f}%`) higher in value"
+        elif diff < 0:
+            diff_summary = f"📤 **You Give** is **`+{abs(diff):,.0f}`** (`{pct_diff:.1f}%`) higher in value"
+        else:
+            diff_summary = "⚖️ Both sides have **equal** numeric value (`0` difference)"
+
+        def _format_lines(side: Dict[str, Any]) -> str:
+            if not side["matched"]:
+                return "*No recognized units*"
+            out = []
+            for unit, qty in side["matched"]:
+                if qty > 1:
+                    vmin, vmax, is_oc = parse_value_range(unit["value_text"])
+                    if not is_oc and vmin is not None and vmax is not None:
+                        sub = f"{vmin * qty:,.0f}" if vmin == vmax else f"{vmin * qty:,.0f} – {vmax * qty:,.0f}"
+                        val_tag = f"`{unit['value_text']}` each = **`{sub}`**"
+                    else:
+                        val_tag = f"`{unit['value_text']}`"
+                    out.append(f"• **{qty}x {unit['name']}** — {val_tag} *(Dem {unit['demand_text']})*")
+                else:
+                    out.append(f"• **{unit['name']}** — **`{unit['value_text']}`** *(Dem {unit['demand_text']})*")
+            out.append(f"\n**Total Value:** `{format_trade_side_total(side)}` • **Avg Demand:** `{side['avg_demand']:.1f}/10`")
+            return "\n".join(out)
+
+        embed = discord.Embed(
+            title="⚖️ Trade Value Comparison",
+            description=f"Calculated for {interaction.user.mention}\n{diff_summary}",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="📤 You Give", value=_format_lines(give_side), inline=False)
+        embed.add_field(name="📥 You Get", value=_format_lines(get_side), inline=False)
+
+        notes: List[str] = [
+            f"🔥 **Demand Comparison:** Give `{give_side['avg_demand']:.1f}/10` vs Get `{get_side['avg_demand']:.1f}/10`"
+        ]
+        all_unknown = give_side["unknown"] + get_side["unknown"]
+        if all_unknown:
+            notes.append(f"⚠️ **Unrecognized:** `{', '.join(all_unknown[:8])}`")
+        if get_side["warnings"]:
+            notes.append(f"📉 **Dropping / Underpaid items on Get side:** `{', '.join(get_side['warnings'])}`")
+        if give_side["warnings"]:
+            notes.append(f"📉 **Dropping / Underpaid items on Give side:** `{', '.join(give_side['warnings'])}`")
+        embed.add_field(name="📋 Summary & Notes", value="\n".join(notes), inline=False)
+
+        embed.set_footer(
+            text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value Calculator",
+            icon_url=interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None,
+        )
+        view = TradeCalcResultView(interaction.user.id, self.give_input.value, self.get_input.value)
+
+        if self.orig_message:
+            try:
+                await self.orig_message.edit(embed=embed, view=view)
+                return await interaction.response.send_message("✅ Trade calculation updated!", ephemeral=True)
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=view,
+            ephemeral=False,
         )
 
 
@@ -1373,6 +1519,17 @@ def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any],
 
     if item.get("sign_value_text"):
         embed.add_field(name="✍️ Sign Value", value=f"**`{item['sign_value_text']}`**", inline=True)
+
+    short_aliases = [
+        a for a in item.get("aliases", "").split(",")
+        if a and a != item["item_key"] and len(a) <= 16
+    ]
+    if short_aliases:
+        embed.add_field(
+            name="⌨️ Shortcuts",
+            value=", ".join(f"`{a}`" for a in short_aliases[:5]),
+            inline=False,
+        )
 
     if item.get("image_url") and item["image_url"].startswith(("http://", "https://")):
         embed.set_thumbnail(url=item["image_url"])
@@ -1614,7 +1771,7 @@ class ValueHubView(discord.ui.View):
                 f"⏳ Please wait **{remaining:.1f}s** before using the Trade Calculator again.",
                 ephemeral=True,
             )
-        await interaction.response.send_modal(TradeCalcModal())
+        await interaction.response.send_modal(TradeCalcModal(author_id=interaction.user.id))
 
     async def on_top_click(self, interaction: discord.Interaction):
         site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
@@ -1721,6 +1878,17 @@ def should_react_wfl_message(message: discord.Message, smart_filter: bool = True
     # Also catch multi-word offers ("uttv and utc for pharaoh", "2x eng + 500 gems")
     if len(cleaned) >= 14 and (" or " in f" {cleaned} " or " for " in f" {cleaned} " or any(ch.isdigit() for ch in cleaned)):
         return True
+
+    # Check if the message mentions any known CMTD unit/shortcut from VALUE_ALIAS_MAP
+    words = cleaned.split()
+    if len(words) >= 2:
+        for w in words:
+            if len(w) >= 3 and w in VALUE_ALIAS_MAP:
+                return True
+        for idx in range(len(words) - 1):
+            bigram = f"{words[idx]} {words[idx + 1]}"
+            if bigram in VALUE_ALIAS_MAP:
+                return True
 
     return False
 
@@ -1932,6 +2100,16 @@ class CommunityBot(commands.Bot):
         self.add_view(EventFollowView())
         if not background_scheduler.is_running():
             background_scheduler.start()
+
+    async def close(self):
+        global HTTP_SESSION
+        if HTTP_SESSION and not HTTP_SESSION.closed:
+            try:
+                await HTTP_SESSION.close()
+            except Exception:
+                pass
+            HTTP_SESSION = None
+        await super().close()
 
 
 bot = CommunityBot()
@@ -4436,9 +4614,9 @@ class ValueSetupView(discord.ui.View):
         embed = discord.Embed(
             title="💎 Official CMTD Value List & Trade Hub",
             description=(
-                "Check live unit values (auto-checked every **2 minutes**), calculate trades, and track price changes right here in Discord!\n\n"
+                "Check live unit values (auto-checked every **2 minutes**), compare trades, and track price changes right here in Discord!\n\n"
                 "• Click **`🔍 Check Unit Value`** to look up any unit privately.\n"
-                "• Click **`⚖️ Trade Calculator`** (or type `/calc`) to check **Win / Fair / Lose**.\n"
+                "• Click **`⚖️ Trade Calculator`** (or type `/calc`) to compare **You Give** vs. **You Get** publicly.\n"
                 "• Click **`🏆 Top Values`** or **`📈 Recent Changes`** for live leaderboards & updates."
             ),
             color=0x3498DB,
@@ -4868,7 +5046,7 @@ async def value_cmd(interaction: discord.Interaction, unit: str, public: bool = 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
 
 
-@bot.tree.command(name="calc", description="Calculate a trade (Win / Fair / Lose) using live CMTD values")
+@bot.tree.command(name="calc", description="Compare a trade publicly using live CMTD values & demand")
 async def calc_cmd(interaction: discord.Interaction):
     remaining = check_calc_cooldown(interaction.user.id)
     if remaining > 0:
@@ -4876,7 +5054,7 @@ async def calc_cmd(interaction: discord.Interaction):
             f"⏳ Anti-spam cooldown: please wait **{remaining:.1f}s** before using `/calc` again.",
             ephemeral=True,
         )
-    await interaction.response.send_modal(TradeCalcModal())
+    await interaction.response.send_modal(TradeCalcModal(author_id=interaction.user.id))
 
 
 @bot.tree.command(name="value_changes", description="View recent unit value, demand & stability changes")
@@ -5427,6 +5605,9 @@ async def background_scheduler():
         active_gids = {g.id for g in bot.guilds}
         for gid in [g for g in STARBOARD_LOCKS if g not in active_gids]:
             STARBOARD_LOCKS.pop(gid, None)
+    now_f = time.time()
+    for gid in [g for g, until in WFL_BACKOFF_UNTIL.items() if until < now_f]:
+        WFL_BACKOFF_UNTIL.pop(gid, None)
 
     # 2. Backup sweep: delete temporary voice rooms only when completely empty
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
