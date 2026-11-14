@@ -7,7 +7,6 @@ import time
 import asyncio
 import sqlite3
 import subprocess
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set, Union
 
@@ -82,10 +81,6 @@ CALC_COOLDOWN_SECONDS = 10.0
 LFG_POST_COOLDOWNS: Dict[int, float] = {}
 LFG_COOLDOWN_SECONDS = 25.0
 
-# Dynamic Auto-Slowmode Traffic Monitor (Channel ID -> deque of timestamps)
-CHANNEL_MSG_TIMESTAMPS: Dict[int, deque] = {}
-ACTIVE_AUTO_SLOWMODES: Dict[int, Dict[str, Any]] = {}
-
 # Temporary Voice RAM State (Deletes only when empty or closed by owner)
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
 VOICE_CREATE_COOLDOWNS: Dict[int, float] = {}
@@ -143,8 +138,7 @@ def init_db():
                 wfl_smart_filter INTEGER DEFAULT 1,
                 signs_channel_id INTEGER,
                 lfg_channel_1_id INTEGER,
-                lfg_channel_2_id INTEGER,
-                autoslowmode_enabled INTEGER DEFAULT 0
+                lfg_channel_2_id INTEGER
             )
             """
         )
@@ -166,7 +160,6 @@ def init_db():
             "signs_channel_id": "INTEGER",
             "lfg_channel_1_id": "INTEGER",
             "lfg_channel_2_id": "INTEGER",
-            "autoslowmode_enabled": "INTEGER DEFAULT 0",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
@@ -510,8 +503,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                    antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                    value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                   wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
-                   autoslowmode_enabled
+                   wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -536,7 +528,6 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "signs_channel_id": row[15] if row else None,
             "lfg_channel_1_id": row[16] if row else None,
             "lfg_channel_2_id": row[17] if row else None,
-            "autoslowmode_enabled": bool(row[18]) if row else False,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -555,10 +546,9 @@ def update_guild_settings(guild_id: int, **kwargs):
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                 antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                 value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
-                autoslowmode_enabled
+                wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -577,8 +567,7 @@ def update_guild_settings(guild_id: int, **kwargs):
                 wfl_smart_filter = excluded.wfl_smart_filter,
                 signs_channel_id = excluded.signs_channel_id,
                 lfg_channel_1_id = excluded.lfg_channel_1_id,
-                lfg_channel_2_id = excluded.lfg_channel_2_id,
-                autoslowmode_enabled = excluded.autoslowmode_enabled
+                lfg_channel_2_id = excluded.lfg_channel_2_id
             """,
             (
                 guild_id,
@@ -600,7 +589,6 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["signs_channel_id"],
                 current["lfg_channel_1_id"],
                 current["lfg_channel_2_id"],
-                1 if current["autoslowmode_enabled"] else 0,
             ),
         )
         conn.commit()
@@ -638,7 +626,7 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 
 
 # -------------------------------------------------------------
-# 3. Value List & Partner Signs System (Auto-Scan + /value + /calc)
+# 3. Value List & Partner Signs System (Full-History Scan + /value + /calc)
 # -------------------------------------------------------------
 KNOWN_UNIT_ALIASES: Dict[str, List[str]] = {
     "upgraded titan tv man": ["uttv", "upgraded titan tv", "ttv"],
@@ -713,7 +701,6 @@ INITIAL_VALUE_SEED: List[Tuple[str, str, str, str, str]] = [
     ("DevSigned Scientist", "Signed", "o/c", "7/10", "Unstable"),
 ]
 
-# Pre-seeded Partner Sign Values from server screenshots
 INITIAL_SIGN_SEED: List[Tuple[str, str, str, List[str]]] = [
     ("Meddyson", "Meddyson", "+220%", ["meddyson"]),
     ("Kaptoxa274", "Kaptoxa274", "+75%", ["kaptoxa274", "kaptoxa", "картоха"]),
@@ -824,7 +811,7 @@ def seed_initial_values_if_empty():
 seed_initial_values_if_empty()
 
 
-# --- Partner Signs Cache & Helpers ---
+# --- Partner Signs Cache & Full-History Parser ---
 def rebuild_sign_alias_map():
     SIGN_ALIAS_MAP.clear()
     for p_key, partner in SIGN_PARTNERS_CACHE.items():
@@ -928,10 +915,12 @@ def normalize_sign_value_str(raw: str) -> str:
     low = s.lower()
     if "o/c" in low or low == "oc":
         return "o/c"
-    if not s.startswith(("+", "-")) and any(ch.isdigit() for ch in s):
-        s = "+" + s
-    if not s.endswith("%") and any(ch.isdigit() for ch in s):
-        s = s + "%"
+    m = re.search(r"([+-]?\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?)\s*%?", s)
+    if m:
+        num_part = re.sub(r"\s+", "", m.group(1))
+        if not num_part.startswith(("+", "-")):
+            num_part = "+" + num_part
+        return num_part + "%"
     return s
 
 
@@ -960,6 +949,9 @@ def upsert_sign_partner(
 ) -> Tuple[Dict[str, Any], bool]:
     clean_disp = display_name.strip().lstrip("@")
     clean_rblx = roblox_username.strip().lstrip("@")
+    if clean_disp.startswith("<@") and clean_rblx:
+        clean_disp = clean_rblx
+
     existing = find_sign_partner(clean_disp) or (find_sign_partner(clean_rblx) if clean_rblx else None)
     norm_sign = normalize_sign_value_str(sign_text)
     now_ts = int(time.time())
@@ -967,14 +959,15 @@ def upsert_sign_partner(
 
     if existing:
         p_key = existing["partner_key"]
-        final_disp = clean_disp or existing["display_name"]
+        final_disp = clean_disp if (clean_disp and not clean_disp.startswith("<@")) else existing["display_name"]
         final_rblx = clean_rblx or existing["roblox_username"]
         alias_set = {a.strip() for a in existing.get("aliases", "").split(",") if a.strip()}
-        alias_set.add(normalize_unit_key(final_disp))
+        if final_disp and not final_disp.startswith("<@"):
+            alias_set.add(normalize_unit_key(final_disp))
         if final_rblx:
             alias_set.add(normalize_unit_key(final_rblx))
         for ea in (extra_aliases or []):
-            if ea.strip():
+            if ea.strip() and not ea.strip().startswith("<@"):
                 alias_set.add(normalize_unit_key(ea))
         final_prev = prev_sign_text if prev_sign_text is not None else (
             existing["sign_text"] if existing["sign_text"] != norm_sign else existing["prev_sign_text"]
@@ -983,14 +976,15 @@ def upsert_sign_partner(
         if existing["sign_text"] != norm_sign:
             changed = True
     else:
-        p_key = normalize_unit_key(clean_disp or clean_rblx)
-        final_disp = clean_disp or clean_rblx
+        base_name = clean_disp if (clean_disp and not clean_disp.startswith("<@")) else clean_rblx
+        p_key = normalize_unit_key(base_name)
+        final_disp = base_name
         final_rblx = clean_rblx
         alias_set = {p_key}
         if final_rblx:
             alias_set.add(normalize_unit_key(final_rblx))
         for ea in (extra_aliases or []):
-            if ea.strip():
+            if ea.strip() and not ea.strip().startswith("<@"):
                 alias_set.add(normalize_unit_key(ea))
         final_prev = prev_sign_text or ""
         final_note = note_text.strip()
@@ -1038,13 +1032,52 @@ def upsert_sign_partner(
     return partner_dict, changed
 
 
+SIGN_CHATTER_LINES = {
+    "now", "needed", "no needed to ping", "sorry for ping guys", "update", "updated",
+    "ok", "okay", "yes", "no", "bump", "fixed", "wip", "soon", "test",
+}
+
+SIGN_VALUE_LINE_RE = re.compile(
+    r"^(?:sign\s*val(?:ue)?|sign\s*percent(?:age)?|sign|val(?:ue)?)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+SIGN_SINGLE_LINE_RE = re.compile(
+    r"^(@?[^\s:|-][^:|-]{1,45}?)\s*(?::|-|—|–)\s*([+-]?\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?\s*%|o/c)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_header_and_meta(header_raw: str) -> Tuple[str, str, List[str]]:
+    header_line = header_raw.lstrip("-•*# ").strip()
+    extra_aliases: List[str] = []
+    note_tag = ""
+
+    if "|" in header_line:
+        h_left, h_right = header_line.split("|", 1)
+        header_line = h_left.strip()
+        note_tag = h_right.strip()
+
+    bracket_m = re.search(r"\[([^\]]+)\]", header_line)
+    if bracket_m:
+        note_tag = bracket_m.group(1).strip()
+        header_line = re.sub(r"\s*\[[^\]]+\]\s*", " ", header_line).strip()
+
+    paren_m = re.search(r"\(([^)]+)\)", header_line)
+    if paren_m:
+        in_paren = paren_m.group(1).strip().lstrip("@")
+        if in_paren and not in_paren.startswith("<@"):
+            extra_aliases.append(in_paren)
+        header_line = re.sub(r"\s*\([^)]+\)\s*", " ", header_line).strip()
+
+    return header_line.lstrip("@").strip(), note_tag, extra_aliases
+
+
 def parse_and_apply_sign_changelog(
     raw_text: str,
     guild: Optional[discord.Guild] = None,
     mentions: Optional[List[discord.abc.User]] = None,
     source: str = "sign-changelog",
 ) -> List[Dict[str, Any]]:
-    # Resolve Discord <@id> user mentions to real names first
     resolved_text = raw_text
     mention_map: Dict[int, str] = {}
     if mentions:
@@ -1063,164 +1096,198 @@ def parse_and_apply_sign_changelog(
 
     resolved_text = re.sub(r"<@!?(\d+)>", _replace_user_mention, resolved_text)
 
-    # Filter out role mentions (<@&id>) and pure chatter lines
-    cleaned_lines_all = []
-    for ln in resolved_text.splitlines():
-        s = ln.strip()
-        if not s:
-            cleaned_lines_all.append("")
-            continue
-        if re.fullmatch(r"(?:<@&\d+>|@everyone|@here|@\[.*?\]\s*.*)", s, re.IGNORECASE):
-            continue
-        cleaned_lines_all.append(s)
-
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", "\n".join(cleaned_lines_all)) if b.strip()]
+    # Handle special ex-dev line if present
     results: List[Dict[str, Any]] = []
-
-    for block in blocks:
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        if not lines:
-            continue
-
-        # Handle special format: "1. ex dev sign is: szszjfbdbdj" + "o/c"
-        full_block_low = block.lower()
-        ex_dev_match = re.search(r"ex\s*dev\s*sign\s*is\s*:\s*([a-z0-9_.-]+)", full_block_low)
-        if ex_dev_match and "o/c" in full_block_low:
-            r_user = ex_dev_match.group(1)
-            upsert_sign_partner(
-                display_name=f"Ex-Dev ({r_user})",
-                roblox_username=r_user,
-                sign_text="o/c",
-                extra_aliases=[r_user, "exdev", "ex dev"],
-                source=source,
-            )
-            results.append(
-                {
-                    "name": f"Ex-Dev ({r_user})",
-                    "roblox": r_user,
-                    "trend": "neutral",
-                    "line": "**Sign Value:** **`o/c`** *(Non-Partner)*",
-                }
-            )
-            continue
-
-        # Find the Sign Value line in this block
-        sign_line_idx = -1
-        for idx, ln in enumerate(lines):
-            if re.match(r"^sign\s*val(?:ue)?\s*:", ln, re.IGNORECASE):
-                sign_line_idx = idx
-                break
-
-        if sign_line_idx == -1:
-            continue
-
-        header_line = lines[0].lstrip("-•*# ").strip()
-        if not header_line or header_line.lower().startswith("sign val"):
-            continue
-
-        # Extract status/bracket tags from header, e.g. "@Stefrim | PLS SIGN = BAN" or "@Whatenix (WhatenixTT)"
-        extra_aliases: List[str] = []
-        note_tag = ""
-        if "|" in header_line:
-            h_left, h_right = header_line.split("|", 1)
-            header_line = h_left.strip()
-            note_tag = h_right.strip()
-        bracket_m = re.search(r"\[([^\]]+)\]", header_line)
-        if bracket_m:
-            note_tag = bracket_m.group(1).strip()
-            header_line = re.sub(r"\s*\[[^\]]+\]\s*", " ", header_line).strip()
-        paren_m = re.search(r"\(([^)]+)\)", header_line)
-        if paren_m:
-            in_paren = paren_m.group(1).strip().lstrip("@")
-            if in_paren:
-                extra_aliases.append(in_paren)
-            header_line = re.sub(r"\s*\([^)]+\)\s*", " ", header_line).strip()
-
-        display_name = header_line.lstrip("@").strip()
-        if not display_name or len(display_name) > 55:
-            continue
-
-        roblox_user = ""
-        desc_note = note_tag
-        for mid_ln in lines[1:]:
-            if re.match(r"^sign\s*val(?:ue)?\s*:", mid_ln, re.IGNORECASE):
-                continue
-            if re.match(r"^user(?:name)?\s*:", mid_ln, re.IGNORECASE):
-                roblox_user = mid_ln.split(":", 1)[1].strip().lstrip("@")
-            elif re.match(r"^desc(?:ription)?\s*:", mid_ln, re.IGNORECASE):
-                d_val = mid_ln.split(":", 1)[1].strip()
-                if d_val.lower() not in ("ok", "none", "-"):
-                    desc_note = d_val
-            elif ":" not in mid_ln and not roblox_user and len(mid_ln) <= 40:
-                roblox_user = mid_ln.strip().lstrip("@")
-
-        raw_sign_val = lines[sign_line_idx].split(":", 1)[1].strip()
-        arrow_parts = re.split(r"\s*(?:->|➔|→|=>)\s*", raw_sign_val, maxsplit=1)
-        trend = "neutral"
-
-        if len(arrow_parts) == 2:
-            old_s = normalize_sign_value_str(arrow_parts[0])
-            new_s = normalize_sign_value_str(arrow_parts[1])
-            old_min, old_max, _ = parse_sign_percentage_range(old_s)
-            new_min, new_max, _ = parse_sign_percentage_range(new_s)
-            if old_min is not None and new_min is not None:
-                old_avg = (old_min + (old_max or old_min)) / 2.0
-                new_avg = (new_min + (new_max or new_min)) / 2.0
-                if new_avg > old_avg:
-                    trend = "up"
-                elif new_avg < old_avg:
-                    trend = "down"
-            formatted_line = f"**Sign Value:** `{old_s}` ➔ **`{new_s}`**"
-        else:
-            old_s = None
-            new_s = normalize_sign_value_str(raw_sign_val)
-            formatted_line = f"**Sign Value:** **`{new_s}`**"
-
+    low_full = resolved_text.lower()
+    ex_dev_match = re.search(r"ex\s*dev\s*sign\s*is\s*:\s*([a-z0-9_.-]+)", low_full)
+    if ex_dev_match and "o/c" in low_full:
+        r_user = ex_dev_match.group(1)
         upsert_sign_partner(
-            display_name=display_name,
-            roblox_username=roblox_user,
-            sign_text=new_s,
-            prev_sign_text=old_s,
-            note_text=desc_note,
-            extra_aliases=extra_aliases,
+            display_name=f"Ex-Dev ({r_user})",
+            roblox_username=r_user,
+            sign_text="o/c",
+            extra_aliases=[r_user, "exdev", "ex dev"],
             source=source,
         )
         results.append(
             {
-                "name": display_name,
-                "roblox": roblox_user,
-                "trend": trend,
-                "line": formatted_line,
+                "name": f"Ex-Dev ({r_user})",
+                "roblox": r_user,
+                "trend": "neutral",
+                "line": "**Sign Value:** **`o/c`** *(Non-Partner)*",
             }
         )
+
+    # Line-by-line state machine parser (works WITH or WITHOUT blank lines between partners!)
+    raw_lines = resolved_text.splitlines()
+    pending_lines: List[str] = []
+    idx = 0
+
+    while idx < len(raw_lines):
+        s = raw_lines[idx].strip()
+        idx += 1
+
+        if not s:
+            if pending_lines:
+                pending_lines.clear()
+            continue
+
+        # Skip role pings, @everyone, @here, URLs, and pure chatter lines
+        if re.fullmatch(r"(?:<@&\d+>|@everyone|@here|@\[.*?\]\s*.*)", s, re.IGNORECASE):
+            continue
+        if s.startswith(("http://", "https://")) or s.lower() in SIGN_CHATTER_LINES:
+            continue
+
+        # Check if this line is a "Sign Value: ..." line
+        m_sign = SIGN_VALUE_LINE_RE.match(s)
+        if m_sign and pending_lines:
+            raw_sign_val = m_sign.group(1).strip()
+
+            # Check if the very next line is "Description: ..."
+            desc_after = ""
+            if idx < len(raw_lines):
+                nxt = raw_lines[idx].strip()
+                if re.match(r"^(?:desc(?:ription)?|note)\s*:", nxt, re.IGNORECASE):
+                    d_val = nxt.split(":", 1)[1].strip()
+                    if d_val.lower() not in ("ok", "none", "-"):
+                        desc_after = d_val
+                    idx += 1
+
+            display_name, note_tag, extra_aliases = _extract_header_and_meta(pending_lines[0])
+            roblox_user = ""
+            desc_note = desc_after or note_tag
+
+            for mid_ln in pending_lines[1:]:
+                if re.match(r"^user(?:name)?\s*:", mid_ln, re.IGNORECASE):
+                    roblox_user = mid_ln.split(":", 1)[1].strip().lstrip("@")
+                elif re.match(r"^(?:desc(?:ription)?|note)\s*:", mid_ln, re.IGNORECASE):
+                    d_val = mid_ln.split(":", 1)[1].strip()
+                    if d_val.lower() not in ("ok", "none", "-"):
+                        desc_note = d_val
+                elif ":" not in mid_ln and not roblox_user and len(mid_ln) <= 45:
+                    roblox_user = mid_ln.strip().lstrip("@")
+
+            if display_name.startswith("<@") and roblox_user:
+                display_name = roblox_user
+
+            pending_lines.clear()
+
+            if not display_name or display_name.startswith("<@") or len(display_name) > 55:
+                continue
+
+            arrow_parts = re.split(r"\s*(?:->|➔|→|=>)\s*", raw_sign_val, maxsplit=1)
+            trend = "neutral"
+
+            if len(arrow_parts) == 2:
+                old_s = normalize_sign_value_str(arrow_parts[0])
+                new_s = normalize_sign_value_str(arrow_parts[1])
+                old_min, old_max, _ = parse_sign_percentage_range(old_s)
+                new_min, new_max, _ = parse_sign_percentage_range(new_s)
+                if old_min is not None and new_min is not None:
+                    old_avg = (old_min + (old_max or old_min)) / 2.0
+                    new_avg = (new_min + (new_max or new_min)) / 2.0
+                    if new_avg > old_avg:
+                        trend = "up"
+                    elif new_avg < old_avg:
+                        trend = "down"
+                formatted_line = f"**Sign Value:** `{old_s}` ➔ **`{new_s}`**"
+            else:
+                old_s = None
+                new_s = normalize_sign_value_str(raw_sign_val)
+                formatted_line = f"**Sign Value:** **`{new_s}`**"
+
+            upsert_sign_partner(
+                display_name=display_name,
+                roblox_username=roblox_user,
+                sign_text=new_s,
+                prev_sign_text=old_s,
+                note_text=desc_note,
+                extra_aliases=extra_aliases,
+                source=source,
+            )
+            results.append(
+                {
+                    "name": display_name,
+                    "roblox": roblox_user,
+                    "trend": trend,
+                    "line": formatted_line,
+                }
+            )
+            continue
+
+        # Check single-line format: "@Whatenix: +25%" or "Kaptoxa274 - +75%"
+        if not pending_lines:
+            m_single = SIGN_SINGLE_LINE_RE.match(s)
+            if m_single:
+                display_name, note_tag, extra_aliases = _extract_header_and_meta(m_single.group(1))
+                new_s = normalize_sign_value_str(m_single.group(2))
+                if display_name and not display_name.startswith("<@"):
+                    upsert_sign_partner(
+                        display_name=display_name,
+                        roblox_username="",
+                        sign_text=new_s,
+                        note_text=note_tag,
+                        extra_aliases=extra_aliases,
+                        source=source,
+                    )
+                    results.append(
+                        {
+                            "name": display_name,
+                            "roblox": "",
+                            "trend": "neutral",
+                            "line": f"**Sign Value:** **`{new_s}`**",
+                        }
+                    )
+                    continue
+
+        # Otherwise accumulate candidate header/metadata lines (keep at most 3 pending lines)
+        if len(pending_lines) >= 3:
+            pending_lines.pop(0)
+        pending_lines.append(s)
 
     return results
 
 
-async def scan_signs_channel_history(channel: discord.TextChannel, limit: int = 120) -> int:
-    collected: List[discord.Message] = []
-    try:
-        async for msg in channel.history(limit=limit, oldest_first=False):
-            if msg.author.bot:
-                continue
-            if msg.content and "sign" in msg.content.lower():
-                collected.append(msg)
-    except Exception:
-        return 0
+def _collect_message_full_text(msg: discord.Message) -> str:
+    parts: List[str] = []
+    if msg.content:
+        parts.append(msg.content)
+    for emb in msg.embeds:
+        if emb.title:
+            parts.append(emb.title)
+        if emb.description:
+            parts.append(emb.description)
+        for fld in emb.fields:
+            if fld.name:
+                parts.append(fld.name)
+            if fld.value:
+                parts.append(fld.value)
+    return "\n".join(parts)
 
-    # Apply oldest-first so the newest message in the channel wins!
-    collected.reverse()
+
+async def scan_signs_channel_history(channel: discord.TextChannel) -> Tuple[int, int]:
+    """Reads 100% of channel history from oldest to newest so latest changes always win."""
+    messages_scanned = 0
     updated_partners: Set[str] = set()
-    for msg in collected:
-        parsed = parse_and_apply_sign_changelog(
-            msg.content,
-            guild=channel.guild,
-            mentions=list(msg.mentions),
-            source="signs-channel-sync",
-        )
-        for entry in parsed:
-            updated_partners.add(entry["name"])
-    return len(updated_partners)
+    try:
+        async for msg in channel.history(limit=None, oldest_first=True):
+            if bot.user and msg.author.id == bot.user.id:
+                continue
+            full_text = _collect_message_full_text(msg)
+            if not full_text.strip():
+                continue
+            messages_scanned += 1
+            parsed = parse_and_apply_sign_changelog(
+                full_text,
+                guild=channel.guild,
+                mentions=list(msg.mentions),
+                source="signs-channel-sync",
+            )
+            for entry in parsed:
+                updated_partners.add(entry["name"])
+    except Exception as e:
+        print(f"[SignsSync] Error scanning #{channel.name}: {e}")
+    return messages_scanned, len(updated_partners)
 
 
 def build_sign_partners_embed(guild: Optional[discord.Guild]) -> discord.Embed:
@@ -1238,11 +1305,15 @@ def build_sign_partners_embed(guild: Optional[discord.Guild]) -> discord.Embed:
         prev_part = f" *(was `{p['prev_sign_text']}`)*" if p.get("prev_sign_text") and p["prev_sign_text"] != p["sign_text"] else ""
         lines.append(f"• **{p['display_name']}**{rblx_part} — **`{p['sign_text']}`**{prev_part}")
 
+    desc_body = "\n".join(lines) if lines else "*No partner sign values recorded yet.*"
+    if len(desc_body) > 3700:
+        desc_body = desc_body[:3690] + "\n*...and more*"
+
     embed = discord.Embed(
         title="✍️ Official Partner Sign Values",
         description=(
             "You can type any partner's Discord name or Roblox username in `/value` or `/calc` (e.g. `Whatenix Pharaoh` or `2x TTD_OnlyMy UTTV`):\n\n"
-            + ("\n".join(lines) if lines else "*No partner sign values recorded yet.*")
+            + desc_body
         ),
         color=0x9B59B6,
         timestamp=datetime.now(timezone.utc),
@@ -1413,7 +1484,7 @@ async def get_http_session() -> Optional["aiohttp.ClientSession"]:
         HTTP_SESSION = aiohttp.ClientSession(
             timeout=timeout,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.0; +https://discord.com)",
+                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.1; +https://discord.com)",
                 "Accept": "text/html,application/xhtml+xml,application/json",
                 "Cache-Control": "no-cache",
             },
@@ -1738,13 +1809,11 @@ def extract_unit_and_sign_from_phrase(phrase: str) -> Tuple[Optional[Dict[str, A
     if not cleaned:
         return None, None
 
-    # 1. Direct unit match without sign
     direct_unit = find_value_item(cleaned)
     low_cleaned = normalize_unit_key(cleaned)
     if direct_unit and low_cleaned in VALUE_ALIAS_MAP:
         return direct_unit, None
 
-    # 2. Check parenthesized sign: e.g. "Pharaoh (Whatenix)" or "UTTV (sign TTD_OnlyMy)"
     paren_m = re.search(r"\(([^)]+)\)", cleaned)
     if paren_m:
         inside = re.sub(r"^(?:signed|sign)\s*(?:by)?\s*", "", paren_m.group(1), flags=re.IGNORECASE).strip()
@@ -1755,7 +1824,6 @@ def extract_unit_and_sign_from_phrase(phrase: str) -> Tuple[Optional[Dict[str, A
             if unit:
                 return unit, partner
 
-    # 3. Check explicit "sign / signed by" keyword: e.g. "Pharaoh sign Whatenix" or "Whatenix signed UTTV"
     sign_kw_after = re.match(r"^(.+?)\s+(?:signed|sign)\s*(?:by)?\s+@?([^\s]+)$", cleaned, re.IGNORECASE)
     if sign_kw_after:
         partner = find_sign_partner(sign_kw_after.group(2))
@@ -1770,7 +1838,6 @@ def extract_unit_and_sign_from_phrase(phrase: str) -> Tuple[Optional[Dict[str, A
         if unit and partner:
             return unit, partner
 
-    # 4. Prefix or suffix partner name without keyword: e.g. "Whatenix Pharaoh", "Pharaoh Whatenix", "TTD_OnlyMy UTTV"
     words = cleaned.split()
     if len(words) >= 2:
         first_partner = find_sign_partner(words[0])
@@ -1798,14 +1865,10 @@ def parse_trade_side(raw_text: str) -> Dict[str, Any]:
         name_part = token
         low_tok = normalize_unit_key(token)
 
-        # Direct exact unit/gamepass match first (e.g. "2x money", "2x lucky", "x2 candy")
         if low_tok in VALUE_ALIAS_MAP:
             matched.append((VALUE_ITEMS_CACHE[VALUE_ALIAS_MAP[low_tok]], 1, None))
             continue
 
-        # Support ALL multiplier formats (Latin x & Cyrillic х, *, parentheses, prefix & suffix):
-        # e.g. "x2 hacked", "2x hacked", "x 2 hacked", "2 hacked", "*2 hacked", "(2x) hacked",
-        #      "hacked x2", "hacked 2x", "hacked 2", "hacked (2)", "2x Whatenix Pharaoh"
         m_pre = re.match(r"^(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)\s+(.+)$", token, re.IGNORECASE)
         m_pre_paren = re.match(r"^\(\s*[xх*]?\s*(\d+)\s*[xх*]?\s*\)\s*(.+)$", token, re.IGNORECASE)
         m_suf = re.match(r"^(.+?)\s+(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)$", token, re.IGNORECASE)
@@ -2608,7 +2671,7 @@ def enqueue_wfl_reactions(message: discord.Message, smart_filter: bool = True):
 
 
 # -------------------------------------------------------------
-# 5. Smart Anti-Scam Shield & Dynamic Auto-Slowmode
+# 5. Smart Anti-Scam & Phishing Shield
 # -------------------------------------------------------------
 URL_EXTRACT_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)", re.IGNORECASE)
 
@@ -2715,42 +2778,6 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
             except Exception:
                 pass
     return True
-
-
-async def handle_dynamic_autoslowmode(message: discord.Message, settings: Dict[str, Any]):
-    if not settings.get("autoslowmode_enabled"):
-        return
-    if not isinstance(message.channel, discord.TextChannel) or not message.guild:
-        return
-
-    ch = message.channel
-    now = time.time()
-    dq = CHANNEL_MSG_TIMESTAMPS.get(ch.id)
-    if dq is None:
-        dq = deque(maxlen=40)
-        CHANNEL_MSG_TIMESTAMPS[ch.id] = dq
-
-    dq.append(now)
-    # Count messages in the last 15 seconds
-    while dq and (now - dq[0]) > 15.0:
-        dq.popleft()
-
-    if len(dq) >= 28 and ch.id not in ACTIVE_AUTO_SLOWMODES:
-        orig_delay = ch.slowmode_delay
-        if orig_delay < 8:
-            ACTIVE_AUTO_SLOWMODES[ch.id] = {
-                "guild_id": message.guild.id,
-                "orig_delay": orig_delay,
-                "activated_at": now,
-            }
-            try:
-                await ch.edit(slowmode_delay=10, reason="Dynamic Auto-Slowmode: high message surge")
-                await ch.send(
-                    "⚡ **High chat traffic detected** — temporary `10s` slowmode enabled until chat calms down.",
-                    delete_after=15,
-                )
-            except Exception:
-                ACTIVE_AUTO_SLOWMODES.pop(ch.id, None)
 
 
 # -------------------------------------------------------------
@@ -3413,7 +3440,6 @@ def remove_temp_voice_record(channel_id: int):
         conn.commit()
 
 
-# --- Squad LFG Helpers (Linked directly to Private Voice Rooms) ---
 def build_lfg_embed(
     vc: discord.VoiceChannel,
     owner_id: int,
@@ -3699,7 +3725,6 @@ class LfgBuilderView(discord.ui.View):
         else:
             target_channels = [ch for ch in self.lfg_channels if str(ch.id) == self.selected_target] or [self.lfg_channels[0]]
 
-        # Remove any old LFG posts for this voice room before publishing updated one
         await delete_lfg_posts_for_voice(self.vc.guild, self.vc.id)
 
         embed = build_lfg_embed(
@@ -4200,7 +4225,7 @@ class VoiceControlView(discord.ui.View):
 
         if not lfg_channels:
             return await interaction.response.send_message(
-                "❌ LFG channels are not configured yet. Ask an admin to set LFG Channel 1 / 2 in `/panel` ➔ `🔊 Voice 2.0`.",
+                "❌ LFG channels are not configured yet. Ask an admin to set LFG Channel 1 / 2 in `/panel` ➔ `🔊 Voice + LFG`.",
                 ephemeral=True,
             )
 
@@ -5587,7 +5612,7 @@ class ValueSetupView(discord.ui.View):
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[discord.ChannelType.text],
-        placeholder="✍️ Select Signs Value Channel (Auto-reads history & live posts)...",
+        placeholder="✍️ Select Signs Value Channel (Scans 100% of history)...",
         row=1,
     )
     async def select_signs_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
@@ -5595,13 +5620,13 @@ class ValueSetupView(discord.ui.View):
         update_guild_settings(self.guild_id, signs_channel_id=chosen.id)
         await interaction.response.defer(ephemeral=True)
         ch_obj = interaction.guild.get_channel(chosen.id) if interaction.guild else None
-        scanned = 0
+        scanned_msgs, synced_partners = (0, 0)
         if isinstance(ch_obj, discord.TextChannel):
-            scanned = await scan_signs_channel_history(ch_obj, limit=150)
+            scanned_msgs, synced_partners = await scan_signs_channel_history(ch_obj)
         await interaction.edit_original_response(
             content=(
                 f"✅ **Signs Value channel set to <#{chosen.id}>!**\n"
-                f"• Auto-scanned channel history and synced **{scanned}** sign partner(s) ({len(SIGN_PARTNERS_CACHE)} total in database).\n"
+                f"• Read all **{scanned_msgs}** messages in channel history and synced **{synced_partners}** sign partner(s) (**{len(SIGN_PARTNERS_CACHE)}** total in database).\n"
                 "• All new and edited messages in that channel will now update partner signs automatically!"
             ),
             view=self,
@@ -5641,15 +5666,15 @@ class ValueSetupView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         s = get_guild_settings(self.guild_id)
         checked, changed = await sync_value_list_from_website(s["value_list_url"])
-        signs_scanned = 0
+        scanned_msgs, signs_synced = (0, 0)
         if s.get("signs_channel_id") and interaction.guild:
             ch_obj = interaction.guild.get_channel(s["signs_channel_id"])
             if isinstance(ch_obj, discord.TextChannel):
-                signs_scanned = await scan_signs_channel_history(ch_obj, limit=150)
+                scanned_msgs, signs_synced = await scan_signs_channel_history(ch_obj)
         await interaction.followup.send(
-            f"🔄 **Sync Complete!**\n"
+            f"🔄 **Full Sync Complete!**\n"
             f"• Website: checked **{checked}** items (**{changed}** updated, **{len(VALUE_ITEMS_CACHE)}** cached)\n"
-            f"• Signs Channel: synced **{signs_scanned}** partner(s) (**{len(SIGN_PARTNERS_CACHE)}** cached)",
+            f"• Signs Channel: read **{scanned_msgs}** messages, synced **{signs_synced}** partner(s) (**{len(SIGN_PARTNERS_CACHE)}** cached)",
             ephemeral=True,
         )
 
@@ -5810,20 +5835,6 @@ class AntiScamSetupView(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(label="Toggle Auto-Slowmode", style=discord.ButtonStyle.primary, emoji="⚡", row=2)
-    async def toggle_autoslow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cur = get_guild_settings(self.guild_id).get("autoslowmode_enabled", False)
-        new_val = not cur
-        update_guild_settings(self.guild_id, autoslowmode_enabled=new_val)
-        await interaction.response.edit_message(
-            content=(
-                "⚡ **Dynamic Auto-Slowmode ENABLED!** When chat surges (28+ msgs / 15s), slowmode temporarily bumps to `10s` and auto-resets once chat calms down."
-                if new_val
-                else "⚪ **Dynamic Auto-Slowmode DISABLED.**"
-            ),
-            view=self,
-        )
-
 
 class LockdownSetupView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -5887,7 +5898,6 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         wfl_status = f"`Missing: {', '.join(missing)}`"
 
     shield_status = "🟢 **On**" if s["antiscam_enabled"] else "⚪ `Off`"
-    slow_status = "⚡ **Auto-Slowmode On**" if s.get("autoslowmode_enabled") else "⚪ `Slowmode Off`"
     lock_status = "🔴 **LOCKED**" if is_lockdown_active(guild.id) else "🟢 Normal"
 
     embed = discord.Embed(
@@ -5900,7 +5910,7 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="🔊 Voice 2.0 / 📣 LFG", value=f"Trigger: {jtc}\nLFG: {lfg_display}", inline=True)
     embed.add_field(name="💎 Value / ✍️ Signs Ch", value=f"Val: {val_ch}\nSigns: {signs_ch}", inline=True)
     embed.add_field(name="🏷️ Ping / 🛡️ Team Roles", value=f"Ping: {val_role}\nTeam: {val_mgr_txt}", inline=True)
-    embed.add_field(name="🛡️ Security & Lockdown", value=f"{shield_status} • {slow_status}\nLockdown: {lock_status}", inline=True)
+    embed.add_field(name="🛡️ Shield & Lockdown", value=f"Anti-Scam: {shield_status}\nLockdown: {lock_status}", inline=True)
     embed.add_field(name="🚀 Booster / 👋 Auto-Role", value=f"{booster} / {autorole}", inline=False)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} units • {len(SIGN_PARTNERS_CACHE)} sign partners")
     return embed
@@ -5961,7 +5971,7 @@ class ControlPanelView(discord.ui.View):
         await interaction.response.send_message(
             f"💎 **Value List & Partner Signs System**\n"
             f"• **Website:** {s['value_list_url']} (`{len(VALUE_ITEMS_CACHE)}` units)\n"
-            f"• **Signs Channel (Auto-Scanner):** {signs_ch_txt} (`{len(SIGN_PARTNERS_CACHE)}` partners)\n"
+            f"• **Signs Channel (Full-History Auto-Scanner):** {signs_ch_txt} (`{len(SIGN_PARTNERS_CACHE)}` partners)\n"
             f"• **Allowed Team Roles:** {mgr_display}\n\n"
             "Select channels, roles, or post the pinned Value & Sign Hub below:",
             view=ValueSetupView(interaction.guild.id),
@@ -5979,16 +5989,15 @@ class ControlPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Security", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
+    @discord.ui.button(label="Anti-Scam", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
     async def setup_antiscam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
         s = get_guild_settings(interaction.guild.id)
         state_txt = "ENABLED" if s["antiscam_enabled"] else "DISABLED"
-        slow_txt = "ENABLED" if s.get("autoslowmode_enabled") else "DISABLED"
         await interaction.response.send_message(
-            f"🛡️ **Anti-Scam Shield** (`{state_txt}`) & **⚡ Dynamic Auto-Slowmode** (`{slow_txt}`)\n"
-            "Configure phishing link protection and automatic update-surge slowmode below:",
+            f"🛡️ **Anti-Scam & Phishing Shield** is currently **{state_txt}**.\n"
+            "Configure log channel and timeout punishment below:",
             view=AntiScamSetupView(interaction.guild.id),
             ephemeral=True,
         )
@@ -6734,8 +6743,11 @@ async def on_ready():
         if s.get("signs_channel_id"):
             signs_ch = guild.get_channel(s["signs_channel_id"])
             if isinstance(signs_ch, discord.TextChannel):
-                synced_signs = await scan_signs_channel_history(signs_ch, limit=150)
-                print(f"[SignsSync] Scanned #{signs_ch.name}: {synced_signs} partner(s) synced ({len(SIGN_PARTNERS_CACHE)} total)")
+                scanned_msgs, synced_signs = await scan_signs_channel_history(signs_ch)
+                print(
+                    f"[SignsSync] Scanned full history of #{signs_ch.name}: "
+                    f"{scanned_msgs} messages, {synced_signs} partner(s) synced ({len(SIGN_PARTNERS_CACHE)} total)"
+                )
 
     checked_units, changed_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
     if checked_units:
@@ -6796,16 +6808,15 @@ async def on_message(message: discord.Message):
         if await handle_antiscam_check(message, settings):
             return
 
-        await handle_dynamic_autoslowmode(message, settings)
-
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
 
         # Auto-parse new sign partner updates posted in #signs-value
         if settings.get("signs_channel_id") and message.channel.id == settings["signs_channel_id"]:
-            if message.content and "sign" in message.content.lower():
+            full_text = _collect_message_full_text(message)
+            if full_text.strip():
                 parse_and_apply_sign_changelog(
-                    message.content,
+                    full_text,
                     guild=message.guild,
                     mentions=list(message.mentions),
                     source="signs-channel-live",
@@ -6829,9 +6840,10 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         return
     settings = get_guild_settings(after.guild.id)
     if settings.get("signs_channel_id") and after.channel.id == settings["signs_channel_id"]:
-        if after.content and "sign" in after.content.lower():
+        full_text = _collect_message_full_text(after)
+        if full_text.strip():
             parse_and_apply_sign_changelog(
-                after.content,
+                full_text,
                 guild=after.guild,
                 mentions=list(after.mentions),
                 source="signs-channel-edit",
@@ -6891,7 +6903,7 @@ async def background_scheduler():
                 break
         asyncio.create_task(sync_value_list_from_website(target_url))
 
-    # 1.5 Periodic RAM cooldown & traffic map cleanup
+    # 1.5 Periodic RAM cooldown cleanup
     if len(VOICE_CREATE_COOLDOWNS) > 2000:
         cutoff_vc = now_f - 60.0
         for uid in [u for u, t in VOICE_CREATE_COOLDOWNS.items() if t < cutoff_vc]:
@@ -6906,22 +6918,6 @@ async def background_scheduler():
             STARBOARD_LOCKS.pop(gid, None)
     for gid in [g for g, until in WFL_BACKOFF_UNTIL.items() if until < now_f]:
         WFL_BACKOFF_UNTIL.pop(gid, None)
-
-    # 1.8 Restore Dynamic Auto-Slowmode once chat traffic calms down
-    for ch_id, info in list(ACTIVE_AUTO_SLOWMODES.items()):
-        if now_f - info["activated_at"] < 45.0:
-            continue
-        dq = CHANNEL_MSG_TIMESTAMPS.get(ch_id)
-        recent_msgs = sum(1 for t in dq if (now_f - t) <= 15.0) if dq else 0
-        if recent_msgs < 8:
-            ACTIVE_AUTO_SLOWMODES.pop(ch_id, None)
-            guild = bot.get_guild(info["guild_id"])
-            ch = guild.get_channel(ch_id) if guild else None
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    await ch.edit(slowmode_delay=info["orig_delay"], reason="Dynamic Auto-Slowmode: traffic normalized")
-                except Exception:
-                    pass
 
     # 2. Backup sweep: delete temporary voice rooms & linked LFG posts when completely empty
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
