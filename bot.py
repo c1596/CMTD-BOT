@@ -101,7 +101,8 @@ def init_db():
                 antiscam_timeout_mins INTEGER DEFAULT 60,
                 value_channel_id INTEGER,
                 value_ping_role_id INTEGER,
-                value_list_url TEXT
+                value_list_url TEXT,
+                value_manager_role_ids TEXT
             )
             """
         )
@@ -118,6 +119,7 @@ def init_db():
             "value_channel_id": "INTEGER",
             "value_ping_role_id": "INTEGER",
             "value_list_url": "TEXT",
+            "value_manager_role_ids": "TEXT",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
@@ -363,7 +365,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             SELECT ideas_channel_id, showcase_channel_id, star_threshold,
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                    antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
-                   value_channel_id, value_ping_role_id, value_list_url
+                   value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -383,6 +385,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "value_channel_id": row[10] if row else None,
             "value_ping_role_id": row[11] if row else None,
             "value_list_url": (row[12] if (row and row[12]) else DEFAULT_VALUE_LIST_URL),
+            "value_manager_role_ids": (row[13] if (row and row[13]) else ""),
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -400,9 +403,9 @@ def update_guild_settings(guild_id: int, **kwargs):
                 guild_id, ideas_channel_id, showcase_channel_id,
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                 antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
-                value_channel_id, value_ping_role_id, value_list_url
+                value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -416,7 +419,8 @@ def update_guild_settings(guild_id: int, **kwargs):
                 antiscam_timeout_mins = excluded.antiscam_timeout_mins,
                 value_channel_id = excluded.value_channel_id,
                 value_ping_role_id = excluded.value_ping_role_id,
-                value_list_url = excluded.value_list_url
+                value_list_url = excluded.value_list_url,
+                value_manager_role_ids = excluded.value_manager_role_ids
             """,
             (
                 guild_id,
@@ -433,9 +437,31 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["value_channel_id"],
                 current["value_ping_role_id"],
                 current["value_list_url"],
+                current["value_manager_role_ids"],
             ),
         )
         conn.commit()
+
+
+def get_value_manager_role_ids(guild_id: int) -> List[int]:
+    raw = get_guild_settings(guild_id).get("value_manager_role_ids", "") or ""
+    role_ids: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            role_ids.append(int(part))
+    return role_ids
+
+
+def has_value_manager_access(member: discord.abc.User) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    allowed_ids = set(get_value_manager_role_ids(member.guild.id))
+    if allowed_ids:
+        return any(r.id in allowed_ids for r in member.roles)
+    return member.guild_permissions.manage_messages
 
 
 def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional[int], Optional[int]]:
@@ -449,7 +475,7 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 
 
 # -------------------------------------------------------------
-# 3. Value List System (Auto-Sync + /value + /value_post)
+# 3. Value List System (Auto-Sync + /value + /value_post + Delete)
 # -------------------------------------------------------------
 KNOWN_UNIT_ALIASES: Dict[str, List[str]] = {
     "upgraded titan tv man": ["uttv", "upgraded titan tv", "ttv"],
@@ -549,6 +575,16 @@ def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
     return ",".join(sorted(aliases))
 
 
+def rebuild_alias_map():
+    VALUE_ALIAS_MAP.clear()
+    for item_key, item in VALUE_ITEMS_CACHE.items():
+        VALUE_ALIAS_MAP[item_key] = item_key
+        for alias in item.get("aliases", "").split(","):
+            a_clean = normalize_unit_key(alias)
+            if a_clean:
+                VALUE_ALIAS_MAP[a_clean] = item_key
+
+
 def reload_value_cache():
     VALUE_ITEMS_CACHE.clear()
     VALUE_ALIAS_MAP.clear()
@@ -576,11 +612,7 @@ def reload_value_cache():
                 "updated_at": row[10] or int(time.time()),
             }
             VALUE_ITEMS_CACHE[row[0]] = item
-            VALUE_ALIAS_MAP[row[0]] = row[0]
-            for alias in item["aliases"].split(","):
-                a_clean = normalize_unit_key(alias)
-                if a_clean:
-                    VALUE_ALIAS_MAP[a_clean] = row[0]
+    rebuild_alias_map()
 
 
 def seed_initial_values_if_empty():
@@ -624,6 +656,31 @@ def find_value_item(query: str) -> Optional[Dict[str, Any]]:
         if q in alias:
             return VALUE_ITEMS_CACHE.get(key)
     return None
+
+
+def delete_value_item(query: str) -> Optional[Dict[str, Any]]:
+    q = normalize_unit_key(query)
+    if not q:
+        return None
+    target = VALUE_ITEMS_CACHE.get(q)
+    if not target and q in VALUE_ALIAS_MAP:
+        target = VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[q])
+    if not target:
+        for item in VALUE_ITEMS_CACHE.values():
+            if normalize_unit_key(item["name"]) == q:
+                target = item
+                break
+    if not target:
+        return None
+
+    item_key = target["item_key"]
+    with get_db() as conn:
+        conn.execute("DELETE FROM value_items WHERE item_key = ?", (item_key,))
+        conn.commit()
+
+    VALUE_ITEMS_CACHE.pop(item_key, None)
+    rebuild_alias_map()
+    return target
 
 
 def upsert_value_item(
@@ -712,7 +769,7 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
         return 0
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.5; +https://discord.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.6; +https://discord.com)",
         "Accept": "text/html,application/xhtml+xml",
     }
     try:
@@ -817,7 +874,9 @@ def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
         if not lines:
             continue
 
-        unit_raw = lines[0].lstrip("-•* ").strip()
+        unit_raw = re.sub(r"^[-•*`#>\s]+|[`*\s]+$", "", lines[0]).strip()
+        if not unit_raw or unit_raw.startswith(("@", "<@")):
+            continue
         if ":" in unit_raw and unit_raw.lower().startswith(("value", "status", "stability", "demand", "sign")):
             continue
 
@@ -838,6 +897,8 @@ def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
         new_sign: Optional[str] = None
 
         for attr_line in lines[1:]:
+            if attr_line.startswith(("@", "<@")):
+                continue
             if ":" not in attr_line:
                 entry["lines"].append(attr_line)
                 continue
@@ -947,6 +1008,34 @@ def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any],
 
     embed.set_footer(
         text=f"{guild.name if guild else 'CMTD'} • Official Value List",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
+
+
+def build_top_values_embed(guild: Optional[discord.Guild]) -> discord.Embed:
+    items = list(VALUE_ITEMS_CACHE.values())
+    items.sort(
+        key=lambda x: (parse_numeric_value(x["value_text"]) or -1.0),
+        reverse=True,
+    )
+    top_items = items[:15]
+    lines: List[str] = []
+    for idx, it in enumerate(top_items, start=1):
+        medal = "🥇" if idx == 1 else ("🥈" if idx == 2 else ("🥉" if idx == 3 else f"`#{idx}`"))
+        lines.append(
+            f"{medal} **{it['name']}** — **`{it['value_text']}`** "
+            f"• Demand: `{it['demand_text']}` • *{it['stability_text']}*"
+        )
+
+    embed = discord.Embed(
+        title="🏆 Top 15 Highest Value Units",
+        description="\n".join(lines) if lines else "*No units tracked yet.*",
+        color=0xF1C40F,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • {len(VALUE_ITEMS_CACHE)} total tracked units",
         icon_url=guild.icon.url if (guild and guild.icon) else None,
     )
     return embed
@@ -1084,8 +1173,23 @@ class ValueHubView(discord.ui.View):
         check_btn.callback = self.on_check_click
         self.add_item(check_btn)
 
+        top_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Top Values",
+            emoji="🏆",
+            custom_id="val_hub:top_values",
+        )
+        top_btn.callback = self.on_top_click
+        self.add_item(top_btn)
+
     async def on_check_click(self, interaction: discord.Interaction):
         await interaction.response.send_modal(QuickValueLookupModal())
+
+    async def on_top_click(self, interaction: discord.Interaction):
+        site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
+        embed = build_top_values_embed(interaction.guild)
+        view = build_link_view("Open Full Value List", site_url)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class ValueChangelogModal(discord.ui.Modal, title="Publish Official Value Changes"):
@@ -1122,6 +1226,12 @@ class ValueChangelogModal(discord.ui.Modal, title="Publish Official Value Change
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
             return
+        if not has_value_manager_access(interaction.user):
+            return await interaction.response.send_message(
+                "❌ You don't have permission to publish value changes.",
+                ephemeral=True,
+            )
+
         settings = get_guild_settings(interaction.guild.id)
         target_ch_id = settings.get("value_channel_id")
         target_ch = interaction.guild.get_channel(target_ch_id) if target_ch_id else interaction.channel
@@ -1176,9 +1286,11 @@ class ValueChangelogModal(discord.ui.Modal, title="Publish Official Value Change
             view=ValueChangelogVoteView(up_count=0, down_count=0),
             allowed_mentions=allowed,
         )
+        updated_names = ", ".join(f"`{e['display_name']}`" for e in parsed[:10])
         ping_note = f" (pinged {ping_role.mention})" if content else " (posted without ping)"
         await interaction.response.send_message(
-            f"✅ Published **{len(parsed)}** unit update(s) in {target_ch.mention}{ping_note} and synced the `/value` database! [Jump to Post]({sent.jump_url})",
+            f"✅ Published **{len(parsed)}** unit update(s) in {target_ch.mention}{ping_note}: {updated_names}\n"
+            f"-# Added a unit by mistake? Remove it with `/value_unit_delete`. [Jump to Post]({sent.jump_url})",
             ephemeral=True,
         )
 
@@ -3696,12 +3808,28 @@ class ValueSetupView(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(label="Set Site URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=2)
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🛡️ Select Value Team Roles (Allowed to use /value_post & delete)...",
+        min_values=1,
+        max_values=10,
+        row=2,
+    )
+    async def select_value_managers(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role_ids_str = ",".join(str(r.id) for r in select.values)
+        update_guild_settings(self.guild_id, value_manager_role_ids=role_ids_str)
+        mentions = ", ".join(f"<@&{r.id}>" for r in select.values)
+        await interaction.response.edit_message(
+            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can now use `/value_post` and `/value_unit_delete`!",
+            view=self,
+        )
+
+    @discord.ui.button(label="Set Site URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=3)
     async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         cur_url = get_guild_settings(self.guild_id)["value_list_url"]
         await interaction.response.send_modal(ValueUrlModal(cur_url))
 
-    @discord.ui.button(label="Sync Website Now", style=discord.ButtonStyle.secondary, emoji="🔄", row=2)
+    @discord.ui.button(label="Sync Website Now", style=discord.ButtonStyle.secondary, emoji="🔄", row=3)
     async def sync_web_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         site_url = get_guild_settings(self.guild_id)["value_list_url"]
@@ -3711,7 +3839,7 @@ class ValueSetupView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=2)
+    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=3)
     async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
             return
@@ -3721,6 +3849,7 @@ class ValueSetupView(discord.ui.View):
             description=(
                 "Check live unit values, demand, and stability right here in Discord or open the full website!\n\n"
                 "• Click **`🔍 Check Unit Value`** below to look up any unit privately.\n"
+                "• Click **`🏆 Top Values`** to view the Top 15 highest value units.\n"
                 "• Or type `/value` in chat with instant autocomplete."
             ),
             color=0x3498DB,
@@ -3733,6 +3862,14 @@ class ValueSetupView(discord.ui.View):
         await interaction.response.send_message(
             f"📌 Value List Hub posted! [Jump to Message]({sent.jump_url})",
             ephemeral=True,
+        )
+
+    @discord.ui.button(label="Clear Team Roles", style=discord.ButtonStyle.danger, emoji="🧹", row=3)
+    async def clear_managers_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, value_manager_role_ids="")
+        await interaction.response.edit_message(
+            content="🧹 Custom Value Team roles cleared (reverted to `Manage Messages` / `Administrator`).",
+            view=self,
         )
 
 
@@ -3854,6 +3991,11 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     booster = f"<@&{s['booster_role_id']}>" if s["booster_role_id"] else "`Not Set`"
     autorole = f"<@&{s['autorole_id']}>" if s["autorole_id"] else "`Not Set`"
 
+    mgr_ids = get_value_manager_role_ids(guild.id)
+    val_mgr_txt = ", ".join(f"<@&{rid}>" for rid in mgr_ids[:4]) if mgr_ids else "`Default (Manage Messages)`"
+    if len(mgr_ids) > 4:
+        val_mgr_txt += f" (+{len(mgr_ids) - 4})"
+
     detected_wfl = await resolve_wfl_emojis(guild)
     if len(detected_wfl) == 3:
         wfl_status = " ".join(str(e) for e in detected_wfl)
@@ -3881,11 +4023,11 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="🔊 Voice 2.0 Trigger", value=jtc, inline=True)
     embed.add_field(name="💎 Value Channel", value=val_ch, inline=True)
     embed.add_field(name="🏷️ Value Ping Role", value=val_role, inline=True)
-    embed.add_field(name="📦 Tracked Units", value=f"`{len(VALUE_ITEMS_CACHE)}` units", inline=True)
+    embed.add_field(name="🛡️ Value Team Roles", value=val_mgr_txt, inline=True)
     embed.add_field(name="🛡️ Anti-Scam Shield", value=shield_status, inline=True)
     embed.add_field(name="🔒 Server Lockdown", value=lock_status, inline=True)
     embed.add_field(name="🚀 Booster / Auto-Role", value=f"{booster} / {autorole}", inline=True)
-    embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members")
+    embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} tracked units")
     return embed
 
 
@@ -3938,11 +4080,14 @@ class ControlPanelView(discord.ui.View):
         if not interaction.guild:
             return
         s = get_guild_settings(interaction.guild.id)
+        mgr_ids = get_value_manager_role_ids(interaction.guild.id)
+        mgr_display = ", ".join(f"<@&{rid}>" for rid in mgr_ids) if mgr_ids else "`Default (Manage Messages / Admin)`"
         await interaction.response.send_message(
             f"💎 **Value List & Changelog System**\n"
             f"• **Website:** {s['value_list_url']}\n"
             f"• **Tracked Units:** `{len(VALUE_ITEMS_CACHE)}`\n"
-            "Configure your changelog channel, ping role, or post the pinned Value Hub below:",
+            f"• **Allowed Team Roles (`/value_post` & `/value_unit_delete`):** {mgr_display}\n\n"
+            "Configure your changelog channel, ping role, team roles (multi-select), or post the pinned Value Hub below:",
             view=ValueSetupView(interaction.guild.id),
             ephemeral=True,
         )
@@ -4031,9 +4176,39 @@ async def value_cmd(interaction: discord.Interaction, unit: str, public: bool = 
 
 
 @bot.tree.command(name="value_post", description="Publish formatted value list changes & auto-update the bot's value database")
-@app_commands.default_permissions(manage_messages=True)
 async def value_post_cmd(interaction: discord.Interaction):
+    if not interaction.guild:
+        return
+    if not has_value_manager_access(interaction.user):
+        return await interaction.response.send_message(
+            "❌ You need one of the configured **Value Team** roles (or Administrator) to use `/value_post`.",
+            ephemeral=True,
+        )
     await interaction.response.send_modal(ValueChangelogModal())
+
+
+@bot.tree.command(name="value_unit_delete", description="Remove an accidentally added or outdated unit from the bot's value list")
+@app_commands.describe(unit="Select or type the exact unit name to remove from /value")
+@app_commands.autocomplete(unit=unit_name_autocomplete)
+async def value_unit_delete_cmd(interaction: discord.Interaction, unit: str):
+    if not interaction.guild:
+        return
+    if not has_value_manager_access(interaction.user):
+        return await interaction.response.send_message(
+            "❌ You need one of the configured **Value Team** roles (or Administrator) to use `/value_unit_delete`.",
+            ephemeral=True,
+        )
+
+    deleted = delete_value_item(unit)
+    if not deleted:
+        return await interaction.response.send_message(
+            f"❌ Unit `{unit}` was not found in the database.",
+            ephemeral=True,
+        )
+    await interaction.response.send_message(
+        f"🗑️ Deleted **{deleted['name']}** (`Value: {deleted['value_text']}` • `Demand: {deleted['demand_text']}`) from the value list!",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="panel", description="Open the server configuration panel")
@@ -4281,8 +4456,6 @@ async def stats_cmd(interaction: discord.Interaction):
         total_ideas = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM polls WHERE is_closed = 0")
         active_polls = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM scheduled_events WHERE started = 0")
-        active_events = c.fetchone()[0]
 
     embed = discord.Embed(title="📈 Bot Performance & Metrics", color=0x2ECC71)
     embed.add_field(name="🏓 Latency", value=f"`{round(bot.latency * 1000)} ms`", inline=True)
