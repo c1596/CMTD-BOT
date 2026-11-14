@@ -1375,17 +1375,13 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
         embed.add_field(name="📤 You Give", value=_format_lines(give_side), inline=False)
         embed.add_field(name="📥 You Get", value=_format_lines(get_side), inline=False)
 
-        notes: List[str] = [
-            f"🔥 **Demand Comparison:** Give `{give_side['avg_demand']:.1f}/10` vs Get `{get_side['avg_demand']:.1f}/10`"
-        ]
         all_unknown = give_side["unknown"] + get_side["unknown"]
         if all_unknown:
-            notes.append(f"⚠️ **Unrecognized:** `{', '.join(all_unknown[:8])}`")
-        if get_side["warnings"]:
-            notes.append(f"📉 **Dropping / Underpaid items on Get side:** `{', '.join(get_side['warnings'])}`")
-        if give_side["warnings"]:
-            notes.append(f"📉 **Dropping / Underpaid items on Give side:** `{', '.join(give_side['warnings'])}`")
-        embed.add_field(name="📋 Summary & Notes", value="\n".join(notes), inline=False)
+            embed.add_field(
+                name="⚠️ Unrecognized Items",
+                value=f"`{', '.join(all_unknown[:8])}`",
+                inline=False,
+            )
 
         embed.set_footer(
             text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value Calculator",
