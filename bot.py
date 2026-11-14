@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import subprocess
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 try:
     from zoneinfo import ZoneInfo
@@ -44,17 +44,21 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot_database.db")
 
 SETTINGS_CACHE: Dict[int, Dict[str, Any]] = {}
-WFL_EMOJI_CACHE: Dict[int, List[discord.Emoji]] = {}
+WFL_EMOJI_CACHE: Dict[int, List[Any]] = {}
+APP_EMOJIS_CACHE: List[Any] = []
 STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
+LOCKDOWN_IN_PROGRESS: Set[int] = set()
 
 # Temporary Voice RAM State
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
 VOICE_CREATE_COOLDOWNS: Dict[int, float] = {}
-VOICE_INACTIVITY_SECONDS = 300  # 5 minutes of inactivity
+VOICE_WARNING_SECONDS = 240     # 4 minutes: send Keep Alive warning
+VOICE_INACTIVITY_SECONDS = 300  # 5 minutes: delete inactive room
 
 WFL_EMOJI_NAMES = ("w1_win", "w1_fair", "w1_lose")
 POLL_NUM_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
+YOUTUBE_ACTIVITY_ID = 880218394199220334  # Discord Watch Together Activity
 
 
 def get_db() -> sqlite3.Connection:
@@ -78,16 +82,29 @@ def init_db():
                 booster_role_id INTEGER,
                 autorole_id INTEGER,
                 wfl_channel_id INTEGER,
-                jtc_channel_id INTEGER
+                jtc_channel_id INTEGER,
+                antiscam_enabled INTEGER DEFAULT 0,
+                antiscam_log_channel_id INTEGER,
+                antiscam_timeout_mins INTEGER DEFAULT 60
             )
             """
         )
         c.execute("PRAGMA table_info(guild_settings)")
         cols = {row[1] for row in c.fetchall()}
-        for col_name in ("booster_role_id", "autorole_id", "wfl_channel_id", "jtc_channel_id"):
+        extra_cols = {
+            "booster_role_id": "INTEGER",
+            "autorole_id": "INTEGER",
+            "wfl_channel_id": "INTEGER",
+            "jtc_channel_id": "INTEGER",
+            "antiscam_enabled": "INTEGER DEFAULT 0",
+            "antiscam_log_channel_id": "INTEGER",
+            "antiscam_timeout_mins": "INTEGER DEFAULT 60",
+        }
+        for col_name, col_type in extra_cols.items():
             if col_name not in cols:
-                c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} INTEGER")
+                c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} {col_type}")
 
+        # Temporary Voice Rooms & Personal Presets (Voice 2.0)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS temp_voices (
@@ -99,11 +116,53 @@ def init_db():
                 last_active_at INTEGER,
                 last_renamed_at INTEGER DEFAULT 0,
                 is_locked INTEGER DEFAULT 0,
-                is_hidden INTEGER DEFAULT 0
+                is_hidden INTEGER DEFAULT 0,
+                warned_inactive INTEGER DEFAULT 0
+            )
+            """
+        )
+        c.execute("PRAGMA table_info(temp_voices)")
+        tv_cols = {row[1] for row in c.fetchall()}
+        if "warned_inactive" not in tv_cols:
+            c.execute("ALTER TABLE temp_voices ADD COLUMN warned_inactive INTEGER DEFAULT 0")
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_voice_presets (
+                user_id INTEGER PRIMARY KEY,
+                custom_name TEXT,
+                user_limit INTEGER DEFAULT 0,
+                default_locked INTEGER DEFAULT 0,
+                default_hidden INTEGER DEFAULT 0
             )
             """
         )
 
+        # Lockdown Snapshots & Whitelist
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lockdown_snapshots (
+                guild_id INTEGER,
+                channel_id INTEGER,
+                prev_send_messages INTEGER,
+                prev_send_in_threads INTEGER,
+                prev_create_threads INTEGER,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lockdown_whitelist (
+                guild_id INTEGER,
+                target_id INTEGER,
+                target_type TEXT,
+                PRIMARY KEY (guild_id, target_id)
+            )
+            """
+        )
+
+        # Starboard / Showcase
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS starboard_entries (
@@ -124,6 +183,8 @@ def init_db():
             )
             """
         )
+
+        # Custom Posts
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS custom_posts (
@@ -140,6 +201,8 @@ def init_db():
             )
             """
         )
+
+        # Scheduled Events
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS scheduled_events (
@@ -202,6 +265,8 @@ def init_db():
             )
             """
         )
+
+        # Polls
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS polls (
@@ -229,6 +294,7 @@ def init_db():
             )
             """
         )
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_starboard_showcase ON starboard_entries(showcase_message_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_polls_active ON polls(is_closed, ends_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_active ON scheduled_events(started, start_ts)")
@@ -247,7 +313,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
         c.execute(
             """
             SELECT ideas_channel_id, showcase_channel_id, star_threshold,
-                   booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id
+                   booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
+                   antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -261,6 +328,9 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "autorole_id": row[4] if row else None,
             "wfl_channel_id": row[5] if row else None,
             "jtc_channel_id": row[6] if row else None,
+            "antiscam_enabled": bool(row[7]) if row else False,
+            "antiscam_log_channel_id": row[8] if row else None,
+            "antiscam_timeout_mins": row[9] if (row and row[9] is not None) else 60,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -276,9 +346,10 @@ def update_guild_settings(guild_id: int, **kwargs):
             """
             INSERT INTO guild_settings (
                 guild_id, ideas_channel_id, showcase_channel_id,
-                star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id
+                star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
+                antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -286,7 +357,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 booster_role_id = excluded.booster_role_id,
                 autorole_id = excluded.autorole_id,
                 wfl_channel_id = excluded.wfl_channel_id,
-                jtc_channel_id = excluded.jtc_channel_id
+                jtc_channel_id = excluded.jtc_channel_id,
+                antiscam_enabled = excluded.antiscam_enabled,
+                antiscam_log_channel_id = excluded.antiscam_log_channel_id,
+                antiscam_timeout_mins = excluded.antiscam_timeout_mins
             """,
             (
                 guild_id,
@@ -297,23 +371,12 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["autorole_id"],
                 current["wfl_channel_id"],
                 current["jtc_channel_id"],
+                1 if current["antiscam_enabled"] else 0,
+                current["antiscam_log_channel_id"],
+                current["antiscam_timeout_mins"],
             ),
         )
         conn.commit()
-
-
-def get_wfl_emojis(guild: discord.Guild) -> List[discord.Emoji]:
-    if guild.id in WFL_EMOJI_CACHE:
-        return WFL_EMOJI_CACHE[guild.id]
-    guild_map = {e.name.lower(): e for e in guild.emojis}
-    bot_map = {e.name.lower(): e for e in bot.emojis}
-    found = []
-    for name in WFL_EMOJI_NAMES:
-        em = guild_map.get(name) or bot_map.get(name)
-        if em:
-            found.append(em)
-    WFL_EMOJI_CACHE[guild.id] = found
-    return found
 
 
 def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional[int], Optional[int]]:
@@ -347,6 +410,7 @@ class CommunityBot(commands.Bot):
         self.add_view(PollView(option_count=5, closed=False))
         self.add_view(EventFollowView(count=0, disabled=False))
         self.add_view(VoiceControlView())
+        self.add_view(VoiceKeepAliveView())
         if not background_scheduler.is_running():
             background_scheduler.start()
 
@@ -355,8 +419,577 @@ bot = CommunityBot()
 
 
 # -------------------------------------------------------------
-# 4. Private Temporary Voice Channels (Join to Create)
+# 4. Reliable W/F/L Emoji Resolver & Reaction Queue
 # -------------------------------------------------------------
+async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) -> List[Any]:
+    global APP_EMOJIS_CACHE
+    if not force_refresh and guild.id in WFL_EMOJI_CACHE and len(WFL_EMOJI_CACHE[guild.id]) == 3:
+        return WFL_EMOJI_CACHE[guild.id]
+
+    guild_map = {e.name.lower(): e for e in guild.emojis}
+    bot_map = {e.name.lower(): e for e in bot.emojis}
+    app_map = {e.name.lower(): e for e in APP_EMOJIS_CACHE}
+
+    found = []
+    for name in WFL_EMOJI_NAMES:
+        em = guild_map.get(name) or bot_map.get(name) or app_map.get(name)
+        if em:
+            found.append(em)
+
+    # If any of the 3 emojis are missing from local cache, fetch directly from Discord API
+    if len(found) < 3:
+        try:
+            fetched_guild_emojis = await guild.fetch_emojis()
+            for e in fetched_guild_emojis:
+                guild_map[e.name.lower()] = e
+        except Exception:
+            pass
+
+        if len(guild_map) < 3 or any(n not in guild_map and n not in bot_map for n in WFL_EMOJI_NAMES):
+            try:
+                APP_EMOJIS_CACHE = await bot.fetch_application_emojis()
+                app_map = {e.name.lower(): e for e in APP_EMOJIS_CACHE}
+            except Exception:
+                pass
+
+        found = []
+        for name in WFL_EMOJI_NAMES:
+            em = guild_map.get(name) or bot_map.get(name) or app_map.get(name)
+            if em:
+                found.append(em)
+
+    # Only cache when all 3 are resolved so transient empty caches never stick
+    if len(found) == 3:
+        WFL_EMOJI_CACHE[guild.id] = found
+    return found
+
+
+async def apply_wfl_reactions(message: discord.Message):
+    if not message.guild:
+        return
+    emojis = await resolve_wfl_emojis(message.guild)
+    if not emojis:
+        return
+
+    for emoji in emojis:
+        for attempt in range(3):
+            try:
+                await message.add_reaction(emoji)
+                await asyncio.sleep(0.25)
+                break
+            except discord.NotFound:
+                # Message was deleted by user/automod
+                return
+            except discord.Forbidden:
+                # Bot lacks Add Reactions or Use External Emojis permission in this channel
+                return
+            except discord.HTTPException:
+                await asyncio.sleep(0.6 * (attempt + 1))
+
+
+# -------------------------------------------------------------
+# 5. Smart Anti-Scam & Phishing Shield (Configurable in /panel)
+# -------------------------------------------------------------
+URL_EXTRACT_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)", re.IGNORECASE)
+
+SAFE_DOMAINS = {
+    "roblox.com",
+    "www.roblox.com",
+    "web.roblox.com",
+    "devforum.roblox.com",
+    "create.roblox.com",
+    "corp.roblox.com",
+    "discord.com",
+    "www.discord.com",
+    "discord.gg",
+    "discordapp.com",
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "twitter.com",
+    "x.com",
+    "tenor.com",
+    "giphy.com",
+    "imgur.com",
+    "i.imgur.com",
+}
+
+PHISHING_DOMAIN_PATTERNS = (
+    re.compile(r"(^|\.)rob[il1]ox", re.IGNORECASE),
+    re.compile(r"(^|\.)r[o0]b[il1][o0]x", re.IGNORECASE),
+    re.compile(r"roblox\.com\.[a-z]{2,}", re.IGNORECASE),
+    re.compile(r"roblox-[a-z0-9-]+\.", re.IGNORECASE),
+    re.compile(r"(^|\.)d[il1]sc[o0]rd(?!app\.com$|a\.com$|\.com$|\.gg$|\.media$|\.gift$)", re.IGNORECASE),
+    re.compile(r"discord-?nitro", re.IGNORECASE),
+    re.compile(r"steamcommun[il1]ty", re.IGNORECASE),
+)
+
+
+def detect_phishing_domain(content: str) -> Optional[str]:
+    if "http://" not in content.lower() and "https://" not in content.lower():
+        return None
+    for match in URL_EXTRACT_RE.finditer(content):
+        domain = match.group(1).lower().rstrip(".")
+        if domain in SAFE_DOMAINS:
+            continue
+        for pat in PHISHING_DOMAIN_PATTERNS:
+            if pat.search(domain):
+                return domain
+    return None
+
+
+async def handle_antiscam_check(message: discord.Message, settings: Dict[str, Any]) -> bool:
+    if not settings.get("antiscam_enabled"):
+        return False
+    if not message.guild or not isinstance(message.author, discord.Member):
+        return False
+    # Staff immunity
+    if message.author.guild_permissions.manage_messages or message.author.guild_permissions.administrator:
+        return False
+
+    bad_domain = detect_phishing_domain(message.content)
+    if not bad_domain:
+        return False
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    timeout_mins = settings.get("antiscam_timeout_mins", 60)
+    action_note = "Message deleted."
+    if timeout_mins and timeout_mins > 0:
+        try:
+            await message.author.timeout(
+                timedelta(minutes=timeout_mins),
+                reason=f"Anti-Scam Shield: phishing domain ({bad_domain})",
+            )
+            action_note = f"Message deleted + **{timeout_mins}m timeout** applied."
+        except Exception:
+            action_note = "Message deleted (missing permission to timeout member)."
+
+    log_ch_id = settings.get("antiscam_log_channel_id")
+    if log_ch_id:
+        log_ch = message.guild.get_channel(log_ch_id)
+        if isinstance(log_ch, discord.TextChannel):
+            embed = discord.Embed(
+                title="🛡️ Anti-Scam Shield Triggered",
+                color=0xE74C3C,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.add_field(
+                name="👤 Offender",
+                value=f"{message.author.mention} (`{message.author.id}`)",
+                inline=True,
+            )
+            embed.add_field(name="📍 Channel", value=message.channel.mention, inline=True)
+            embed.add_field(name="🚨 Flagged Domain", value=f"`{bad_domain}`", inline=True)
+            embed.add_field(name="⚡ Action Taken", value=action_note, inline=False)
+            safe_preview = discord.utils.escape_markdown(message.content[:500])
+            embed.add_field(name="📝 Blocked Content", value=f"```{safe_preview}```", inline=False)
+            try:
+                await log_ch.send(embed=embed)
+            except Exception:
+                pass
+    return True
+
+
+# -------------------------------------------------------------
+# 6. Server Lockdown System (/closeall, /openall, /lockdown_ignore)
+# -------------------------------------------------------------
+def is_lockdown_active(guild_id: int) -> bool:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM lockdown_snapshots WHERE guild_id = ? LIMIT 1", (guild_id,))
+        return c.fetchone() is not None
+
+
+def get_lockdown_whitelist(guild_id: int) -> Dict[int, str]:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT target_id, target_type FROM lockdown_whitelist WHERE guild_id = ?", (guild_id,))
+        return dict(c.fetchall())
+
+
+def toggle_lockdown_whitelist(guild_id: int, target_id: int, target_type: str) -> bool:
+    """Returns True if added to whitelist, False if removed."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM lockdown_whitelist WHERE guild_id = ? AND target_id = ?",
+            (guild_id, target_id),
+        )
+        exists = c.fetchone() is not None
+        if exists:
+            c.execute(
+                "DELETE FROM lockdown_whitelist WHERE guild_id = ? AND target_id = ?",
+                (guild_id, target_id),
+            )
+            conn.commit()
+            return False
+        else:
+            c.execute(
+                "INSERT INTO lockdown_whitelist (guild_id, target_id, target_type) VALUES (?, ?, ?)",
+                (guild_id, target_id, target_type),
+            )
+            conn.commit()
+            return True
+
+
+def encode_perm_bool(val: Optional[bool]) -> int:
+    if val is True:
+        return 1
+    if val is False:
+        return 0
+    return -1  # None (inherited)
+
+
+def decode_perm_bool(code: int) -> Optional[bool]:
+    if code == 1:
+        return True
+    if code == 0:
+        return False
+    return None
+
+
+@bot.tree.command(name="closeall", description="Safely lock all open public channels while keeping read-only channels untouched")
+@app_commands.describe(
+    reason="Reason shown in locked channels (optional)",
+    announce="Send a lock notice message into each locked channel (default: True)",
+)
+@app_commands.default_permissions(administrator=True)
+async def closeall_cmd(
+    interaction: discord.Interaction,
+    reason: str = "Temporary server lockdown by administration.",
+    announce: bool = True,
+):
+    if not interaction.guild:
+        return
+    guild = interaction.guild
+
+    if guild.id in LOCKDOWN_IN_PROGRESS:
+        return await interaction.response.send_message(
+            "⏳ A lockdown operation is already running on this server. Please wait.",
+            ephemeral=True,
+        )
+    if is_lockdown_active(guild.id):
+        return await interaction.response.send_message(
+            "⚠️ Server is **already locked down**! Run `/openall` first before using `/closeall` again so your clean channel snapshot is preserved.",
+            ephemeral=True,
+        )
+
+    LOCKDOWN_IN_PROGRESS.add(guild.id)
+    await interaction.response.send_message("🔒 Scanning channel permissions & starting safe lockdown...", ephemeral=True)
+
+    try:
+        whitelist = get_lockdown_whitelist(guild.id)
+        everyone = guild.default_role
+
+        channels_to_lock: List[discord.TextChannel] = []
+        skipped_readonly = 0
+        skipped_whitelisted = 0
+
+        for ch in guild.text_channels:
+            if ch.id in whitelist or (ch.category_id and ch.category_id in whitelist):
+                skipped_whitelisted += 1
+                continue
+
+            # Check if @everyone can actually send messages right now.
+            # Channels like #announcements, #update-logs, #rules have send_messages=False and are skipped!
+            effective_perms = ch.permissions_for(everyone)
+            if not effective_perms.send_messages:
+                skipped_readonly += 1
+                continue
+
+            channels_to_lock.append(ch)
+
+        if not channels_to_lock:
+            return await interaction.edit_original_response(
+                content=(
+                    f"ℹ️ No open public channels needed locking.\n"
+                    f"• Read-only skipped (e.g. announcements/logs): `{skipped_readonly}`\n"
+                    f"• Whitelisted skipped: `{skipped_whitelisted}`"
+                )
+            )
+
+        snapshot_rows = []
+        locked_count = 0
+        failed_count = 0
+
+        notice_embed = discord.Embed(
+            title="🔒 Channel Temporarily Locked",
+            description=f"**Reason:** {reason.strip()}",
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        notice_embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
+
+        for idx, ch in enumerate(channels_to_lock, start=1):
+            ow = ch.overwrites_for(everyone)
+            snapshot_rows.append(
+                (
+                    guild.id,
+                    ch.id,
+                    encode_perm_bool(ow.send_messages),
+                    encode_perm_bool(ow.send_messages_in_threads),
+                    encode_perm_bool(ow.create_public_threads),
+                )
+            )
+            ow.send_messages = False
+            ow.send_messages_in_threads = False
+            ow.create_public_threads = False
+
+            try:
+                await ch.set_permissions(everyone, overwrite=ow, reason=f"Lockdown by {interaction.user}: {reason[:80]}")
+                locked_count += 1
+                if announce:
+                    try:
+                        await ch.send(embed=notice_embed)
+                    except Exception:
+                        pass
+            except Exception:
+                failed_count += 1
+
+            # Rate-limit protection for 80k+ servers
+            await asyncio.sleep(0.35)
+            if idx % 8 == 0 and idx < len(channels_to_lock):
+                try:
+                    await interaction.edit_original_response(
+                        content=f"🔒 Locking channels... (**{idx}/{len(channels_to_lock)}**)"
+                    )
+                except Exception:
+                    pass
+
+        with get_db() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO lockdown_snapshots
+                (guild_id, channel_id, prev_send_messages, prev_send_in_threads, prev_create_threads)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                snapshot_rows,
+            )
+            conn.commit()
+
+        summary = discord.Embed(
+            title="🔒 Server Lockdown Complete",
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        summary.add_field(name="🔒 Channels Locked", value=f"`{locked_count}`", inline=True)
+        summary.add_field(name="🛡️ Read-Only Preserved", value=f"`{skipped_readonly}`", inline=True)
+        summary.add_field(name="📋 Whitelisted Skipped", value=f"`{skipped_whitelisted}`", inline=True)
+        if failed_count:
+            summary.add_field(name="⚠️ Missing Perms", value=f"`{failed_count}`", inline=True)
+        summary.add_field(name="📝 Reason", value=reason.strip(), inline=False)
+        summary.set_footer(text="Run /openall when ready to restore exact permissions.")
+        await interaction.edit_original_response(content=None, embed=summary)
+    finally:
+        LOCKDOWN_IN_PROGRESS.discard(guild.id)
+
+
+@bot.tree.command(name="openall", description="Restore all channels locked by /closeall without opening announcements/logs")
+@app_commands.describe(announce="Send an unlock notice into each restored channel (default: True)")
+@app_commands.default_permissions(administrator=True)
+async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
+    if not interaction.guild:
+        return
+    guild = interaction.guild
+
+    if guild.id in LOCKDOWN_IN_PROGRESS:
+        return await interaction.response.send_message(
+            "⏳ A lockdown operation is currently in progress. Please wait.",
+            ephemeral=True,
+        )
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT channel_id, prev_send_messages, prev_send_in_threads, prev_create_threads
+            FROM lockdown_snapshots WHERE guild_id = ?
+            """,
+            (guild.id,),
+        )
+        rows = c.fetchall()
+
+    if not rows:
+        return await interaction.response.send_message(
+            "ℹ️ No active lockdown snapshot found for this server.",
+            ephemeral=True,
+        )
+
+    LOCKDOWN_IN_PROGRESS.add(guild.id)
+    await interaction.response.send_message(
+        f"🔓 Restoring permissions for **{len(rows)}** channels from snapshot...",
+        ephemeral=True,
+    )
+
+    try:
+        everyone = guild.default_role
+        restored_count = 0
+        missing_count = 0
+
+        unlock_embed = discord.Embed(
+            title="🔓 Channel Unlocked",
+            description="Chat permissions have been restored by administration.",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+        unlock_embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
+
+        for idx, (ch_id, prev_send, prev_threads, prev_create) in enumerate(rows, start=1):
+            ch = guild.get_channel(ch_id)
+            if not isinstance(ch, discord.TextChannel):
+                missing_count += 1
+                continue
+
+            ow = ch.overwrites_for(everyone)
+            ow.send_messages = decode_perm_bool(prev_send)
+            ow.send_messages_in_threads = decode_perm_bool(prev_threads)
+            ow.create_public_threads = decode_perm_bool(prev_create)
+
+            try:
+                if ow.is_empty():
+                    await ch.set_permissions(everyone, overwrite=None, reason=f"Lockdown lifted by {interaction.user}")
+                else:
+                    await ch.set_permissions(everyone, overwrite=ow, reason=f"Lockdown lifted by {interaction.user}")
+                restored_count += 1
+                if announce:
+                    try:
+                        await ch.send(embed=unlock_embed)
+                    except Exception:
+                        pass
+            except Exception:
+                missing_count += 1
+
+            await asyncio.sleep(0.35)
+            if idx % 8 == 0 and idx < len(rows):
+                try:
+                    await interaction.edit_original_response(
+                        content=f"🔓 Restoring channels... (**{idx}/{len(rows)}**)"
+                    )
+                except Exception:
+                    pass
+
+        with get_db() as conn:
+            conn.execute("DELETE FROM lockdown_snapshots WHERE guild_id = ?", (guild.id,))
+            conn.commit()
+
+        summary = discord.Embed(
+            title="🔓 Server Lockdown Lifted",
+            description="All locked channels have been restored to their exact pre-lockdown permissions. Read-only channels remained untouched.",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+        summary.add_field(name="🔓 Channels Restored", value=f"`{restored_count}`", inline=True)
+        if missing_count:
+            summary.add_field(name="⚠️ Skipped / Deleted", value=f"`{missing_count}`", inline=True)
+        await interaction.edit_original_response(content=None, embed=summary)
+    finally:
+        LOCKDOWN_IN_PROGRESS.discard(guild.id)
+
+
+@bot.tree.command(name="lockdown_ignore", description="Add or remove a channel/category from /closeall lockdown")
+@app_commands.describe(
+    channel="Text channel to ignore/unignore during /closeall",
+    category="Entire category to ignore/unignore during /closeall",
+)
+@app_commands.default_permissions(administrator=True)
+async def lockdown_ignore_cmd(
+    interaction: discord.Interaction,
+    channel: Optional[discord.TextChannel] = None,
+    category: Optional[discord.CategoryChannel] = None,
+):
+    if not interaction.guild:
+        return
+    guild = interaction.guild
+    actions = []
+
+    if channel:
+        added = toggle_lockdown_whitelist(guild.id, channel.id, "channel")
+        actions.append(f"{'✅ Added' if added else '🗑️ Removed'} channel {channel.mention}")
+    if category:
+        added = toggle_lockdown_whitelist(guild.id, category.id, "category")
+        actions.append(f"{'✅ Added' if added else '🗑️ Removed'} category **{category.name}**")
+
+    wl = get_lockdown_whitelist(guild.id)
+    items_desc = []
+    for tid, ttype in wl.items():
+        if ttype == "category":
+            cat = guild.get_channel(tid)
+            items_desc.append(f"📁 **{cat.name if cat else tid}** (Category)")
+        else:
+            items_desc.append(f"💬 <#{tid}>")
+
+    embed = discord.Embed(
+        title="📋 Lockdown Whitelist (Ignored by /closeall)",
+        description="\n".join(items_desc) if items_desc else "*No channels or categories whitelisted yet.*",
+        color=0x5865F2,
+    )
+    header = "\n".join(actions) if actions else "Pass a `channel` or `category` parameter to toggle it in this list."
+    await interaction.response.send_message(content=header, embed=embed, ephemeral=True)
+
+
+# -------------------------------------------------------------
+# 7. Private Temporary Voice Channels 2.0 (Presets, Quick Modes, Watch Together)
+# -------------------------------------------------------------
+def get_user_voice_preset(user_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT custom_name, user_limit, default_locked, default_hidden FROM user_voice_presets WHERE user_id = ?",
+            (user_id,),
+        )
+        row = c.fetchone()
+    if not row:
+        return {
+            "custom_name": None,
+            "user_limit": 0,
+            "default_locked": False,
+            "default_hidden": False,
+        }
+    return {
+        "custom_name": row[0],
+        "user_limit": row[1] or 0,
+        "default_locked": bool(row[2]),
+        "default_hidden": bool(row[3]),
+    }
+
+
+def save_user_voice_preset(user_id: int, **kwargs):
+    current = get_user_voice_preset(user_id)
+    current.update(kwargs)
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_voice_presets (user_id, custom_name, user_limit, default_locked, default_hidden)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                custom_name = excluded.custom_name,
+                user_limit = excluded.user_limit,
+                default_locked = excluded.default_locked,
+                default_hidden = excluded.default_hidden
+            """,
+            (
+                user_id,
+                current["custom_name"],
+                current["user_limit"],
+                1 if current["default_locked"] else 0,
+                1 if current["default_hidden"] else 0,
+            ),
+        )
+        conn.commit()
+
+
+def reset_user_voice_preset(user_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM user_voice_presets WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
 def load_temp_voices_from_db():
     TEMP_VOICE_CACHE.clear()
     with get_db() as conn:
@@ -364,7 +997,7 @@ def load_temp_voices_from_db():
         c.execute(
             """
             SELECT channel_id, guild_id, owner_id, control_message_id,
-                   created_at, last_active_at, last_renamed_at, is_locked, is_hidden
+                   created_at, last_active_at, last_renamed_at, is_locked, is_hidden, warned_inactive
             FROM temp_voices
             """
         )
@@ -379,6 +1012,7 @@ def load_temp_voices_from_db():
                 "last_renamed_at": row[6] or 0,
                 "is_locked": bool(row[7]),
                 "is_hidden": bool(row[8]),
+                "warned_inactive": bool(row[9]),
             }
 
 
@@ -392,9 +1026,9 @@ def save_temp_voice(room: Dict[str, Any]):
             """
             INSERT OR REPLACE INTO temp_voices (
                 channel_id, guild_id, owner_id, control_message_id,
-                created_at, last_active_at, last_renamed_at, is_locked, is_hidden
+                created_at, last_active_at, last_renamed_at, is_locked, is_hidden, warned_inactive
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 room["channel_id"],
@@ -406,6 +1040,7 @@ def save_temp_voice(room: Dict[str, Any]):
                 room.get("last_renamed_at", 0),
                 1 if room.get("is_locked") else 0,
                 1 if room.get("is_hidden") else 0,
+                1 if room.get("warned_inactive") else 0,
             ),
         )
         conn.commit()
@@ -416,13 +1051,14 @@ def touch_temp_voice_activity(channel_id: int):
     if not room:
         return
     now_ts = int(time.time())
-    # Throttle DB writes to once every 10 seconds while keeping RAM instant
-    should_persist = (now_ts - room.get("last_active_at", 0)) >= 10
+    was_warned = room.get("warned_inactive", False)
+    should_persist = was_warned or ((now_ts - room.get("last_active_at", 0)) >= 10)
     room["last_active_at"] = now_ts
+    room["warned_inactive"] = False
     if should_persist:
         with get_db() as conn:
             conn.execute(
-                "UPDATE temp_voices SET last_active_at = ? WHERE channel_id = ?",
+                "UPDATE temp_voices SET last_active_at = ?, warned_inactive = 0 WHERE channel_id = ?",
                 (now_ts, channel_id),
             )
             conn.commit()
@@ -450,13 +1086,18 @@ def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any
     limit_str = f"`{channel.user_limit}` slots" if channel.user_limit > 0 else "`Unlimited`"
     status_badges.append(f"👥 {limit_str}")
 
+    owner_member = channel.guild.get_member(room["owner_id"])
+    if owner_member and owner_member.premium_since is not None:
+        status_badges.append(f"🚀 **{channel.bitrate // 1000}kbps HD**")
+
     embed = discord.Embed(
-        title="🎛️ Private Voice Room Controls",
+        title="🎛️ Private Voice Room Controls 2.0",
         description=(
             f"**Room Owner:** <@{room['owner_id']}>\n"
             f"**Status:** {' • '.join(status_badges)}\n\n"
-            "Use the buttons and menus below to customize access, user limit, or room name.\n"
-            "-# ⏱️ Rooms auto-delete immediately when everyone leaves or after **5 minutes** of inactivity."
+            "• Your room name, limit & lock settings are **auto-saved** for your next session.\n"
+            "• Use **Watch Together** to queue YouTube/music right inside this room.\n"
+            "-# ⏱️ Auto-deletes when empty or after **5 minutes** of inactivity (with a 1-min warning)."
         ),
         color=0xE74C3C if room.get("is_locked") else 0x2ECC71,
     )
@@ -475,9 +1116,63 @@ async def refresh_voice_control_panel(channel: discord.VoiceChannel, room: Dict[
         pass
 
 
+class VoiceKeepAliveView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Keep Room Alive",
+        style=discord.ButtonStyle.success,
+        emoji="⚡",
+        custom_id="vc_ctrl:keepalive",
+    )
+    async def keep_alive_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.VoiceChannel):
+            return
+        room = TEMP_VOICE_CACHE.get(interaction.channel.id)
+        if not room:
+            return await interaction.response.send_message("❌ Room already closed.", ephemeral=True)
+        touch_temp_voice_activity(interaction.channel.id)
+        await interaction.response.edit_message(
+            content=f"⚡ Activity confirmed by {interaction.user.mention}! Room timer reset.",
+            view=None,
+        )
+
+
+class VoiceTransferView(discord.ui.View):
+    def __init__(self, vc: discord.VoiceChannel, room: Dict[str, Any]):
+        super().__init__(timeout=60)
+        self.vc = vc
+        self.room = room
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="👑 Select the new room owner...",
+        min_values=1,
+        max_values=1,
+    )
+    async def select_new_owner(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        target = select.values[0]
+        if target.bot or not isinstance(target, discord.Member) or target not in self.vc.members:
+            return await interaction.response.send_message(
+                "❌ The new owner must be a human member currently inside this voice channel.",
+                ephemeral=True,
+            )
+        if target.id == self.room["owner_id"]:
+            return await interaction.response.send_message("👑 You already own this room!", ephemeral=True)
+
+        self.room["owner_id"] = target.id
+        self.room["last_active_at"] = int(time.time())
+        self.room["warned_inactive"] = False
+        save_temp_voice(self.room)
+        await self.vc.set_permissions(target, connect=True, view_channel=True, manage_channels=True)
+        await refresh_voice_control_panel(self.vc, self.room)
+        await interaction.response.edit_message(content=f"👑 Ownership transferred to {target.mention}!", view=None)
+
+
 class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
     name_input = discord.ui.TextInput(
-        label="New Room Name",
+        label="New Room Name (Auto-saved to your preset)",
         style=discord.TextStyle.short,
         required=True,
         min_length=2,
@@ -493,20 +1188,27 @@ class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
 
     async def on_submit(self, interaction: discord.Interaction):
         now_ts = int(time.time())
+        new_name = self.name_input.value.strip()
+        # Always save to user's personal preset even if rename cooldown is active
+        save_user_voice_preset(interaction.user.id, custom_name=new_name)
+
         last_ren = self.room.get("last_renamed_at", 0)
         if now_ts - last_ren < 300:
             ready_ts = last_ren + 300
             return await interaction.response.send_message(
-                f"⏳ Discord limits channel renames. You can rename again <t:{ready_ts}:R>.",
+                f"💾 Name saved to your personal preset for future rooms! Discord limits live renames — you can rename this active channel again <t:{ready_ts}:R>.",
                 ephemeral=True,
             )
-        new_name = self.name_input.value.strip()
         try:
             await self.channel.edit(name=new_name, reason=f"Renamed by room owner {interaction.user}")
             self.room["last_renamed_at"] = now_ts
             self.room["last_active_at"] = now_ts
+            self.room["warned_inactive"] = False
             save_temp_voice(self.room)
-            await interaction.response.send_message(f"✅ Room renamed to **{new_name}**!", ephemeral=True)
+            await interaction.response.send_message(
+                f"✅ Room renamed to **{new_name}** and saved to your personal preset!",
+                ephemeral=True,
+            )
         except Exception as e:
             await interaction.response.send_message(f"❌ Could not rename room: `{e}`", ephemeral=True)
 
@@ -532,10 +1234,12 @@ class VoiceLimitModal(discord.ui.Modal, title="Set Room User Limit"):
             return await interaction.response.send_message("❌ Enter a number from `0` to `99`.", ephemeral=True)
         limit = int(val)
         await self.channel.edit(user_limit=limit, reason=f"Limit updated by {interaction.user}")
+        save_user_voice_preset(interaction.user.id, user_limit=limit)
         self.room["last_active_at"] = int(time.time())
+        self.room["warned_inactive"] = False
         save_temp_voice(self.room)
         await refresh_voice_control_panel(self.channel, self.room)
-        msg = "👥 User limit removed (`Unlimited`)." if limit == 0 else f"👥 User limit set to **{limit}**."
+        msg = "👥 User limit removed (`Unlimited`) & saved." if limit == 0 else f"👥 User limit set to **{limit}** & saved."
         await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -571,12 +1275,14 @@ class VoiceControlView(discord.ui.View):
         if owner_member:
             await vc.set_permissions(owner_member, connect=True, view_channel=True, manage_channels=True)
 
+        save_user_voice_preset(interaction.user.id, default_locked=new_locked)
         room["is_locked"] = new_locked
         room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
         save_temp_voice(room)
         await refresh_voice_control_panel(vc, room)
         await interaction.response.send_message(
-            "🔒 Room **locked**! Only trusted users can join." if new_locked else "🔓 Room **unlocked** for everyone!",
+            "🔒 Room **locked** (saved to preset)!" if new_locked else "🔓 Room **unlocked** (saved to preset)!",
             ephemeral=True,
         )
 
@@ -596,12 +1302,14 @@ class VoiceControlView(discord.ui.View):
         if owner_member:
             await vc.set_permissions(owner_member, connect=True, view_channel=True, manage_channels=True)
 
+        save_user_voice_preset(interaction.user.id, default_hidden=new_hidden)
         room["is_hidden"] = new_hidden
         room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
         save_temp_voice(room)
         await refresh_voice_control_panel(vc, room)
         await interaction.response.send_message(
-            "🙈 Room is now **hidden** from the channel list." if new_hidden else "👁️ Room is now **visible** to everyone.",
+            "🙈 Room is now **hidden** (saved to preset)." if new_hidden else "👁️ Room is now **visible** (saved to preset).",
             ephemeral=True,
         )
 
@@ -632,7 +1340,10 @@ class VoiceControlView(discord.ui.View):
             return await interaction.response.send_message("👑 You already own this room!", ephemeral=True)
 
         if not isinstance(interaction.user, discord.Member) or interaction.user not in vc.members:
-            return await interaction.response.send_message("❌ You must be connected to this voice channel to claim it.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ You must be connected to this voice channel to claim it.",
+                ephemeral=True,
+            )
 
         current_owner = vc.guild.get_member(room["owner_id"])
         if current_owner and current_owner in vc.members:
@@ -643,10 +1354,38 @@ class VoiceControlView(discord.ui.View):
 
         room["owner_id"] = interaction.user.id
         room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
         save_temp_voice(room)
         await vc.set_permissions(interaction.user, connect=True, view_channel=True, manage_channels=True)
         await refresh_voice_control_panel(vc, room)
         await interaction.response.send_message(f"👑 {interaction.user.mention} claimed ownership of this voice room!")
+
+    @discord.ui.select(
+        placeholder="⚡ Quick Mode: Duo / Trio / Squad / Raid / Open...",
+        options=[
+            discord.SelectOption(label="👤 Duo (2 Slots)", value="2", description="Set user limit to 2"),
+            discord.SelectOption(label="🛡️ Trio (3 Slots)", value="3", description="Set user limit to 3"),
+            discord.SelectOption(label="⚔️ Squad (4 Slots)", value="4", description="Set user limit to 4"),
+            discord.SelectOption(label="🔥 Raid Party (6 Slots)", value="6", description="Set user limit to 6"),
+            discord.SelectOption(label="🌐 Open Lobby (Unlimited)", value="0", description="Remove user limit"),
+        ],
+        custom_id="vc_ctrl:quickmode",
+        row=1,
+    )
+    async def quick_mode_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        limit = int(select.values[0])
+        await vc.edit(user_limit=limit, reason=f"Quick mode selected by {interaction.user}")
+        save_user_voice_preset(interaction.user.id, user_limit=limit)
+        room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
+        save_temp_voice(room)
+        await refresh_voice_control_panel(vc, room)
+        label = "Unlimited" if limit == 0 else f"{limit} slots"
+        await interaction.response.send_message(f"⚡ Quick Mode applied: **{label}** (saved to preset)!", ephemeral=True)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
@@ -654,7 +1393,7 @@ class VoiceControlView(discord.ui.View):
         min_values=1,
         max_values=5,
         custom_id="vc_ctrl:allow",
-        row=1,
+        row=2,
     )
     async def allow_users_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         vc, room, err = self._get_room_and_verify_owner(interaction)
@@ -669,13 +1408,11 @@ class VoiceControlView(discord.ui.View):
             allowed_mentions.append(target.mention)
 
         room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
         save_temp_voice(room)
         if not allowed_mentions:
             return await interaction.response.send_message("⚠️ Please select human members.", ephemeral=True)
-        await interaction.response.send_message(
-            f"✅ Granted access to: {', '.join(allowed_mentions)}",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(f"✅ Granted access to: {', '.join(allowed_mentions)}", ephemeral=True)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
@@ -683,7 +1420,7 @@ class VoiceControlView(discord.ui.View):
         min_values=1,
         max_values=5,
         custom_id="vc_ctrl:block",
-        row=2,
+        row=3,
     )
     async def block_users_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
         vc, room, err = self._get_room_and_verify_owner(interaction)
@@ -703,15 +1440,56 @@ class VoiceControlView(discord.ui.View):
             blocked_mentions.append(target.mention)
 
         room["last_active_at"] = int(time.time())
+        room["warned_inactive"] = False
         save_temp_voice(room)
         if not blocked_mentions:
             return await interaction.response.send_message("⚠️ Cannot block yourself or bots.", ephemeral=True)
+        await interaction.response.send_message(f"🚫 Kicked & blocked: {', '.join(blocked_mentions)}", ephemeral=True)
+
+    @discord.ui.button(label="Watch / Music", style=discord.ButtonStyle.success, emoji="🎬", custom_id="vc_ctrl:activity", row=4)
+    async def watch_together_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.VoiceChannel):
+            return
+        vc = interaction.channel
+        touch_temp_voice_activity(vc.id)
+        try:
+            invite = await vc.create_invite(
+                max_age=3600,
+                target_type=discord.InviteTarget.embedded_application,
+                target_application_id=YOUTUBE_ACTIVITY_ID,
+                reason=f"Watch Together launched by {interaction.user}",
+            )
+            await interaction.response.send_message(
+                f"🎬 **YouTube / Music Watch Together** is ready for this room!\n"
+                f"Click here to launch the shared player: {invite.url}",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Could not launch Watch Together (`Create Invite` or `Use Activities` permission needed): `{e}`",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Transfer", style=discord.ButtonStyle.secondary, emoji="👑", custom_id="vc_ctrl:transfer", row=4)
+    async def transfer_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
         await interaction.response.send_message(
-            f"🚫 Kicked & blocked: {', '.join(blocked_mentions)}",
+            "👑 Choose a member inside your room to transfer ownership:",
+            view=VoiceTransferView(vc, room),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Delete Room", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="vc_ctrl:delete", row=3)
+    @discord.ui.button(label="Reset Preset", style=discord.ButtonStyle.secondary, emoji="🔄", custom_id="vc_ctrl:resetpreset", row=4)
+    async def reset_preset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        reset_user_voice_preset(interaction.user.id)
+        await interaction.response.send_message(
+            "🔄 Your personal room preset has been reset to default!",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Delete Room", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="vc_ctrl:delete", row=4)
     async def delete_room_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc, room, err = self._get_room_and_verify_owner(interaction)
         if err or not vc or not room:
@@ -744,7 +1522,20 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
         return
     VOICE_CREATE_COOLDOWNS[member.id] = now
 
+    preset = get_user_voice_preset(member.id)
+    default_locked = preset["default_locked"]
+    default_hidden = preset["default_hidden"]
+    user_limit = preset["user_limit"]
+    room_name = (preset["custom_name"] or f"🔊 {member.display_name}'s Room")[:95]
+
+    everyone_ow = discord.PermissionOverwrite()
+    if default_locked:
+        everyone_ow.connect = False
+    if default_hidden:
+        everyone_ow.view_channel = False
+
     overwrites = {
+        guild.default_role: everyone_ow,
         guild.me: discord.PermissionOverwrite(
             view_channel=True,
             connect=True,
@@ -759,11 +1550,15 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
         ),
     }
 
-    room_name = f"🔊 {member.display_name}'s Room"[:95]
+    # Server Booster Perk: automatic max HD audio bitrate
+    bitrate = min(guild.bitrate_limit, 256000) if member.premium_since is not None else 64000
+
     try:
         new_vc = await guild.create_voice_channel(
             name=room_name,
             category=trigger_channel.category,
+            user_limit=user_limit,
+            bitrate=bitrate,
             overwrites=overwrites,
             reason=f"Join-to-Create room for {member}",
         )
@@ -774,7 +1569,6 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
     try:
         await member.move_to(new_vc, reason="Moved to newly created voice room")
     except Exception:
-        # User disconnected before move completed -> cleanup immediately
         try:
             await new_vc.delete(reason="User disconnected before move")
         except Exception:
@@ -790,8 +1584,9 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
         "created_at": now_ts,
         "last_active_at": now_ts,
         "last_renamed_at": 0,
-        "is_locked": False,
-        "is_hidden": False,
+        "is_locked": default_locked,
+        "is_hidden": default_hidden,
+        "warned_inactive": False,
     }
     save_temp_voice(room_data)
 
@@ -808,7 +1603,7 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
 
 
 # -------------------------------------------------------------
-# 5. Post Studio Presets & Builders
+# 8. Post Studio Presets & Builders
 # -------------------------------------------------------------
 POST_STYLES: Dict[str, Dict[str, Any]] = {
     "announcement": {
@@ -1174,7 +1969,7 @@ class StyleSwitcherView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 6. Live Interactive Polls System (/poll)
+# 9. Live Interactive Polls System (/poll)
 # -------------------------------------------------------------
 def pack_options(options: List[str]) -> str:
     return "\n".join(opt.replace("\n", " ").strip() for opt in options if opt.strip())
@@ -1522,7 +2317,7 @@ class PollCreatorModal(discord.ui.Modal, title="Create Community Poll"):
 
 
 # -------------------------------------------------------------
-# 7. Event Scheduling System (/event, /event_image, Follow)
+# 10. Event Scheduling System (/event, /event_image, Follow)
 # -------------------------------------------------------------
 def parse_msk_datetime(raw: str) -> Optional[int]:
     raw = raw.strip()
@@ -1811,7 +2606,7 @@ class EventComposerModal(discord.ui.Modal):
 
 
 # -------------------------------------------------------------
-# 8. Starboard / Ideas Showcase System (O(1) Deduplication)
+# 11. Starboard / Ideas Showcase System (O(1) Deduplication)
 # -------------------------------------------------------------
 def build_showcase_embed(message: discord.Message, stars: int) -> discord.Embed:
     if stars >= 50:
@@ -1979,7 +2774,7 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 
 
 # -------------------------------------------------------------
-# 9. Admin Control Panel (/panel)
+# 12. Admin Control Panel (/panel) & Sub-Panels
 # -------------------------------------------------------------
 class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
     threshold_input = discord.ui.TextInput(
@@ -1997,7 +2792,10 @@ class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
         if not val.isdigit() or not (1 <= int(val) <= 500):
             return await interaction.response.send_message("❌ Enter a number between 1 and 500.", ephemeral=True)
         update_guild_settings(interaction.guild.id, star_threshold=int(val))
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=ControlPanelView())
+        await interaction.response.edit_message(
+            embed=await build_panel_embed(interaction.guild),
+            view=ControlPanelView(),
+        )
 
 
 class TempVoiceSetupView(discord.ui.View):
@@ -2016,7 +2814,7 @@ class TempVoiceSetupView(discord.ui.View):
         chosen = select.values[0]
         update_guild_settings(interaction.guild.id, jtc_channel_id=chosen.id)
         await interaction.response.edit_message(
-            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Members joining it will get a private customizable room.",
+            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Rooms auto-save presets and delete after 5m of inactivity.",
             view=self,
         )
 
@@ -2031,7 +2829,83 @@ class TempVoiceSetupView(discord.ui.View):
         )
 
 
-def build_panel_embed(guild: discord.Guild) -> discord.Embed:
+class AntiScamSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📋 Select Security Log Channel (Optional)...",
+        row=0,
+    )
+    async def select_log_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, antiscam_log_channel_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"📋 Anti-Scam security log channel set to <#{chosen.id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        placeholder="⏱️ Select Auto-Timeout Duration for Scammers...",
+        options=[
+            discord.SelectOption(label="Delete Message Only (No Timeout)", value="0"),
+            discord.SelectOption(label="1 Hour Timeout + Delete", value="60"),
+            discord.SelectOption(label="24 Hours Timeout + Delete", value="1440"),
+        ],
+        row=1,
+    )
+    async def select_timeout(self, interaction: discord.Interaction, select: discord.ui.Select):
+        mins = int(select.values[0])
+        update_guild_settings(self.guild_id, antiscam_timeout_mins=mins)
+        label = "Delete only" if mins == 0 else f"{mins} minutes timeout"
+        await interaction.response.edit_message(
+            content=f"⏱️ Anti-Scam punishment updated to: **{label}**.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Enable Shield", style=discord.ButtonStyle.success, emoji="🛡️", row=2)
+    async def enable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, antiscam_enabled=True)
+        await interaction.response.edit_message(
+            content="🛡️ **Anti-Scam & Phishing Shield ENABLED!** Fake Roblox/Discord scam links will be deleted automatically.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Disable Shield", style=discord.ButtonStyle.danger, emoji="🛑", row=2)
+    async def disable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, antiscam_enabled=False)
+        await interaction.response.edit_message(
+            content="🛑 **Anti-Scam & Phishing Shield DISABLED.**",
+            view=self,
+        )
+
+
+class LockdownSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text, discord.ChannelType.category],
+        placeholder="📋 Toggle Channel or Category in Lockdown Whitelist...",
+        row=0,
+    )
+    async def toggle_ignore_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        chosen = select.values[0]
+        is_cat = chosen.type == discord.ChannelType.category
+        added = toggle_lockdown_whitelist(self.guild_id, chosen.id, "category" if is_cat else "channel")
+        status = "Added to" if added else "Removed from"
+        await interaction.response.edit_message(
+            content=f"📋 **{status}** lockdown whitelist: <#{chosen.id}> (`{'Category' if is_cat else 'Channel'}`).",
+            view=self,
+        )
+
+
+async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     s = get_guild_settings(guild.id)
     ideas = f"<#{s['ideas_channel_id']}>" if s["ideas_channel_id"] else "`Not Set`"
     showcase = f"<#{s['showcase_channel_id']}>" if s["showcase_channel_id"] else "`Not Set`"
@@ -2040,12 +2914,23 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     booster = f"<@&{s['booster_role_id']}>" if s["booster_role_id"] else "`Not Set`"
     autorole = f"<@&{s['autorole_id']}>" if s["autorole_id"] else "`Not Set`"
 
-    detected_wfl = get_wfl_emojis(guild)
-    wfl_status = " ".join(str(e) for e in detected_wfl) if detected_wfl else "`Missing (w1_win, w1_fair, w1_lose)`"
+    detected_wfl = await resolve_wfl_emojis(guild)
+    if len(detected_wfl) == 3:
+        wfl_status = " ".join(str(e) for e in detected_wfl)
+    else:
+        found_names = {e.name.lower() for e in detected_wfl}
+        missing = [n for n in WFL_EMOJI_NAMES if n not in found_names]
+        wfl_status = f"`Missing: {', '.join(missing)}`"
+
+    shield_status = "🟢 **Active**" if s["antiscam_enabled"] else "⚪ `Disabled`"
+    if s["antiscam_enabled"] and s["antiscam_log_channel_id"]:
+        shield_status += f" (<#{s['antiscam_log_channel_id']}>)"
+
+    lock_status = "🔴 **LOCKED DOWN**" if is_lockdown_active(guild.id) else "🟢 Normal"
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L auto-reactions, Private Voice Rooms, Booster Guard, and Auto-Role below.",
+        description="Configure Starboard, W/F/L reactions, Private Voice 2.0, Anti-Scam Shield & Lockdown below.",
         color=0x5865F2,
     )
     embed.add_field(name="💡 Ideas Channel", value=ideas, inline=True)
@@ -2053,7 +2938,9 @@ def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="⭐ Star Threshold", value=f"**{s['star_threshold']}** stars", inline=True)
     embed.add_field(name="⚖️ W/F/L Channel", value=wfl, inline=True)
     embed.add_field(name="🎯 W/F/L Emojis", value=wfl_status, inline=True)
-    embed.add_field(name="🔊 Join-to-Create", value=jtc, inline=True)
+    embed.add_field(name="🔊 Voice 2.0 Trigger", value=jtc, inline=True)
+    embed.add_field(name="🛡️ Anti-Scam Shield", value=shield_status, inline=True)
+    embed.add_field(name="🔒 Server Lockdown", value=lock_status, inline=True)
     embed.add_field(name="🚀 Booster Role", value=booster, inline=True)
     embed.add_field(name="👋 Join Auto-Role", value=autorole, inline=True)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members")
@@ -2072,7 +2959,7 @@ class ControlPanelView(discord.ui.View):
     )
     async def select_ideas(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         update_guild_settings(interaction.guild.id, ideas_channel_id=select.values[0].id)
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
+        await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
@@ -2082,7 +2969,7 @@ class ControlPanelView(discord.ui.View):
     )
     async def select_showcase(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         update_guild_settings(interaction.guild.id, showcase_channel_id=select.values[0].id)
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
+        await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
@@ -2093,7 +2980,7 @@ class ControlPanelView(discord.ui.View):
     async def select_wfl(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         WFL_EMOJI_CACHE.pop(interaction.guild.id, None)
         update_guild_settings(interaction.guild.id, wfl_channel_id=select.values[0].id)
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
+        await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
     @discord.ui.select(
         cls=discord.ui.RoleSelect,
@@ -2102,37 +2989,56 @@ class ControlPanelView(discord.ui.View):
     )
     async def select_autorole(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         update_guild_settings(interaction.guild.id, autorole_id=select.values[0].id)
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
+        await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
-    @discord.ui.button(label="Star Threshold", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
+    @discord.ui.button(label="Stars", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
     async def set_threshold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ThresholdModal())
 
-    @discord.ui.button(label="Temp Voice", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
+    @discord.ui.button(label="Voice 2.0", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
     async def setup_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "🔊 **Private Voice Rooms Setup**\n"
-            "Select a voice channel below. Whenever someone joins it, the bot will create a personal room for them "
-            "(auto-deleted when empty or after **5 minutes** of inactivity):",
+            "🔊 **Private Voice Rooms 2.0 Setup**\n"
+            "Select a trigger voice channel below. Rooms auto-save personal presets, support Quick Modes & Watch Together, and auto-delete after 5m of inactivity:",
             view=TempVoiceSetupView(),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Create Post", style=discord.ButtonStyle.primary, emoji="📢", row=4)
+    @discord.ui.button(label="Anti-Scam", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
+    async def setup_antiscam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        s = get_guild_settings(interaction.guild.id)
+        state_txt = "ENABLED" if s["antiscam_enabled"] else "DISABLED"
+        await interaction.response.send_message(
+            f"🛡️ **Anti-Scam & Phishing Shield** (Currently: **{state_txt}**)\n"
+            "Blocks fake Roblox/Discord scam links in `<0.1ms` without affecting staff or official links:",
+            view=AntiScamSetupView(interaction.guild.id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Lockdown", style=discord.ButtonStyle.secondary, emoji="🔒", row=4)
+    async def setup_lockdown_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        await interaction.response.send_message(
+            "🔒 **Lockdown Whitelist Configuration**\n"
+            "Use `/closeall` to safely lock open public channels (read-only channels like `#announcements` are automatically preserved) and `/openall` to restore them.\n"
+            "Select any extra open channels or categories below that `/closeall` should **never** touch:",
+            view=LockdownSetupView(interaction.guild.id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Post", style=discord.ButtonStyle.primary, emoji="📢", row=4)
     async def quick_post_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_modal(
                 PostComposerModal(style_key="announcement", target_channel=interaction.channel)
             )
 
-    @discord.ui.button(label="Reset Extra", style=discord.ButtonStyle.danger, emoji="🧹", row=4)
-    async def clear_optional_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(interaction.guild.id, wfl_channel_id=None, autorole_id=None, jtc_channel_id=None)
-        await interaction.response.edit_message(embed=build_panel_embed(interaction.guild), view=self)
-
 
 # -------------------------------------------------------------
-# 10. Slash Commands & Context Menus
+# 13. Slash Commands & Context Menus
 # -------------------------------------------------------------
 @bot.tree.command(name="panel", description="Open the server configuration panel")
 @app_commands.default_permissions(administrator=True)
@@ -2140,7 +3046,7 @@ async def panel_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return
     await interaction.response.send_message(
-        embed=build_panel_embed(interaction.guild),
+        embed=await build_panel_embed(interaction.guild),
         view=ControlPanelView(),
         ephemeral=True,
     )
@@ -2460,11 +3366,17 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 
 
 # -------------------------------------------------------------
-# 11. Event Listeners & Background Scheduler
+# 14. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
 @bot.event
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
+    # Warm up W/F/L emoji caches across guilds
+    for guild in bot.guilds:
+        s = get_guild_settings(guild.id)
+        if s.get("wfl_channel_id"):
+            await resolve_wfl_emojis(guild)
+
     # Reconcile temporary voice rooms on startup
     now_ts = int(time.time())
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
@@ -2492,7 +3404,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     settings = get_guild_settings(guild.id)
     jtc_id = settings.get("jtc_channel_id")
 
-    # 1. User left or changed state in an existing temporary voice channel
     if before.channel and before.channel.id in TEMP_VOICE_CACHE:
         humans_left = [m for m in before.channel.members if not m.bot]
         if len(humans_left) == 0:
@@ -2500,11 +3411,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         else:
             touch_temp_voice_activity(before.channel.id)
 
-    # 2. User joined or changed state (unmute/stream/video) inside a temporary voice channel
     if after.channel and after.channel.id in TEMP_VOICE_CACHE:
         touch_temp_voice_activity(after.channel.id)
 
-    # 3. User joined the Join-to-Create trigger channel
     if jtc_id and after.channel and after.channel.id == jtc_id:
         if not before.channel or before.channel.id != jtc_id:
             await handle_join_to_create(member, after.channel)
@@ -2516,24 +3425,26 @@ async def on_message(message: discord.Message):
         return
 
     if message.guild:
-        # Track text chat activity inside temporary voice channels
+        settings = get_guild_settings(message.guild.id)
+
+        # 1. Anti-Scam & Phishing Link Shield (fast RAM check)
+        if await handle_antiscam_check(message, settings):
+            return
+
+        # 2. Track text chat activity inside temporary voice channels
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
 
-        settings = get_guild_settings(message.guild.id)
-
+        # 3. Ideas Channel auto-star
         if settings["ideas_channel_id"] and message.channel.id == settings["ideas_channel_id"]:
             try:
                 await message.add_reaction("⭐")
             except Exception:
                 pass
 
+        # 4. W/F/L Channel reliable auto-reactions (non-blocking task with retry)
         if settings["wfl_channel_id"] and message.channel.id == settings["wfl_channel_id"]:
-            for emoji in get_wfl_emojis(message.guild):
-                try:
-                    await message.add_reaction(emoji)
-                except Exception:
-                    pass
+            asyncio.create_task(apply_wfl_reactions(message))
 
     await bot.process_commands(message)
 
@@ -2581,18 +3492,31 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def background_scheduler():
     now_ts = int(time.time())
 
-    # 1. Check temporary voice rooms for empty state or 5-minute inactivity
+    # 1. Check temporary voice rooms: empty, 4-min warning, or 5-min inactivity deletion
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
         if not isinstance(ch, discord.VoiceChannel):
             remove_temp_voice_record(ch_id)
             continue
+
         humans = [m for m in ch.members if not m.bot]
+        idle_sec = now_ts - room["last_active_at"]
+
         if len(humans) == 0:
             await delete_temp_voice_channel(ch, reason="Temporary voice channel empty")
-        elif now_ts - room["last_active_at"] >= VOICE_INACTIVITY_SECONDS:
+        elif idle_sec >= VOICE_INACTIVITY_SECONDS:
             await delete_temp_voice_channel(ch, reason="Temporary voice channel inactive for 5 minutes")
+        elif idle_sec >= VOICE_WARNING_SECONDS and not room.get("warned_inactive"):
+            room["warned_inactive"] = True
+            save_temp_voice(room)
+            try:
+                await ch.send(
+                    content=f"⏳ <@{room['owner_id']}> This room has been quiet for 4 minutes and will auto-close in **1 minute** unless there is activity or you click below:",
+                    view=VoiceKeepAliveView(),
+                )
+            except Exception:
+                pass
 
     # 2. Check expired polls
     with get_db() as conn:
@@ -2708,7 +3632,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # -------------------------------------------------------------
-# 12. Entrypoint
+# 15. Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
