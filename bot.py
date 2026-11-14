@@ -58,11 +58,16 @@ STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 VALUE_VOTE_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 LOCKDOWN_IN_PROGRESS: Set[int] = set()
+WFL_BACKOFF_UNTIL: Dict[int, float] = {}
+HTTP_SESSION: Optional["aiohttp.ClientSession"] = None
 
 # Value List RAM Cache (O(1) lookup for 80k+ members)
 VALUE_ITEMS_CACHE: Dict[str, Dict[str, Any]] = {}
 VALUE_ALIAS_MAP: Dict[str, str] = {}
 LAST_VALUE_WEB_SYNC: float = 0.0
+LAST_VALUE_SYNC_STATS: Dict[str, int] = {"checked": 0, "changed": 0, "ts": 0}
+VALUE_SYNC_INTERVAL_SECONDS = 120  # Check website for price updates every 2 minutes
+VALUE_SYNC_IN_PROGRESS = False
 DEFAULT_VALUE_LIST_URL = "https://cameraman-td.vaultedvaluesx.com/value-list"
 
 # Trade Calculator Anti-Spam Cooldowns (User ID -> Last Timestamp)
@@ -106,7 +111,8 @@ def init_db():
                 value_channel_id INTEGER,
                 value_ping_role_id INTEGER,
                 value_list_url TEXT,
-                value_manager_role_ids TEXT
+                value_manager_role_ids TEXT,
+                wfl_smart_filter INTEGER DEFAULT 1
             )
             """
         )
@@ -124,12 +130,34 @@ def init_db():
             "value_ping_role_id": "INTEGER",
             "value_list_url": "TEXT",
             "value_manager_role_ids": "TEXT",
+            "wfl_smart_filter": "INTEGER DEFAULT 1",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
                 c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} {col_type}")
 
-        # Value List Items & Changelog Votes
+        # Bot Metadata (Command Sync Hash, etc.) & Game Codes
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_meta (
+                meta_key TEXT PRIMARY KEY,
+                meta_value TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_codes (
+                guild_id INTEGER PRIMARY KEY,
+                codes_text TEXT,
+                note_text TEXT,
+                updated_at INTEGER,
+                updated_by TEXT
+            )
+            """
+        )
+
+        # Value List Items, History & Changelog Votes
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS value_items (
@@ -144,6 +172,19 @@ def init_db():
                 sign_value_text TEXT,
                 image_url TEXT,
                 updated_at INTEGER
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS value_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT,
+                field_changed TEXT,
+                old_val TEXT,
+                new_val TEXT,
+                source TEXT,
+                changed_at INTEGER
             )
             """
         )
@@ -366,11 +407,29 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_starboard_showcase ON starboard_entries(showcase_message_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_polls_active ON polls(is_closed, ends_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_active ON scheduled_events(started, start_ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_value_history_ts ON value_history(changed_at DESC)")
         conn.commit()
     print(f"[Database] Ready (WAL Mode) at: {DB_PATH}")
 
 
 init_db()
+
+
+def get_bot_meta(key: str) -> str:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT meta_value FROM bot_meta WHERE meta_key = ?", (key,))
+        row = c.fetchone()
+        return row[0] if (row and row[0]) else ""
+
+
+def set_bot_meta(key: str, value: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_meta (meta_key, meta_value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
 
 
 def get_guild_settings(guild_id: int) -> Dict[str, Any]:
@@ -383,7 +442,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             SELECT ideas_channel_id, showcase_channel_id, star_threshold,
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                    antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
-                   value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids
+                   value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
+                   wfl_smart_filter
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -404,6 +464,7 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "value_ping_role_id": row[11] if row else None,
             "value_list_url": (row[12] if (row and row[12]) else DEFAULT_VALUE_LIST_URL),
             "value_manager_role_ids": (row[13] if (row and row[13]) else ""),
+            "wfl_smart_filter": bool(row[14]) if (row and row[14] is not None) else True,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -421,9 +482,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 guild_id, ideas_channel_id, showcase_channel_id,
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                 antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
-                value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids
+                value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
+                wfl_smart_filter
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -438,7 +500,8 @@ def update_guild_settings(guild_id: int, **kwargs):
                 value_channel_id = excluded.value_channel_id,
                 value_ping_role_id = excluded.value_ping_role_id,
                 value_list_url = excluded.value_list_url,
-                value_manager_role_ids = excluded.value_manager_role_ids
+                value_manager_role_ids = excluded.value_manager_role_ids,
+                wfl_smart_filter = excluded.wfl_smart_filter
             """,
             (
                 guild_id,
@@ -456,6 +519,7 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["value_ping_role_id"],
                 current["value_list_url"],
                 current["value_manager_role_ids"],
+                1 if current["wfl_smart_filter"] else 0,
             ),
         )
         conn.commit()
@@ -710,9 +774,12 @@ def upsert_value_item(
     stability_text: Optional[str] = None,
     sign_value_text: Optional[str] = None,
     image_url: Optional[str] = None,
-) -> Dict[str, Any]:
+    source: str = "manual",
+) -> Tuple[Dict[str, Any], bool]:
     existing = find_value_item(name)
     now_ts = int(time.time())
+    changed_fields: List[Tuple[str, str, str]] = []
+
     if existing:
         item_key = existing["item_key"]
         final_name = existing["name"]
@@ -724,6 +791,15 @@ def upsert_value_item(
         final_stab = stability_text if stability_text is not None else existing["stability_text"]
         final_sign = sign_value_text if sign_value_text is not None else existing["sign_value_text"]
         final_img = image_url if image_url else existing["image_url"]
+
+        if value_text is not None and value_text != existing["value_text"]:
+            changed_fields.append(("Value", existing["value_text"], value_text))
+        if demand_text is not None and demand_text != existing["demand_text"]:
+            changed_fields.append(("Demand", existing["demand_text"], demand_text))
+        if stability_text is not None and stability_text != existing["stability_text"]:
+            changed_fields.append(("Stability", existing["stability_text"], stability_text))
+        if sign_value_text is not None and sign_value_text != existing["sign_value_text"]:
+            changed_fields.append(("Sign Value", existing["sign_value_text"] or "None", sign_value_text))
     else:
         item_key = normalize_unit_key(name)
         final_name = name.strip()
@@ -735,6 +811,9 @@ def upsert_value_item(
         final_stab = stability_text or "Stable"
         final_sign = sign_value_text or ""
         final_img = image_url or ""
+        changed_fields.append(("New Unit", "—", final_val))
+
+    effective_ts = now_ts if changed_fields else (existing["updated_at"] if existing else now_ts)
 
     with get_db() as conn:
         conn.execute(
@@ -756,9 +835,20 @@ def upsert_value_item(
                 final_stab,
                 final_sign,
                 final_img,
-                now_ts,
+                effective_ts,
             ),
         )
+        if changed_fields:
+            conn.executemany(
+                """
+                INSERT INTO value_history (item_name, field_changed, old_val, new_val, source, changed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [(final_name, fld, old_v, new_v, source, now_ts) for fld, old_v, new_v in changed_fields],
+            )
+            conn.execute(
+                "DELETE FROM value_history WHERE id NOT IN (SELECT id FROM value_history ORDER BY id DESC LIMIT 200)"
+            )
         conn.commit()
 
     item_dict = {
@@ -772,34 +862,33 @@ def upsert_value_item(
         "stability_text": final_stab,
         "sign_value_text": final_sign,
         "image_url": final_img,
-        "updated_at": now_ts,
+        "updated_at": effective_ts,
     }
     VALUE_ITEMS_CACHE[item_key] = item_dict
     for a in final_aliases.split(","):
         if a.strip():
             VALUE_ALIAS_MAP[a.strip()] = item_key
-    return item_dict
+    return item_dict, bool(changed_fields)
 
 
-async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int:
-    global LAST_VALUE_WEB_SYNC
+async def get_http_session() -> Optional["aiohttp.ClientSession"]:
+    global HTTP_SESSION
     if not aiohttp:
-        return 0
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.8; +https://discord.com)",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    try:
+        return None
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return 0
-                raw_html = await resp.text()
-    except Exception:
-        return 0
+        HTTP_SESSION = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/9.0; +https://discord.com)",
+                "Accept": "text/html,application/xhtml+xml,application/json",
+                "Cache-Control": "no-cache",
+            },
+        )
+    return HTTP_SESSION
 
+
+def _parse_and_apply_website_html(raw_html: str) -> Tuple[int, int]:
     img_map: Dict[str, str] = {}
     for m in re.finditer(r'<img[^>]+alt="([^"]+?)\s+artwork"[^>]+src="([^"]+)"', raw_html, re.IGNORECASE):
         u_name = normalize_unit_key(html_lib.unescape(m.group(1)))
@@ -814,6 +903,26 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
             src = "https://cameraman-td.vaultedvaluesx.com" + src
         img_map.setdefault(u_name, src)
 
+    parsed_records: Dict[str, Dict[str, Optional[str]]] = {}
+
+    # 1. Extract embedded JSON objects if present in Next.js payload
+    json_pattern = re.compile(
+        r'"name"\s*:\s*"([^"]{2,60})"[^}]{0,400}?"value"\s*:\s*"?([0-9,.\s–\-]+|o/c)"?',
+        re.IGNORECASE,
+    )
+    for jm in json_pattern.finditer(raw_html):
+        j_name = html_lib.unescape(jm.group(1)).strip()
+        j_val = html_lib.unescape(jm.group(2)).strip()
+        if j_name and j_val and not j_name.startswith(("http", "/")):
+            parsed_records[normalize_unit_key(j_name)] = {
+                "name": j_name,
+                "category": None,
+                "value_text": j_val,
+                "demand_text": None,
+                "stability_text": None,
+            }
+
+    # 2. Extract visible HTML card blocks
     text_only = re.sub(r"<script[^>]*>.*?</script>", "\n", raw_html, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<style[^>]*>.*?</style>", "\n", text_only, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<[^>]+>", "\n", text_only)
@@ -823,7 +932,6 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
         "Godly", "Exclusive", "Mythic", "Legendary", "Epic", "Rare",
         "Uncommon", "Common", "Gamepasses", "Crates", "Signed",
     }
-    updated_count = 0
     i = 0
     while i < len(lines):
         if lines[i] == "Value" and i + 1 < len(lines):
@@ -853,116 +961,72 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
                     break
 
             if cand_name and len(cand_name) <= 60:
-                existing = find_value_item(cand_name)
-                prev_val = None
-                if existing and existing["value_text"] != val_str:
-                    prev_val = existing["value_text"]
-                img_url = img_map.get(normalize_unit_key(cand_name))
-                upsert_value_item(
-                    name=cand_name,
-                    category=cand_cat,
-                    value_text=val_str,
-                    prev_value_text=prev_val,
-                    demand_text=dem_str,
-                    stability_text=stab_str,
-                    image_url=img_url,
-                )
-                updated_count += 1
+                parsed_records[normalize_unit_key(cand_name)] = {
+                    "name": cand_name,
+                    "category": cand_cat,
+                    "value_text": val_str,
+                    "demand_text": dem_str,
+                    "stability_text": stab_str,
+                }
         i += 1
 
-    if updated_count > 0:
+    checked_count = 0
+    changed_count = 0
+    for key, rec in parsed_records.items():
+        cand_name = rec["name"] or key
+        val_str = rec["value_text"]
+        existing = find_value_item(cand_name)
+        prev_val = None
+        if existing and val_str and existing["value_text"] != val_str:
+            prev_val = existing["value_text"]
+        img_url = img_map.get(normalize_unit_key(cand_name))
+        _, did_change = upsert_value_item(
+            name=cand_name,
+            category=rec["category"],
+            value_text=val_str,
+            prev_value_text=prev_val,
+            demand_text=rec["demand_text"],
+            stability_text=rec["stability_text"],
+            image_url=img_url,
+            source="auto-check",
+        )
+        checked_count += 1
+        if did_change:
+            changed_count += 1
+
+    return checked_count, changed_count
+
+
+async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> Tuple[int, int]:
+    global LAST_VALUE_WEB_SYNC, LAST_VALUE_SYNC_STATS, VALUE_SYNC_IN_PROGRESS
+    if VALUE_SYNC_IN_PROGRESS:
+        return LAST_VALUE_SYNC_STATS["checked"], LAST_VALUE_SYNC_STATS["changed"]
+
+    session = await get_http_session()
+    if not session:
+        return 0, 0
+
+    VALUE_SYNC_IN_PROGRESS = True
+    try:
+        sep = "&" if "?" in url else "?"
+        bust_url = f"{url}{sep}_t={int(time.time() // 30)}"
+        async with session.get(bust_url) as resp:
+            if resp.status != 200:
+                return 0, 0
+            raw_html = await resp.text()
+
+        checked, changed = await asyncio.to_thread(_parse_and_apply_website_html, raw_html)
+        now_f = time.time()
+        LAST_VALUE_WEB_SYNC = now_f
+        LAST_VALUE_SYNC_STATS = {"checked": checked, "changed": changed, "ts": int(now_f)}
+        if changed > 0:
+            print(f"[ValueSync] 2-min check updated {changed}/{checked} unit(s)!")
+        return checked, changed
+    except Exception:
         LAST_VALUE_WEB_SYNC = time.time()
-    return updated_count
-
-
-def parse_numeric_value(raw: str) -> Optional[float]:
-    nums = re.findall(r"\d+(?:,\d+)*(?:\.\d+)?", raw)
-    if not nums:
-        return None
-    parsed = [float(n.replace(",", "")) for n in nums]
-    return sum(parsed) / len(parsed)
-
-
-def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
-    blocks = re.split(r"\n\s*\n", raw_text.strip())
-    parsed_changes: List[Dict[str, Any]] = []
-
-    for block in blocks:
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        if not lines:
-            continue
-
-        unit_raw = re.sub(r"^[-•*`#>\s]+|[`*\s]+$", "", lines[0]).strip()
-        if not unit_raw or unit_raw.startswith(("@", "<@")):
-            continue
-        if ":" in unit_raw and unit_raw.lower().startswith(("value", "status", "stability", "demand", "sign")):
-            continue
-
-        existing = find_value_item(unit_raw)
-        display_name = existing["name"] if existing else unit_raw
-
-        entry: Dict[str, Any] = {
-            "raw_name": unit_raw,
-            "display_name": display_name,
-            "trend": "neutral",
-            "lines": [],
-        }
-
-        new_val: Optional[str] = None
-        prev_val: Optional[str] = None
-        new_dem: Optional[str] = None
-        new_stab: Optional[str] = None
-        new_sign: Optional[str] = None
-
-        for attr_line in lines[1:]:
-            if attr_line.startswith(("@", "<@")):
-                continue
-            if ":" not in attr_line:
-                entry["lines"].append(attr_line)
-                continue
-            k_raw, v_raw = attr_line.split(":", 1)
-            k = k_raw.strip().lower()
-            v = v_raw.strip()
-
-            arrow_parts = re.split(r"\s*(?:->|➔|→|=>)\s*", v, maxsplit=1)
-            has_arrow = len(arrow_parts) == 2
-
-            if k.startswith("val"):
-                if has_arrow:
-                    prev_val, new_val = arrow_parts[0].strip(), arrow_parts[1].strip()
-                    n_old = parse_numeric_value(prev_val)
-                    n_new = parse_numeric_value(new_val)
-                    if n_old is not None and n_new is not None:
-                        diff = n_new - n_old
-                        if diff > 0:
-                            entry["trend"] = "up"
-                            diff_str = f" (+{int(diff):,})" if diff.is_integer() else f" (+{diff:,.1f})"
-                        elif diff < 0:
-                            entry["trend"] = "down"
-                            diff_str = f" ({int(diff):,})" if diff.is_integer() else f" ({diff:,.1f})"
-                        else:
-                            diff_str = ""
-                    else:
-                        diff_str = ""
-                    entry["lines"].append(f"**Value:** `{prev_val}` ➔ **`{new_val}`**{diff_str}")
-                else:
-                    new_val = v
-                    entry["lines"].append(f"**Value:** **`{new_val}`**")
-
-            elif k.startswith("dem"):
-                if has_arrow:
-                    old_d, new_dem = arrow_parts[0].strip(), arrow_parts[1].strip()
-                    if "/10" not in new_dem and new_dem.replace(".", "", 1).isdigit():
-                        new_dem_db = f"{new_dem}/10"
-                    else:
-                        new_dem_db = new_dem
-                    new_dem = new_dem_db
-                    entry["lines"].append(f"**Demand:** `{old_d}` ➔ **`{new_dem}`**")
-                else:
-                    new_dem = f"{v}/10" if ("/10" not in v and v.replace(".", "", 1).isdigit()) else v
-                    entry["lines"].append(f"**Demand:** **`{new_dem}`**")
-
-            elif k.startswith(("stat", "stab")):
+        return 0, 0
+    finally:
+        VALUE_SYNC_IN_PROGRESS = False
                 if has_arrow:
                     old_s, new_stab = arrow_parts[0].strip(), arrow_parts[1].strip()
                     entry["lines"].append(f"**Status:** `{old_s}` ➔ **`{new_stab}`**")
@@ -987,6 +1051,7 @@ def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
             demand_text=new_dem,
             stability_text=new_stab,
             sign_value_text=new_sign,
+            source="changelog",
         )
         parsed_changes.append(entry)
 
@@ -1054,6 +1119,39 @@ def build_top_values_embed(guild: Optional[discord.Guild]) -> discord.Embed:
     )
     embed.set_footer(
         text=f"{guild.name if guild else 'CMTD'} • {len(VALUE_ITEMS_CACHE)} total tracked units",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
+
+
+def build_recent_value_changes_embed(guild: Optional[discord.Guild]) -> discord.Embed:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT item_name, field_changed, old_val, new_val, source, changed_at
+            FROM value_history
+            ORDER BY id DESC LIMIT 15
+            """
+        )
+        rows = c.fetchall()
+
+    lines: List[str] = []
+    for item_name, field, old_v, new_v, src, ts in rows:
+        tag = "🌐" if src == "auto-check" else "📊"
+        lines.append(f"{tag} **{item_name}** — `{field}`: `{old_v}` ➔ **`{new_v}`** (<t:{ts}:R>)")
+
+    last_ts = LAST_VALUE_SYNC_STATS.get("ts", 0)
+    sync_line = f"Last website check: <t:{last_ts}:R> (auto-checks every **2 min**)" if last_ts else "Auto-checks every **2 min**"
+
+    embed = discord.Embed(
+        title="📈 Recent Value List Changes",
+        description=f"{sync_line}\n\n" + ("\n".join(lines) if lines else "*No recent price changes recorded yet.*"),
+        color=0x2ECC71,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • Live 2-Minute Value Monitor",
         icon_url=guild.icon.url if (guild and guild.icon) else None,
     )
     return embed
@@ -1209,6 +1307,15 @@ class ValueHubView(discord.ui.View):
         top_btn.callback = self.on_top_click
         self.add_item(top_btn)
 
+        recent_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Recent Changes",
+            emoji="📈",
+            custom_id="val_hub:recent_changes",
+        )
+        recent_btn.callback = self.on_recent_click
+        self.add_item(recent_btn)
+
     async def on_check_click(self, interaction: discord.Interaction):
         await interaction.response.send_modal(QuickValueLookupModal())
 
@@ -1227,383 +1334,15 @@ class ValueHubView(discord.ui.View):
         view = build_link_view("Open Full Value List", site_url)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-
-# -------------------------------------------------------------
-# 3.1. Trade Calculator Engine (/calc — Public with Anti-Spam)
-# -------------------------------------------------------------
-GAMEPASS_EXACT_NAMES = {"2x money", "2x lucky", "2x speed", "x2 candy"}
-
-
-def check_calc_cooldown(user_id: int) -> float:
-    now = time.time()
-    last_used = CALC_COOLDOWNS.get(user_id, 0.0)
-    elapsed = now - last_used
-    if elapsed < CALC_COOLDOWN_SECONDS:
-        return CALC_COOLDOWN_SECONDS - elapsed
-    return 0.0
-
-
-def record_calc_usage(user_id: int):
-    now = time.time()
-    CALC_COOLDOWNS[user_id] = now
-    if len(CALC_COOLDOWNS) > 5000:
-        cutoff = now - (CALC_COOLDOWN_SECONDS * 2)
-        stale_keys = [uid for uid, ts in CALC_COOLDOWNS.items() if ts < cutoff]
-        for uid in stale_keys:
-            CALC_COOLDOWNS.pop(uid, None)
-
-
-def parse_numeric_range(raw: str) -> Tuple[float, float, bool]:
-    cleaned = raw.strip().lower()
-    if cleaned in ("o/c", "oc", "n/a", "?", "none"):
-        return 0.0, 0.0, True
-    nums = re.findall(r"\d+(?:,\d+)*(?:\.\d+)?", raw)
-    if not nums:
-        return 0.0, 0.0, False
-    if len(nums) == 1:
-        val = float(nums[0].replace(",", ""))
-        return val, val, False
-    v1 = float(nums[0].replace(",", ""))
-    v2 = float(nums[1].replace(",", ""))
-    return min(v1, v2), max(v1, v2), False
-
-
-def parse_demand_numeric(raw: str) -> Optional[float]:
-    m = re.search(r"\d+(?:\.\d+)?", raw or "")
-    return float(m.group(0)) if m else None
-
-
-def parse_trade_side(raw_text: str) -> Dict[str, Any]:
-    tokens = [t.strip() for t in re.split(r"[\n,;]+", raw_text) if t.strip()][:20]
-    items: List[Tuple[Dict[str, Any], int]] = []
-    unknown: List[str] = []
-
-    for token in tokens:
-        qty = 1
-        name_part = token
-
-        if token.lower() not in GAMEPASS_EXACT_NAMES:
-            prefix_m = re.match(r"^(\d+)\s*x?\s+(.+)$", token, re.IGNORECASE)
-            suffix_m = re.match(r"^(.+?)\s+x?(\d+)$", token, re.IGNORECASE)
-            if prefix_m:
-                qty = min(max(int(prefix_m.group(1)), 1), 99)
-                name_part = prefix_m.group(2).strip()
-            elif suffix_m:
-                name_part = suffix_m.group(1).strip()
-                qty = min(max(int(suffix_m.group(2)), 1), 99)
-
-        unit = find_value_item(name_part)
-        if unit:
-            items.append((unit, qty))
-        else:
-            unknown.append(token[:40])
-
-    total_min = 0.0
-    total_max = 0.0
-    demand_sum = 0.0
-    demand_qty = 0
-    oc_count = 0
-    warnings: List[str] = []
-
-    for unit, qty in items:
-        min_v, max_v, is_oc = parse_numeric_range(unit["value_text"])
-        if is_oc:
-            oc_count += qty
-        else:
-            total_min += min_v * qty
-            total_max += max_v * qty
-
-        dem_num = parse_demand_numeric(unit.get("demand_text", ""))
-        if dem_num is not None:
-            demand_sum += dem_num * qty
-            demand_qty += qty
-
-        stab_low = unit.get("stability_text", "").lower()
-        if ("dropping" in stab_low or "underpaid" in stab_low) and unit["name"] not in warnings:
-            warnings.append(unit["name"])
-
-    avg_value = (total_min + total_max) / 2.0
-    avg_demand = (demand_sum / demand_qty) if demand_qty > 0 else 0.0
-
-    return {
-        "raw_text": raw_text,
-        "items": items,
-        "unknown": unknown,
-        "total_min": total_min,
-        "total_max": total_max,
-        "avg_value": avg_value,
-        "avg_demand": avg_demand,
-        "oc_count": oc_count,
-        "warnings": warnings,
-    }
-
-
-def format_trade_side_total(side: Dict[str, Any]) -> str:
-    if side["total_min"] == side["total_max"]:
-        base = f"{int(side['total_min']):,}" if side["total_min"].is_integer() else f"{side['total_min']:,.1f}"
-    else:
-        lo = f"{int(side['total_min']):,}" if side["total_min"].is_integer() else f"{side['total_min']:,.1f}"
-        hi = f"{int(side['total_max']):,}" if side["total_max"].is_integer() else f"{side['total_max']:,.1f}"
-        base = f"{lo} – {hi}"
-    if side["oc_count"] > 0:
-        base += f" + {side['oc_count']} o/c"
-    return base
-
-
-def calculate_trade_offer(give_raw: str, get_raw: str) -> Dict[str, Any]:
-    give = parse_trade_side(give_raw)
-    get = parse_trade_side(get_raw)
-
-    diff = get["avg_value"] - give["avg_value"]
-    denom = max(give["avg_value"], get["avg_value"], 1.0)
-    pct_diff = (diff / denom) * 100.0
-
-    if pct_diff > 5.0:
-        verdict = "WIN"
-        emoji = "🟢"
-        color = 0x2ECC71
-    elif pct_diff < -5.0:
-        verdict = "LOSE"
-        emoji = "🔴"
-        color = 0xE74C3C
-    else:
-        verdict = "FAIR"
-        emoji = "🟡"
-        color = 0xF1C40F
-
-    return {
-        "give": give,
-        "get": get,
-        "diff": diff,
-        "pct_diff": pct_diff,
-        "verdict": verdict,
-        "emoji": emoji,
-        "color": color,
-    }
-
-
-def build_trade_calc_embed(guild: Optional[discord.Guild], calc: Dict[str, Any], wfl_ch_id: Optional[int] = None) -> discord.Embed:
-    give = calc["give"]
-    get = calc["get"]
-    diff = calc["diff"]
-    sign = "+" if diff > 0 else ""
-    diff_num = f"{sign}{int(round(diff)):,}"
-    pct_str = f"{sign}{calc['pct_diff']:.1f}%"
-
-    def _format_lines(side: Dict[str, Any]) -> str:
-        if not side["items"]:
-            return "*No recognized units*"
-        lines = []
-        for unit, qty in side["items"][:12]:
-            prefix = f"{qty}x " if qty > 1 else ""
-            lines.append(f"• **{prefix}{unit['name']}** — `{unit['value_text']}` *(Dem {unit['demand_text']})*")
-        if len(side["items"]) > 12:
-            lines.append(f"*...and {len(side['items']) - 12} more*")
-        return "\n".join(lines)
-
-    give_block = (
-        f"{_format_lines(give)}\n\n"
-        f"💰 **Total:** `{format_trade_side_total(give)}`\n"
-        f"🔥 **Avg Demand:** `{give['avg_demand']:.1f}/10`"
-    )
-    get_block = (
-        f"{_format_lines(get)}\n\n"
-        f"💰 **Total:** `{format_trade_side_total(get)}`\n"
-        f"🔥 **Avg Demand:** `{get['avg_demand']:.1f}/10`"
-    )
-
-    embed = discord.Embed(
-        title=f"⚖️ Trade Verdict: {calc['emoji']} {calc['verdict']} ({diff_num} | {pct_str})",
-        color=calc["color"],
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="📤 You Give", value=give_block[:1024], inline=True)
-    embed.add_field(name="📥 You Get", value=get_block[:1024], inline=True)
-
-    notes: List[str] = []
-    all_unknown = give["unknown"] + get["unknown"]
-    if all_unknown:
-        notes.append(f"⚠️ **Unrecognized:** `{', '.join(all_unknown[:6])}` (check spelling via `/value`)")
-    if get["warnings"]:
-        notes.append(f"📉 **Stability Alert:** You are receiving dropping/underpaid unit(s): **{', '.join(get['warnings'][:5])}**")
-
-    wfl_hint = f"Want community opinions? Post your offer in <#{wfl_ch_id}>!" if wfl_ch_id else "Want community opinions? Post your offer in the W/F/L channel!"
-    notes.append(f"💬 {wfl_hint}")
-    embed.add_field(name="📋 Summary & Notes", value="\n".join(notes)[:1024], inline=False)
-
-    embed.set_footer(
-        text=f"{guild.name if guild else 'CMTD'} • Live Value List Calculator",
-        icon_url=guild.icon.url if (guild and guild.icon) else None,
-    )
-    return embed
-
-
-class TradeCalcResultView(discord.ui.View):
-    def __init__(self, give_raw: str, get_raw: str):
-        super().__init__(timeout=180)
-        self.give_raw = give_raw
-        self.get_raw = get_raw
-
-    @discord.ui.button(label="Edit Offer", style=discord.ButtonStyle.secondary, emoji="✏️")
-    async def edit_offer_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            TradeCalcModal(give_default=self.give_raw, get_default=self.get_raw)
-        )
-
-
-class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
-    give_input = discord.ui.TextInput(
-        label="You Give (comma or new line, e.g. 2x UTTV)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500,
-        placeholder="2x UTTV, Engineer Cameraman, Scientist Crate",
-    )
-    get_input = discord.ui.TextInput(
-        label="You Get (comma or new line, e.g. Pharaoh)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500,
-        placeholder="Pharaoh Cameraman, 2x Lucky",
-    )
-
-    def __init__(self, give_default: str = "", get_default: str = ""):
-        super().__init__()
-        if give_default:
-            self.give_input.default = give_default
-        if get_default:
-            self.get_input.default = get_default
-
-    async def on_submit(self, interaction: discord.Interaction):
-        remaining = check_calc_cooldown(interaction.user.id)
-        if remaining > 0:
-            return await interaction.response.send_message(
-                f"⏳ Anti-spam cooldown: please wait **{remaining:.1f}s** before calculating again.",
-                ephemeral=True,
-            )
-
-        give_raw = self.give_input.value.strip()
-        get_raw = self.get_input.value.strip()
-        calc = calculate_trade_offer(give_raw, get_raw)
-
-        if not calc["give"]["items"] and not calc["get"]["items"]:
-            return await interaction.response.send_message(
-                "❌ Could not recognize any units in your offer. Check unit names or shortcuts with `/value`.",
-                ephemeral=True,
-            )
-
-        record_calc_usage(interaction.user.id)
-        wfl_ch_id = get_guild_settings(interaction.guild.id).get("wfl_channel_id") if interaction.guild else None
-        embed = build_trade_calc_embed(interaction.guild, calc, wfl_ch_id=wfl_ch_id)
-        view = TradeCalcResultView(give_raw=give_raw, get_raw=get_raw)
+    async def on_recent_click(self, interaction: discord.Interaction):
+        site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
+        embed = build_recent_value_changes_embed(interaction.guild)
+        view = build_link_view("Open Full Value List", site_url)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-class ValueChangelogModal(discord.ui.Modal, title="Publish Official Value Changes"):
-    header_input = discord.ui.TextInput(
-        label="Changelog Title (Optional)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=120,
-        default="📊 Official Value List Changes",
-    )
-    changes_input = discord.ui.TextInput(
-        label="Changes (Paste your usual unit blocks)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=3500,
-        placeholder="UTTV\nValue: 4650 -> 4000\nStatus: Underpaid\n\nUTC\nValue: 2800 -> 3000",
-    )
-    ping_confirm_input = discord.ui.TextInput(
-        label="Ping Value Changes Role? (yes / no)",
-        style=discord.TextStyle.short,
-        required=True,
-        max_length=5,
-        default="no",
-        placeholder="Type yes to ping or no to post silently",
-    )
-    note_input = discord.ui.TextInput(
-        label="Extra Note (Optional)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=300,
-        placeholder="e.g. Adjusted based on recent trade demand.",
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-        if not has_value_manager_access(interaction.user):
-            return await interaction.response.send_message(
-                "❌ You don't have permission to publish value changes.",
-                ephemeral=True,
-            )
-
-        settings = get_guild_settings(interaction.guild.id)
-        target_ch_id = settings.get("value_channel_id")
-        target_ch = interaction.guild.get_channel(target_ch_id) if target_ch_id else interaction.channel
-        if not isinstance(target_ch, discord.TextChannel):
-            return await interaction.response.send_message(
-                "❌ Value Changelog channel not found. Configure it in `/panel` ➔ `💎 Value List`.",
-                ephemeral=True,
-            )
-
-        parsed = parse_value_changelog_text(self.changes_input.value)
-        if not parsed:
-            return await interaction.response.send_message(
-                "❌ Could not parse any unit changes. Make sure each unit block starts with the unit name.",
-                ephemeral=True,
-            )
-
-        sections: List[str] = []
-        for entry in parsed:
-            icon = "📈" if entry["trend"] == "up" else ("📉" if entry["trend"] == "down" else "⚖️")
-            details = "\n".join(f"> {ln}" for ln in entry["lines"]) if entry["lines"] else "> *Updated*"
-            sections.append(f"{icon} **{entry['display_name']}**\n{details}")
-
-        desc = "\n\n".join(sections)
-        if self.note_input.value.strip():
-            desc += f"\n\n📝 *{self.note_input.value.strip()}*"
-
-        embed = discord.Embed(
-            title=self.header_input.value.strip() or "📊 Official Value List Changes",
-            description=desc[:4000],
-            color=0xF1C40F,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_author(
-            name=f"Updated by {interaction.user.display_name}",
-            icon_url=interaction.user.display_avatar.url,
-        )
-        embed.set_footer(
-            text=f"{interaction.guild.name} • Use /value to check any unit",
-            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
-        )
-
-        should_ping = self.ping_confirm_input.value.strip().lower() in ("yes", "y", "да", "1", "true")
-        ping_role_id = settings.get("value_ping_role_id")
-        ping_role = interaction.guild.get_role(ping_role_id) if ping_role_id else None
-
-        content = ping_role.mention if (should_ping and ping_role) else None
-        allowed = discord.AllowedMentions(roles=True) if content else discord.AllowedMentions.none()
-
-        sent = await target_ch.send(
-            content=content,
-            embed=embed,
-            view=ValueChangelogVoteView(up_count=0, down_count=0),
-            allowed_mentions=allowed,
-        )
-        updated_names = ", ".join(f"`{e['display_name']}`" for e in parsed[:10])
-        ping_note = f" (pinged {ping_role.mention})" if content else " (posted without ping)"
-        await interaction.response.send_message(
-            f"✅ Published **{len(parsed)}** unit update(s) in {target_ch.mention}{ping_note}: {updated_names}\n"
-            f"-# Added a unit by mistake? Remove it with `/value_unit_delete`. [Jump to Post]({sent.jump_url})",
-            ephemeral=True,
-        )
-
-
 # -------------------------------------------------------------
-# 4. Reliable W/F/L Emoji Resolver & Reaction Queue
+# 4. Reliable W/F/L Emoji Resolver & Adaptive Reaction Queue
 # -------------------------------------------------------------
 async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) -> List[Any]:
     global APP_EMOJIS_CACHE
@@ -1652,17 +1391,50 @@ WFL_CHATTER_WORDS = {
     "big l", "huge l", "massive l", "small w", "small l",
     "fairish", "add", "adds", "no", "nah", "yes", "yep", "cap",
     "idk", "ty", "thx", "thanks", "bradar", "bro", "ok", "okay",
+    "dont", "dont do it", "scam", "overpay", "underpay", "op", "up",
 }
 
+TRADE_OFFER_MARKERS = (
+    "w/f/l", "wfl", "worl", "w or l", "win or lose",
+    "me:", "them:", "my:", "their:", "you:", "him:", "her:",
+    "offering", "offer", "for my", "for his", "for her",
+    "->", "➔", "→", "=>", " vs ", "should i", "worth", "quick", "fast",
+)
 
-def is_wfl_voter_chatter(message: discord.Message) -> bool:
+
+def should_react_wfl_message(message: discord.Message, smart_filter: bool = True) -> bool:
+    # Always react to screenshots / images / embeds
     if message.attachments or message.embeds:
+        return True
+
+    raw = message.content.strip()
+    if not raw:
         return False
-    cleaned = re.sub(r"[^a-z0-9\s]", "", message.content.lower()).strip()
+
+    low = raw.lower()
+    cleaned = re.sub(r"[^a-z0-9\s]", "", low).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
-    if not cleaned:
+
+    # Ignore pure single-phrase voter chatter ("W", "L", "huge w", "dont do it")
+    if cleaned in WFL_CHATTER_WORDS:
         return False
-    return cleaned in WFL_CHATTER_WORDS
+
+    if not smart_filter:
+        return True
+
+    # In Smart Mode (essential for 80k+ servers), skip plain text replies to other messages
+    # because replies without images are people voting/commenting on someone else's trade.
+    if message.reference is not None:
+        return False
+
+    if "?" in low or any(marker in low for marker in TRADE_OFFER_MARKERS):
+        return True
+
+    # Also catch multi-word offers ("uttv and utc for pharaoh", "2x eng + 500 gems")
+    if len(cleaned) >= 14 and (" or " in f" {cleaned} " or " for " in f" {cleaned} " or any(ch.isdigit() for ch in cleaned)):
+        return True
+
+    return False
 
 
 async def _wfl_queue_worker(guild_id: int):
@@ -1670,10 +1442,16 @@ async def _wfl_queue_worker(guild_id: int):
     while True:
         message, enqueued_at = await queue.get()
         try:
-            if time.time() - enqueued_at > 180:
+            # Drop stale items if backlog ever exceeded 60s so live posts always get reactions first
+            if time.time() - enqueued_at > 60:
                 continue
             if not message.guild:
                 continue
+
+            now = time.time()
+            backoff_until = WFL_BACKOFF_UNTIL.get(guild_id, 0.0)
+            if backoff_until > now:
+                await asyncio.sleep(min(backoff_until - now, 4.0))
 
             emojis = await resolve_wfl_emojis(message.guild)
             if not emojis:
@@ -1682,11 +1460,12 @@ async def _wfl_queue_worker(guild_id: int):
             for emoji in emojis:
                 try:
                     await message.add_reaction(emoji)
-                    await asyncio.sleep(0.55)
+                    await asyncio.sleep(0.45)
                 except (discord.NotFound, discord.Forbidden):
                     break
                 except discord.HTTPException as e:
                     retry_after = float(getattr(e, "retry_after", 1.5) or 1.5)
+                    WFL_BACKOFF_UNTIL[guild_id] = time.time() + min(retry_after + 0.5, 6.0)
                     await asyncio.sleep(retry_after + 0.5)
                     try:
                         await message.add_reaction(emoji)
@@ -1699,16 +1478,16 @@ async def _wfl_queue_worker(guild_id: int):
             queue.task_done()
 
 
-def enqueue_wfl_reactions(message: discord.Message):
+def enqueue_wfl_reactions(message: discord.Message, smart_filter: bool = True):
     if not message.guild:
         return
-    if is_wfl_voter_chatter(message):
+    if not should_react_wfl_message(message, smart_filter=smart_filter):
         return
 
     guild_id = message.guild.id
     queue = WFL_QUEUES.get(guild_id)
     if queue is None:
-        queue = asyncio.Queue(maxsize=120)
+        queue = asyncio.Queue(maxsize=35)
         WFL_QUEUES[guild_id] = queue
 
     worker = WFL_WORKERS.get(guild_id)
@@ -4354,9 +4133,10 @@ class ValueSetupView(discord.ui.View):
     async def sync_web_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         site_url = get_guild_settings(self.guild_id)["value_list_url"]
-        count = await sync_value_list_from_website(site_url)
+        checked, changed = await sync_value_list_from_website(site_url)
         await interaction.followup.send(
-            f"🔄 Synced **{count}** items from `{site_url}`! Total units in RAM cache: **{len(VALUE_ITEMS_CACHE)}**.",
+            f"🔄 Checked **{checked}** items from `{site_url}` (**{changed}** updated)! "
+            f"Auto-sync runs automatically every **2 minutes**. Total cached: **{len(VALUE_ITEMS_CACHE)}**.",
             ephemeral=True,
         )
 
@@ -4368,10 +4148,10 @@ class ValueSetupView(discord.ui.View):
         embed = discord.Embed(
             title="💎 Official CMTD Value List & Trade Hub",
             description=(
-                "Check live unit values, demand, stability, and calculate trades right here in Discord!\n\n"
+                "Check live unit values (auto-checked every **2 minutes**), calculate trades, and track price changes right here in Discord!\n\n"
                 "• Click **`🔍 Check Unit Value`** to look up any unit privately.\n"
                 "• Click **`⚖️ Trade Calculator`** (or type `/calc`) to check **Win / Fair / Lose**.\n"
-                "• Click **`🏆 Top Values`** to view the Top 15 highest value units."
+                "• Click **`🏆 Top Values`** or **`📈 Recent Changes`** for live leaderboards & updates."
             ),
             color=0x3498DB,
         )
@@ -4524,8 +4304,9 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         val_mgr_txt += f" (+{len(mgr_ids) - 4})"
 
     detected_wfl = await resolve_wfl_emojis(guild)
+    wfl_mode_tag = "Smart Trade Filter" if s.get("wfl_smart_filter", True) else "All Posts"
     if len(detected_wfl) == 3:
-        wfl_status = " ".join(str(e) for e in detected_wfl)
+        wfl_status = f"{' '.join(str(e) for e in detected_wfl)} (`{wfl_mode_tag}`)"
     else:
         found_names = {e.name.lower() for e in detected_wfl}
         missing = [n for n in WFL_EMOJI_NAMES if n not in found_names]
@@ -4536,10 +4317,12 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         shield_status += f" (<#{s['antiscam_log_channel_id']}>)"
 
     lock_status = "🔴 **LOCKED DOWN**" if is_lockdown_active(guild.id) else "🟢 Normal"
+    last_sync_ts = LAST_VALUE_SYNC_STATS.get("ts", 0)
+    sync_status = f"<t:{last_sync_ts}:R> (every 2m)" if last_sync_ts else "Every 2m"
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L reactions, Value System, Voice 2.0, Anti-Scam & Lockdown below.",
+        description="Configure Starboard, W/F/L reactions, Value System (2-min sync), Voice 2.0, Anti-Scam & Lockdown below.",
         color=0x5865F2,
     )
     embed.add_field(name="💡 Ideas Channel", value=ideas, inline=True)
@@ -4551,9 +4334,10 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="💎 Value Channel", value=val_ch, inline=True)
     embed.add_field(name="🏷️ Value Ping Role", value=val_role, inline=True)
     embed.add_field(name="🛡️ Value Team Roles", value=val_mgr_txt, inline=True)
+    embed.add_field(name="🔄 Last Value Sync", value=sync_status, inline=True)
     embed.add_field(name="🛡️ Anti-Scam Shield", value=shield_status, inline=True)
     embed.add_field(name="🔒 Server Lockdown", value=lock_status, inline=True)
-    embed.add_field(name="🚀 Booster / Auto-Role", value=f"{booster} / {autorole}", inline=True)
+    embed.add_field(name="🚀 Booster / Auto-Role", value=f"{booster} / {autorole}", inline=False)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} tracked units")
     return embed
 
@@ -4653,13 +4437,13 @@ class ControlPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Stars / Post", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
-    async def set_threshold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ThresholdModal())
-
-
-# -------------------------------------------------------------
-# 14. Slash Commands & Context Menus
+    @discord.ui.button(label="W/F/L Mode", style=discord.ButtonStyle.secondary, emoji="⚖️", row=4)
+    async def toggle_wfl_mode_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        cur = get_guild_settings(interaction.guild.id).get("wfl_smart_filter", True)
+        update_guild_settings(interaction.guild.id, wfl_smart_filter=not cur)
+        await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 # -------------------------------------------------------------
 async def unit_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     q = normalize_unit_key(current)
@@ -4713,128 +4497,115 @@ async def calc_cmd(interaction: discord.Interaction):
     await interaction.response.send_modal(TradeCalcModal())
 
 
-@bot.tree.command(name="value_post", description="Publish formatted value list changes & auto-update the bot's value database")
-async def value_post_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="value_changes", description="View recent unit value, demand & stability changes")
+async def value_changes_cmd(interaction: discord.Interaction):
+    site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
+    embed = build_recent_value_changes_embed(interaction.guild)
+    view = build_link_view("Open Full Value List", site_url)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class CodesUpdateModal(discord.ui.Modal, title="Update Active Game Codes"):
+    codes_input = discord.ui.TextInput(
+        label="Active Codes (1 per line, e.g. RELEASE - 200 Gems)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+        placeholder="UPDATE5 - 500 Gems\nCMTD2026 - 2x Luck Boost",
+    )
+    note_input = discord.ui.TextInput(
+        label="Extra Note (Optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=200,
+        placeholder="Redeem codes at the Twitter/Codes NPC in the lobby!",
+    )
+
+    def __init__(self, current_codes: str = "", current_note: str = ""):
+        super().__init__()
+        if current_codes:
+            self.codes_input.default = current_codes
+        if current_note:
+            self.note_input.default = current_note
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO guild_codes (guild_id, codes_text, note_text, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    interaction.guild.id,
+                    self.codes_input.value.strip(),
+                    self.note_input.value.strip(),
+                    int(time.time()),
+                    interaction.user.display_name,
+                ),
+            )
+            conn.commit()
+        await interaction.response.send_message(
+            "✅ Active game codes updated! Players can now view and copy them anytime via `/codes`.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="codes", description="View and copy active Cameraman Tower Defense codes")
+async def codes_cmd(interaction: discord.Interaction):
+    if not interaction.guild:
+        return
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT codes_text, note_text, updated_at, updated_by FROM guild_codes WHERE guild_id = ?",
+            (interaction.guild.id,),
+        )
+        row = c.fetchone()
+
+    if not row or not row[0]:
+        return await interaction.response.send_message(
+            "🎁 No active codes have been added yet! Administrators or Value Team members can set them with `/codes_set`.",
+            ephemeral=True,
+        )
+
+    codes_raw, note_raw, updated_at, updated_by = row
+    formatted_lines = [f"• `{ln.strip()}`" for ln in codes_raw.splitlines() if ln.strip()]
+    desc = "\n".join(formatted_lines)
+    if note_raw:
+        desc += f"\n\n💡 *{note_raw}*"
+    desc += f"\n\n-# Last updated <t:{updated_at}:R> by {updated_by}"
+
+    embed = discord.Embed(
+        title="🎁 Active Cameraman TD Codes",
+        description=desc,
+        color=0x2ECC71,
+    )
+    embed.set_footer(
+        text=f"{interaction.guild.name} • Tap a code on mobile to copy",
+        icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="codes_set", description="Set or update the active game codes shown by /codes")
+async def codes_set_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         return
     if not has_value_manager_access(interaction.user):
         return await interaction.response.send_message(
-            "❌ You need one of the configured **Value Team** roles (or Administrator) to use `/value_post`.",
+            "❌ You need Administrator or a configured Value Team role to update `/codes`.",
             ephemeral=True,
         )
-    await interaction.response.send_modal(ValueChangelogModal())
-
-
-@bot.tree.command(name="value_unit_delete", description="Remove an accidentally added or outdated unit from the bot's value list")
-@app_commands.describe(unit="Select or type the exact unit name to remove from /value")
-@app_commands.autocomplete(unit=unit_name_autocomplete)
-async def value_unit_delete_cmd(interaction: discord.Interaction, unit: str):
-    if not interaction.guild:
-        return
-    if not has_value_manager_access(interaction.user):
-        return await interaction.response.send_message(
-            "❌ You need one of the configured **Value Team** roles (or Administrator) to use `/value_unit_delete`.",
-            ephemeral=True,
-        )
-
-    deleted = delete_value_item(unit)
-    if not deleted:
-        return await interaction.response.send_message(
-            f"❌ Unit `{unit}` was not found in the database.",
-            ephemeral=True,
-        )
-    await interaction.response.send_message(
-        f"🗑️ Deleted **{deleted['name']}** (`Value: {deleted['value_text']}` • `Demand: {deleted['demand_text']}`) from the value list!",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="panel", description="Open the server configuration panel")
-@app_commands.default_permissions(administrator=True)
-async def panel_cmd(interaction: discord.Interaction):
-    if not interaction.guild:
-        return
-    await interaction.response.send_message(
-        embed=await build_panel_embed(interaction.guild),
-        view=ControlPanelView(),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="booster_role", description="Set the exclusive role guarded for active Server Boosters")
-@app_commands.describe(role="Role to remove automatically when a member stops boosting")
-@app_commands.default_permissions(administrator=True)
-async def booster_role_cmd(interaction: discord.Interaction, role: Optional[discord.Role] = None):
-    if not interaction.guild:
-        return
-    update_guild_settings(interaction.guild.id, booster_role_id=role.id if role else None)
-    msg = f"🚀 Booster Guard set to {role.mention}." if role else "🧹 Booster Guard disabled."
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-@bot.tree.command(name="post", description="Publish a styled embed post from the bot")
-@app_commands.describe(
-    style="Choose a visual style preset",
-    channel="Target channel (defaults to current channel)",
-    ping_role="Optional role to mention",
-    image="Optional image from your gallery",
-)
-@app_commands.choices(
-    style=[
-        app_commands.Choice(name="📢 Announcement", value="announcement"),
-        app_commands.Choice(name="🚀 Update / Patch Notes", value="update"),
-        app_commands.Choice(name="🎉 Event / Giveaway", value="event"),
-        app_commands.Choice(name="📘 Guide / Info", value="guide"),
-        app_commands.Choice(name="⚠️ Urgent Alert", value="alert"),
-        app_commands.Choice(name="🖤 Minimalist Dark", value="minimal"),
-    ]
-)
-@app_commands.default_permissions(manage_messages=True)
-async def post_cmd(
-    interaction: discord.Interaction,
-    style: str = "announcement",
-    channel: Optional[discord.TextChannel] = None,
-    ping_role: Optional[discord.Role] = None,
-    image: Optional[discord.Attachment] = None,
-):
-    target = channel or interaction.channel
-    if not isinstance(target, discord.TextChannel):
-        return await interaction.response.send_message("❌ Please select a valid text channel.", ephemeral=True)
-    defaults = {"image_url": image.url} if image else {}
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT codes_text, note_text FROM guild_codes WHERE guild_id = ?", (interaction.guild.id,))
+        row = c.fetchone()
     await interaction.response.send_modal(
-        PostComposerModal(style_key=style, target_channel=target, ping_role=ping_role, defaults=defaults)
-    )
-
-
-@bot.tree.command(name="edit", description="Edit an existing bot post by Message ID or Link")
-@app_commands.describe(message="Message ID or full Discord message link")
-@app_commands.default_permissions(manage_messages=True)
-async def edit_cmd(interaction: discord.Interaction, message: str):
-    if not interaction.guild or not interaction.channel:
-        return
-    ch_id, msg_id = parse_message_reference(message, interaction.channel.id)
-    if not ch_id or not msg_id:
-        return await interaction.response.send_message("❌ Invalid Message ID or Link.", ephemeral=True)
-
-    target_ch = interaction.guild.get_channel(ch_id)
-    if not isinstance(target_ch, discord.TextChannel):
-        return await interaction.response.send_message("❌ Channel not found.", ephemeral=True)
-
-    try:
-        target_msg = await target_ch.fetch_message(msg_id)
-    except Exception:
-        return await interaction.response.send_message("❌ Message not found in that channel.", ephemeral=True)
-
-    if not bot.user or target_msg.author.id != bot.user.id:
-        return await interaction.response.send_message("❌ I can only edit my own messages.", ephemeral=True)
-
-    data = load_post_data_from_message(target_msg)
-    await interaction.response.send_modal(
-        PostComposerModal(
-            style_key=data["style"],
-            target_channel=target_ch,
-            edit_message=target_msg,
-            defaults=data,
+        CodesUpdateModal(
+            current_codes=(row[0] if row else ""),
+            current_note=(row[1] if row else ""),
         )
     )
 
@@ -5075,17 +4846,59 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 # -------------------------------------------------------------
 # 15. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
+def compute_command_tree_signature() -> str:
+    entries: List[str] = []
+    for cmd in bot.tree.get_commands():
+        if isinstance(cmd, app_commands.Command):
+            params = ",".join(f"{p.name}:{p.type.name}" for p in cmd.parameters)
+            entries.append(f"slash:{cmd.name}:{cmd.description}:{params}")
+        elif isinstance(cmd, app_commands.ContextMenu):
+            entries.append(f"ctx:{cmd.name}:{cmd.type.name}")
+    entries.sort()
+    return "|".join(entries)
+
+
+async def sync_commands_instant_to_guilds(target_guild: Optional[discord.Guild] = None) -> int:
+    # Clear global commands on Discord API so there are zero duplicates, while keeping bot.tree intact
+    if bot.user:
+        try:
+            await bot.http.bulk_upsert_global_commands(bot.user.id, [])
+        except Exception:
+            pass
+
+    guilds = [target_guild] if target_guild else list(bot.guilds)
+    synced_total = 0
+    for g in guilds:
+        try:
+            bot.tree.copy_global_to(guild=g)
+            synced = await bot.tree.sync(guild=g)
+            synced_total = max(synced_total, len(synced))
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            print(f"[CommandSync] Failed for guild {g.id}: {e}")
+    return synced_total
+
+
 @bot.event
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
+
+    # Auto-sync slash commands immediately to guilds whenever commands change
+    current_sig = compute_command_tree_signature()
+    saved_sig = get_bot_meta("command_tree_sig")
+    if current_sig != saved_sig and bot.guilds:
+        count = await sync_commands_instant_to_guilds()
+        set_bot_meta("command_tree_sig", current_sig)
+        print(f"[CommandSync] Auto-synced {count} instant guild commands!")
+
     for guild in bot.guilds:
         s = get_guild_settings(guild.id)
         if s.get("wfl_channel_id"):
             await resolve_wfl_emojis(guild)
 
-    synced_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
-    if synced_units:
-        print(f"[ValueList] Synced {synced_units} items from website (Total cached: {len(VALUE_ITEMS_CACHE)})")
+    checked_units, changed_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
+    if checked_units:
+        print(f"[ValueList] Checked {checked_units} items ({changed_units} updated, {len(VALUE_ITEMS_CACHE)} total cached)")
 
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
@@ -5148,7 +4961,7 @@ async def on_message(message: discord.Message):
                 pass
 
         if settings["wfl_channel_id"] and message.channel.id == settings["wfl_channel_id"]:
-            enqueue_wfl_reactions(message)
+            enqueue_wfl_reactions(message, smart_filter=settings.get("wfl_smart_filter", True))
 
     await bot.process_commands(message)
 
@@ -5196,9 +5009,24 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def background_scheduler():
     now_ts = int(time.time())
 
-    # 1. Periodic 15-minute website refresh for Value List
-    if time.time() - LAST_VALUE_WEB_SYNC >= 900:
-        asyncio.create_task(sync_value_list_from_website(DEFAULT_VALUE_LIST_URL))
+    # 1. Periodic 2-minute website check for Value List price/demand updates
+    if time.time() - LAST_VALUE_WEB_SYNC >= VALUE_SYNC_INTERVAL_SECONDS:
+        target_url = DEFAULT_VALUE_LIST_URL
+        for g_settings in SETTINGS_CACHE.values():
+            if g_settings.get("value_list_url"):
+                target_url = g_settings["value_list_url"]
+                break
+        asyncio.create_task(sync_value_list_from_website(target_url))
+
+    # 1.5 Periodic RAM cooldown map cleanup (prevents memory growth on 80k+ servers)
+    if len(VOICE_CREATE_COOLDOWNS) > 2000:
+        cutoff_vc = time.time() - 60.0
+        for uid in [u for u, t in VOICE_CREATE_COOLDOWNS.items() if t < cutoff_vc]:
+            VOICE_CREATE_COOLDOWNS.pop(uid, None)
+    if len(STARBOARD_LOCKS) > 50:
+        active_gids = {g.id for g in bot.guilds}
+        for gid in [g for g in STARBOARD_LOCKS if g not in active_gids]:
+            STARBOARD_LOCKS.pop(gid, None)
 
     # 2. Backup sweep: delete temporary voice rooms only when completely empty
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
@@ -5301,10 +5129,10 @@ async def before_scheduler():
 @bot.command(name="sync")
 @commands.has_permissions(administrator=True)
 async def sync_commands(ctx: commands.Context):
-    msg = await ctx.send("⏳ Cleaning duplicate guild overrides & syncing slash commands...")
-    if ctx.guild:
-        bot.tree.clear_commands(guild=ctx.guild)
-        await bot.tree.sync(guild=ctx.guild)
+    msg = await ctx.send("⏳ Clearing global duplicates & syncing commands instantly to this server...")
+    count = await sync_commands_instant_to_guilds()
+    set_bot_meta("command_tree_sig", compute_command_tree_signature())
+    await msg.edit(content=f"✅ Instantly synced **{count}** commands to all servers (0 duplicates, visible immediately)!")
     synced = await bot.tree.sync()
     await msg.edit(content=f"✅ Successfully synced **{len(synced)}** global commands (duplicates cleared)!")
 
