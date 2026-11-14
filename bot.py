@@ -7,6 +7,7 @@ import time
 import asyncio
 import sqlite3
 import subprocess
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Set, Union
 
@@ -58,22 +59,32 @@ WFL_WORKERS: Dict[int, asyncio.Task] = {}
 STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 VALUE_VOTE_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
+SIGN_VOTE_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 LOCKDOWN_IN_PROGRESS: Set[int] = set()
 WFL_BACKOFF_UNTIL: Dict[int, float] = {}
 HTTP_SESSION: Optional["aiohttp.ClientSession"] = None
 
-# Value List RAM Cache (O(1) lookup for 80k+ members)
+# Value List & Sign Partners RAM Caches (O(1) lookup for 80k+ members)
 VALUE_ITEMS_CACHE: Dict[str, Dict[str, Any]] = {}
 VALUE_ALIAS_MAP: Dict[str, str] = {}
+SIGN_PARTNERS_CACHE: Dict[str, Dict[str, Any]] = {}
+SIGN_ALIAS_MAP: Dict[str, str] = {}
+
 LAST_VALUE_WEB_SYNC: float = 0.0
 LAST_VALUE_SYNC_STATS: Dict[str, int] = {"checked": 0, "changed": 0, "ts": 0}
-VALUE_SYNC_INTERVAL_SECONDS = 120  # Check website for price updates every 2 minutes
+VALUE_SYNC_INTERVAL_SECONDS = 120  # Check website every 2 minutes
 VALUE_SYNC_IN_PROGRESS = False
 DEFAULT_VALUE_LIST_URL = "https://cameraman-td.vaultedvaluesx.com/value-list"
 
-# Trade Calculator Anti-Spam Cooldowns (User ID -> Last Timestamp)
+# Trade Calculator & LFG Anti-Spam Cooldowns
 CALC_COOLDOWNS: Dict[int, float] = {}
 CALC_COOLDOWN_SECONDS = 10.0
+LFG_POST_COOLDOWNS: Dict[int, float] = {}
+LFG_COOLDOWN_SECONDS = 25.0
+
+# Dynamic Auto-Slowmode Traffic Monitor (Channel ID -> deque of timestamps)
+CHANNEL_MSG_TIMESTAMPS: Dict[int, deque] = {}
+ACTIVE_AUTO_SLOWMODES: Dict[int, Dict[str, Any]] = {}
 
 # Temporary Voice RAM State (Deletes only when empty or closed by owner)
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -82,6 +93,22 @@ VOICE_CREATE_COOLDOWNS: Dict[int, float] = {}
 WFL_EMOJI_NAMES = ("w1_win", "w1_fair", "w1_lose")
 POLL_NUM_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
 YOUTUBE_ACTIVITY_ID = 880218394199220334  # Discord Watch Together Activity
+
+LFG_GAME_MODES: List[Tuple[str, str, int]] = [
+    ("Easy", "🟢", 0x2ECC71),
+    ("Medium", "🟡", 0xF1C40F),
+    ("Hard", "🟠", 0xE67E22),
+    ("Insane", "🔴", 0xE74C3C),
+    ("Nightmare", "💀", 0x8E44AD),
+    ("Easy Halloween", "🎃", 0xFF8C00),
+    ("Hard Halloween", "👻", 0x9B59B6),
+]
+
+LFG_MODIFIERS: List[Tuple[str, str]] = [
+    ("No Modifiers", "➖"),
+    ("X2 HP Enemies", "❤️"),
+    ("X2 Speed Enemies", "⚡"),
+]
 
 
 def get_db() -> sqlite3.Connection:
@@ -113,7 +140,11 @@ def init_db():
                 value_ping_role_id INTEGER,
                 value_list_url TEXT,
                 value_manager_role_ids TEXT,
-                wfl_smart_filter INTEGER DEFAULT 1
+                wfl_smart_filter INTEGER DEFAULT 1,
+                signs_channel_id INTEGER,
+                lfg_channel_1_id INTEGER,
+                lfg_channel_2_id INTEGER,
+                autoslowmode_enabled INTEGER DEFAULT 0
             )
             """
         )
@@ -132,12 +163,16 @@ def init_db():
             "value_list_url": "TEXT",
             "value_manager_role_ids": "TEXT",
             "wfl_smart_filter": "INTEGER DEFAULT 1",
+            "signs_channel_id": "INTEGER",
+            "lfg_channel_1_id": "INTEGER",
+            "lfg_channel_2_id": "INTEGER",
+            "autoslowmode_enabled": "INTEGER DEFAULT 0",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
                 c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} {col_type}")
 
-        # Bot Metadata (Command Sync Hash, etc.) & Game Codes
+        # Bot Metadata
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS bot_meta (
@@ -189,7 +224,33 @@ def init_db():
             """
         )
 
-        # Temporary Voice Rooms & Personal Presets (Voice 2.0)
+        # Partner Sign Values & Changelog Votes
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_partners (
+                partner_key TEXT PRIMARY KEY,
+                display_name TEXT,
+                roblox_username TEXT,
+                aliases TEXT,
+                sign_text TEXT,
+                prev_sign_text TEXT,
+                note_text TEXT,
+                updated_at INTEGER
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sign_post_votes (
+                message_id INTEGER,
+                user_id INTEGER,
+                vote INTEGER,
+                PRIMARY KEY (message_id, user_id)
+            )
+            """
+        )
+
+        # Temporary Voice Rooms, Presets & Linked LFG Posts
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS temp_voices (
@@ -222,8 +283,23 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lfg_posts (
+                message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                guild_id INTEGER,
+                voice_channel_id INTEGER,
+                owner_id INTEGER,
+                game_mode TEXT,
+                modifiers TEXT,
+                note TEXT,
+                created_at INTEGER
+            )
+            """
+        )
 
-        # Lockdown Snapshots (Legacy + Multi-Role Full Channel Snapshots) & Whitelist
+        # Lockdown Snapshots & Whitelist
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS lockdown_snapshots (
@@ -398,6 +474,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_polls_active ON polls(is_closed, ends_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_active ON scheduled_events(started, start_ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_value_history_ts ON value_history(changed_at DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_lfg_vc ON lfg_posts(voice_channel_id)")
         conn.commit()
     print(f"[Database] Ready (WAL Mode) at: {DB_PATH}")
 
@@ -433,7 +510,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                    antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                    value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                   wfl_smart_filter
+                   wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
+                   autoslowmode_enabled
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -455,6 +533,10 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "value_list_url": (row[12] if (row and row[12]) else DEFAULT_VALUE_LIST_URL),
             "value_manager_role_ids": (row[13] if (row and row[13]) else ""),
             "wfl_smart_filter": bool(row[14]) if (row and row[14] is not None) else True,
+            "signs_channel_id": row[15] if row else None,
+            "lfg_channel_1_id": row[16] if row else None,
+            "lfg_channel_2_id": row[17] if row else None,
+            "autoslowmode_enabled": bool(row[18]) if row else False,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -473,9 +555,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                 antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                 value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                wfl_smart_filter
+                wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
+                autoslowmode_enabled
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -491,7 +574,11 @@ def update_guild_settings(guild_id: int, **kwargs):
                 value_ping_role_id = excluded.value_ping_role_id,
                 value_list_url = excluded.value_list_url,
                 value_manager_role_ids = excluded.value_manager_role_ids,
-                wfl_smart_filter = excluded.wfl_smart_filter
+                wfl_smart_filter = excluded.wfl_smart_filter,
+                signs_channel_id = excluded.signs_channel_id,
+                lfg_channel_1_id = excluded.lfg_channel_1_id,
+                lfg_channel_2_id = excluded.lfg_channel_2_id,
+                autoslowmode_enabled = excluded.autoslowmode_enabled
             """,
             (
                 guild_id,
@@ -510,6 +597,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["value_list_url"],
                 current["value_manager_role_ids"],
                 1 if current["wfl_smart_filter"] else 0,
+                current["signs_channel_id"],
+                current["lfg_channel_1_id"],
+                current["lfg_channel_2_id"],
+                1 if current["autoslowmode_enabled"] else 0,
             ),
         )
         conn.commit()
@@ -547,7 +638,7 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 
 
 # -------------------------------------------------------------
-# 3. Value List System (Auto-Sync + /value + /value_post + Delete)
+# 3. Value List & Partner Signs System (Auto-Scan + /value + /calc)
 # -------------------------------------------------------------
 KNOWN_UNIT_ALIASES: Dict[str, List[str]] = {
     "upgraded titan tv man": ["uttv", "upgraded titan tv", "ttv"],
@@ -622,6 +713,24 @@ INITIAL_VALUE_SEED: List[Tuple[str, str, str, str, str]] = [
     ("DevSigned Scientist", "Signed", "o/c", "7/10", "Unstable"),
 ]
 
+# Pre-seeded Partner Sign Values from server screenshots
+INITIAL_SIGN_SEED: List[Tuple[str, str, str, List[str]]] = [
+    ("Meddyson", "Meddyson", "+220%", ["meddyson"]),
+    ("Kaptoxa274", "Kaptoxa274", "+75%", ["kaptoxa274", "kaptoxa", "картоха"]),
+    ("Bloxbusters", "BloxBuxters", "+75%", ["bloxbusters", "bloxbuxters"]),
+    ("RedCapture", "redcapture_official", "+75%", ["redcapture", "redcapture_official", "red"]),
+    ("vivlos", "TTD_OnlyMy", "+65%", ["vivlos", "ttd_onlymy"]),
+    ("Кафулька", "Itz_sinduchok", "+60%", ["кафулька", "kafylka", "itz_sinduchok"]),
+    ("kabullet", "Roblt137", "+40%", ["kabullet", "roblt137"]),
+    ("Amir", "AmirRB_official", "+40%", ["amir", "amirrb_official"]),
+    ("IDK", "Violetbonie_n1k", "+35%", ["idk", "violetbonie_n1k"]),
+    ("Stefrim", "TheStefrim", "+30-35%", ["stefrim", "thestefrim"]),
+    ("Derk", "Real_Derk", "+30%", ["derk", "real_derk"]),
+    ("Foxyhohhj", "Mrbog_fly666", "+30%", ["foxyhohhj", "foxy", "mrbog_fly666"]),
+    ("Whatenix", "WhatenixTT", "+25%", ["whatenix", "whatenixtt", "whx"]),
+    ("Ex-Dev (szszjfbdbdj)", "szszjfbdbdj", "o/c", ["szszjfbdbdj", "exdev", "ex dev"]),
+]
+
 
 def normalize_unit_key(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
@@ -639,7 +748,7 @@ def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
             aliases.add(known_key)
             for item in extra_list:
                 aliases.add(normalize_unit_key(item))
-    words = [w for w in re.split(r"[^a-z0-9]+", key) if w]
+    words = [w for w in re.split(r"[^a-z0-9а-яё]+", key) if w]
     if len(words) >= 3:
         acronym = "".join(w[0] for w in words)
         if len(acronym) >= 3:
@@ -713,6 +822,436 @@ def seed_initial_values_if_empty():
 
 
 seed_initial_values_if_empty()
+
+
+# --- Partner Signs Cache & Helpers ---
+def rebuild_sign_alias_map():
+    SIGN_ALIAS_MAP.clear()
+    for p_key, partner in SIGN_PARTNERS_CACHE.items():
+        SIGN_ALIAS_MAP[p_key] = p_key
+        for alias in partner.get("aliases", "").split(","):
+            a_clean = normalize_unit_key(alias)
+            if a_clean:
+                SIGN_ALIAS_MAP[a_clean] = p_key
+
+
+def reload_sign_cache():
+    SIGN_PARTNERS_CACHE.clear()
+    SIGN_ALIAS_MAP.clear()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT partner_key, display_name, roblox_username, aliases,
+                   sign_text, prev_sign_text, note_text, updated_at
+            FROM sign_partners
+            """
+        )
+        for row in c.fetchall():
+            SIGN_PARTNERS_CACHE[row[0]] = {
+                "partner_key": row[0],
+                "display_name": row[1],
+                "roblox_username": row[2] or "",
+                "aliases": row[3] or row[0],
+                "sign_text": row[4] or "+0%",
+                "prev_sign_text": row[5] or "",
+                "note_text": row[6] or "",
+                "updated_at": row[7] or int(time.time()),
+            }
+    rebuild_sign_alias_map()
+
+
+def seed_initial_signs_if_empty():
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM sign_partners")
+        if c.fetchone()[0] == 0:
+            now_ts = int(time.time())
+            rows = []
+            for d_name, r_user, s_val, extra_aliases in INITIAL_SIGN_SEED:
+                p_key = normalize_unit_key(d_name)
+                all_a = {p_key, normalize_unit_key(r_user)}
+                for ea in extra_aliases:
+                    if ea.strip():
+                        all_a.add(normalize_unit_key(ea))
+                rows.append((p_key, d_name, r_user, ",".join(sorted(all_a)), s_val, "", "", now_ts))
+            c.executemany(
+                """
+                INSERT OR IGNORE INTO sign_partners (
+                    partner_key, display_name, roblox_username, aliases,
+                    sign_text, prev_sign_text, note_text, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+    reload_sign_cache()
+
+
+seed_initial_signs_if_empty()
+
+
+def find_sign_partner(query: str) -> Optional[Dict[str, Any]]:
+    q = normalize_unit_key(query.lstrip("@"))
+    if not q:
+        return None
+    if q in SIGN_ALIAS_MAP:
+        return SIGN_PARTNERS_CACHE.get(SIGN_ALIAS_MAP[q])
+    for alias, key in SIGN_ALIAS_MAP.items():
+        if len(q) >= 3 and (alias.startswith(q) or q in alias):
+            return SIGN_PARTNERS_CACHE.get(key)
+    if len(q) >= 4 and SIGN_ALIAS_MAP:
+        close = difflib.get_close_matches(q, list(SIGN_ALIAS_MAP.keys()), n=1, cutoff=0.80)
+        if close:
+            return SIGN_PARTNERS_CACHE.get(SIGN_ALIAS_MAP[close[0]])
+    return None
+
+
+def delete_sign_partner(query: str) -> Optional[Dict[str, Any]]:
+    target = find_sign_partner(query)
+    if not target:
+        return None
+    p_key = target["partner_key"]
+    with get_db() as conn:
+        conn.execute("DELETE FROM sign_partners WHERE partner_key = ?", (p_key,))
+        conn.commit()
+    SIGN_PARTNERS_CACHE.pop(p_key, None)
+    rebuild_sign_alias_map()
+    return target
+
+
+def normalize_sign_value_str(raw: str) -> str:
+    s = raw.strip()
+    if not s:
+        return "+0%"
+    low = s.lower()
+    if "o/c" in low or low == "oc":
+        return "o/c"
+    if not s.startswith(("+", "-")) and any(ch.isdigit() for ch in s):
+        s = "+" + s
+    if not s.endswith("%") and any(ch.isdigit() for ch in s):
+        s = s + "%"
+    return s
+
+
+def parse_sign_percentage_range(sign_str: str) -> Tuple[Optional[float], Optional[float], bool]:
+    if not sign_str:
+        return 0.0, 0.0, False
+    low = sign_str.strip().lower()
+    if "o/c" in low or low == "oc":
+        return None, None, True
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", low)]
+    if not nums:
+        return 0.0, 0.0, False
+    if len(nums) >= 2 and any(sep in low for sep in ("-", "–", "to")):
+        return nums[0], nums[1], False
+    return nums[0], nums[0], False
+
+
+def upsert_sign_partner(
+    display_name: str,
+    roblox_username: str = "",
+    sign_text: str = "+0%",
+    prev_sign_text: Optional[str] = None,
+    note_text: str = "",
+    extra_aliases: Optional[List[str]] = None,
+    source: str = "manual",
+) -> Tuple[Dict[str, Any], bool]:
+    clean_disp = display_name.strip().lstrip("@")
+    clean_rblx = roblox_username.strip().lstrip("@")
+    existing = find_sign_partner(clean_disp) or (find_sign_partner(clean_rblx) if clean_rblx else None)
+    norm_sign = normalize_sign_value_str(sign_text)
+    now_ts = int(time.time())
+    changed = False
+
+    if existing:
+        p_key = existing["partner_key"]
+        final_disp = clean_disp or existing["display_name"]
+        final_rblx = clean_rblx or existing["roblox_username"]
+        alias_set = {a.strip() for a in existing.get("aliases", "").split(",") if a.strip()}
+        alias_set.add(normalize_unit_key(final_disp))
+        if final_rblx:
+            alias_set.add(normalize_unit_key(final_rblx))
+        for ea in (extra_aliases or []):
+            if ea.strip():
+                alias_set.add(normalize_unit_key(ea))
+        final_prev = prev_sign_text if prev_sign_text is not None else (
+            existing["sign_text"] if existing["sign_text"] != norm_sign else existing["prev_sign_text"]
+        )
+        final_note = note_text.strip() if note_text.strip() else existing["note_text"]
+        if existing["sign_text"] != norm_sign:
+            changed = True
+    else:
+        p_key = normalize_unit_key(clean_disp or clean_rblx)
+        final_disp = clean_disp or clean_rblx
+        final_rblx = clean_rblx
+        alias_set = {p_key}
+        if final_rblx:
+            alias_set.add(normalize_unit_key(final_rblx))
+        for ea in (extra_aliases or []):
+            if ea.strip():
+                alias_set.add(normalize_unit_key(ea))
+        final_prev = prev_sign_text or ""
+        final_note = note_text.strip()
+        changed = True
+
+    aliases_packed = ",".join(sorted(alias_set))
+    eff_ts = now_ts if changed else (existing["updated_at"] if existing else now_ts)
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO sign_partners (
+                partner_key, display_name, roblox_username, aliases,
+                sign_text, prev_sign_text, note_text, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (p_key, final_disp, final_rblx, aliases_packed, norm_sign, final_prev, final_note, eff_ts),
+        )
+        if changed:
+            old_v = existing["sign_text"] if existing else "—"
+            conn.execute(
+                """
+                INSERT INTO value_history (item_name, field_changed, old_val, new_val, source, changed_at)
+                VALUES (?, 'Sign Value', ?, ?, ?, ?)
+                """,
+                (f"Sign: {final_disp}", old_v, norm_sign, source, now_ts),
+            )
+        conn.commit()
+
+    partner_dict = {
+        "partner_key": p_key,
+        "display_name": final_disp,
+        "roblox_username": final_rblx,
+        "aliases": aliases_packed,
+        "sign_text": norm_sign,
+        "prev_sign_text": final_prev,
+        "note_text": final_note,
+        "updated_at": eff_ts,
+    }
+    SIGN_PARTNERS_CACHE[p_key] = partner_dict
+    for a in aliases_packed.split(","):
+        if a.strip():
+            SIGN_ALIAS_MAP[a.strip()] = p_key
+    return partner_dict, changed
+
+
+def parse_and_apply_sign_changelog(
+    raw_text: str,
+    guild: Optional[discord.Guild] = None,
+    mentions: Optional[List[discord.abc.User]] = None,
+    source: str = "sign-changelog",
+) -> List[Dict[str, Any]]:
+    # Resolve Discord <@id> user mentions to real names first
+    resolved_text = raw_text
+    mention_map: Dict[int, str] = {}
+    if mentions:
+        for u in mentions:
+            mention_map[u.id] = u.display_name or u.name
+
+    def _replace_user_mention(m: re.Match) -> str:
+        uid = int(m.group(1))
+        if uid in mention_map:
+            return f"@{mention_map[uid]}"
+        if guild:
+            mem = guild.get_member(uid)
+            if mem:
+                return f"@{mem.display_name or mem.name}"
+        return m.group(0)
+
+    resolved_text = re.sub(r"<@!?(\d+)>", _replace_user_mention, resolved_text)
+
+    # Filter out role mentions (<@&id>) and pure chatter lines
+    cleaned_lines_all = []
+    for ln in resolved_text.splitlines():
+        s = ln.strip()
+        if not s:
+            cleaned_lines_all.append("")
+            continue
+        if re.fullmatch(r"(?:<@&\d+>|@everyone|@here|@\[.*?\]\s*.*)", s, re.IGNORECASE):
+            continue
+        cleaned_lines_all.append(s)
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", "\n".join(cleaned_lines_all)) if b.strip()]
+    results: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        # Handle special format: "1. ex dev sign is: szszjfbdbdj" + "o/c"
+        full_block_low = block.lower()
+        ex_dev_match = re.search(r"ex\s*dev\s*sign\s*is\s*:\s*([a-z0-9_.-]+)", full_block_low)
+        if ex_dev_match and "o/c" in full_block_low:
+            r_user = ex_dev_match.group(1)
+            upsert_sign_partner(
+                display_name=f"Ex-Dev ({r_user})",
+                roblox_username=r_user,
+                sign_text="o/c",
+                extra_aliases=[r_user, "exdev", "ex dev"],
+                source=source,
+            )
+            results.append(
+                {
+                    "name": f"Ex-Dev ({r_user})",
+                    "roblox": r_user,
+                    "trend": "neutral",
+                    "line": "**Sign Value:** **`o/c`** *(Non-Partner)*",
+                }
+            )
+            continue
+
+        # Find the Sign Value line in this block
+        sign_line_idx = -1
+        for idx, ln in enumerate(lines):
+            if re.match(r"^sign\s*val(?:ue)?\s*:", ln, re.IGNORECASE):
+                sign_line_idx = idx
+                break
+
+        if sign_line_idx == -1:
+            continue
+
+        header_line = lines[0].lstrip("-•*# ").strip()
+        if not header_line or header_line.lower().startswith("sign val"):
+            continue
+
+        # Extract status/bracket tags from header, e.g. "@Stefrim | PLS SIGN = BAN" or "@Whatenix (WhatenixTT)"
+        extra_aliases: List[str] = []
+        note_tag = ""
+        if "|" in header_line:
+            h_left, h_right = header_line.split("|", 1)
+            header_line = h_left.strip()
+            note_tag = h_right.strip()
+        bracket_m = re.search(r"\[([^\]]+)\]", header_line)
+        if bracket_m:
+            note_tag = bracket_m.group(1).strip()
+            header_line = re.sub(r"\s*\[[^\]]+\]\s*", " ", header_line).strip()
+        paren_m = re.search(r"\(([^)]+)\)", header_line)
+        if paren_m:
+            in_paren = paren_m.group(1).strip().lstrip("@")
+            if in_paren:
+                extra_aliases.append(in_paren)
+            header_line = re.sub(r"\s*\([^)]+\)\s*", " ", header_line).strip()
+
+        display_name = header_line.lstrip("@").strip()
+        if not display_name or len(display_name) > 55:
+            continue
+
+        roblox_user = ""
+        desc_note = note_tag
+        for mid_ln in lines[1:]:
+            if re.match(r"^sign\s*val(?:ue)?\s*:", mid_ln, re.IGNORECASE):
+                continue
+            if re.match(r"^user(?:name)?\s*:", mid_ln, re.IGNORECASE):
+                roblox_user = mid_ln.split(":", 1)[1].strip().lstrip("@")
+            elif re.match(r"^desc(?:ription)?\s*:", mid_ln, re.IGNORECASE):
+                d_val = mid_ln.split(":", 1)[1].strip()
+                if d_val.lower() not in ("ok", "none", "-"):
+                    desc_note = d_val
+            elif ":" not in mid_ln and not roblox_user and len(mid_ln) <= 40:
+                roblox_user = mid_ln.strip().lstrip("@")
+
+        raw_sign_val = lines[sign_line_idx].split(":", 1)[1].strip()
+        arrow_parts = re.split(r"\s*(?:->|➔|→|=>)\s*", raw_sign_val, maxsplit=1)
+        trend = "neutral"
+
+        if len(arrow_parts) == 2:
+            old_s = normalize_sign_value_str(arrow_parts[0])
+            new_s = normalize_sign_value_str(arrow_parts[1])
+            old_min, old_max, _ = parse_sign_percentage_range(old_s)
+            new_min, new_max, _ = parse_sign_percentage_range(new_s)
+            if old_min is not None and new_min is not None:
+                old_avg = (old_min + (old_max or old_min)) / 2.0
+                new_avg = (new_min + (new_max or new_min)) / 2.0
+                if new_avg > old_avg:
+                    trend = "up"
+                elif new_avg < old_avg:
+                    trend = "down"
+            formatted_line = f"**Sign Value:** `{old_s}` ➔ **`{new_s}`**"
+        else:
+            old_s = None
+            new_s = normalize_sign_value_str(raw_sign_val)
+            formatted_line = f"**Sign Value:** **`{new_s}`**"
+
+        upsert_sign_partner(
+            display_name=display_name,
+            roblox_username=roblox_user,
+            sign_text=new_s,
+            prev_sign_text=old_s,
+            note_text=desc_note,
+            extra_aliases=extra_aliases,
+            source=source,
+        )
+        results.append(
+            {
+                "name": display_name,
+                "roblox": roblox_user,
+                "trend": trend,
+                "line": formatted_line,
+            }
+        )
+
+    return results
+
+
+async def scan_signs_channel_history(channel: discord.TextChannel, limit: int = 120) -> int:
+    collected: List[discord.Message] = []
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=False):
+            if msg.author.bot:
+                continue
+            if msg.content and "sign" in msg.content.lower():
+                collected.append(msg)
+    except Exception:
+        return 0
+
+    # Apply oldest-first so the newest message in the channel wins!
+    collected.reverse()
+    updated_partners: Set[str] = set()
+    for msg in collected:
+        parsed = parse_and_apply_sign_changelog(
+            msg.content,
+            guild=channel.guild,
+            mentions=list(msg.mentions),
+            source="signs-channel-sync",
+        )
+        for entry in parsed:
+            updated_partners.add(entry["name"])
+    return len(updated_partners)
+
+
+def build_sign_partners_embed(guild: Optional[discord.Guild]) -> discord.Embed:
+    partners = list(SIGN_PARTNERS_CACHE.values())
+    partners.sort(
+        key=lambda p: (
+            -1.0 if parse_sign_percentage_range(p["sign_text"])[2] else (parse_sign_percentage_range(p["sign_text"])[0] or 0.0)
+        ),
+        reverse=True,
+    )
+
+    lines: List[str] = []
+    for p in partners:
+        rblx_part = f" (`{p['roblox_username']}`)" if p.get("roblox_username") and p["roblox_username"].lower() != p["display_name"].lower() else ""
+        prev_part = f" *(was `{p['prev_sign_text']}`)*" if p.get("prev_sign_text") and p["prev_sign_text"] != p["sign_text"] else ""
+        lines.append(f"• **{p['display_name']}**{rblx_part} — **`{p['sign_text']}`**{prev_part}")
+
+    embed = discord.Embed(
+        title="✍️ Official Partner Sign Values",
+        description=(
+            "You can type any partner's Discord name or Roblox username in `/value` or `/calc` (e.g. `Whatenix Pharaoh` or `2x TTD_OnlyMy UTTV`):\n\n"
+            + ("\n".join(lines) if lines else "*No partner sign values recorded yet.*")
+        ),
+        color=0x9B59B6,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • {len(SIGN_PARTNERS_CACHE)} Tracked Sign Partners",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
 
 
 def find_value_item(query: str) -> Optional[Dict[str, Any]]:
@@ -874,7 +1413,7 @@ async def get_http_session() -> Optional["aiohttp.ClientSession"]:
         HTTP_SESSION = aiohttp.ClientSession(
             timeout=timeout,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/9.0; +https://discord.com)",
+                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.0; +https://discord.com)",
                 "Accept": "text/html,application/xhtml+xml,application/json",
                 "Cache-Control": "no-cache",
             },
@@ -899,7 +1438,6 @@ def _parse_and_apply_website_html(raw_html: str) -> Tuple[int, int]:
 
     parsed_records: Dict[str, Dict[str, Optional[str]]] = {}
 
-    # 1. Extract embedded JSON objects if present in Next.js payload
     json_pattern = re.compile(
         r'"name"\s*:\s*"([^"]{2,60})"[^}]{0,400}?"value"\s*:\s*"?([0-9,.\s–\-]+|o/c)"?',
         re.IGNORECASE,
@@ -916,7 +1454,6 @@ def _parse_and_apply_website_html(raw_html: str) -> Tuple[int, int]:
                 "stability_text": None,
             }
 
-    # 2. Extract visible HTML card blocks
     text_only = re.sub(r"<script[^>]*>.*?</script>", "\n", raw_html, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<style[^>]*>.*?</style>", "\n", text_only, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<[^>]+>", "\n", text_only)
@@ -1051,13 +1588,33 @@ def parse_value_range(val_str: str) -> Tuple[Optional[float], Optional[float], b
     return nums[0], nums[0], False
 
 
+def apply_partner_sign_to_range(
+    vmin: Optional[float],
+    vmax: Optional[float],
+    unit_is_oc: bool,
+    partner: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], Optional[float], bool]:
+    if unit_is_oc:
+        return None, None, True
+    if vmin is None or vmax is None:
+        return None, None, False
+    if not partner:
+        return vmin, vmax, False
+
+    s_min, s_max, sign_is_oc = parse_sign_percentage_range(partner["sign_text"])
+    if sign_is_oc:
+        return None, None, True
+    mult_min = 1.0 + ((s_min or 0.0) / 100.0)
+    mult_max = 1.0 + ((s_max or 0.0) / 100.0)
+    return round(vmin * mult_min), round(vmax * mult_max), False
+
+
 def parse_and_apply_value_changelog(raw_text: str) -> List[Dict[str, Any]]:
     blocks = [b.strip() for b in re.split(r"\n\s*\n", raw_text.strip()) if b.strip()]
     parsed_changes: List[Dict[str, Any]] = []
 
     for block in blocks:
         raw_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        # Filter out accidental role/user/everyone mentions
         lines = [
             ln for ln in raw_lines
             if not re.fullmatch(r"(?:<@&?\d+>|@everyone|@here|@\[.*?\]\s*.*)", ln, re.IGNORECASE)
@@ -1176,9 +1733,64 @@ def check_calc_cooldown(user_id: int) -> float:
     return 0.0
 
 
+def extract_unit_and_sign_from_phrase(phrase: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    cleaned = re.sub(r"\s+", " ", phrase.strip())
+    if not cleaned:
+        return None, None
+
+    # 1. Direct unit match without sign
+    direct_unit = find_value_item(cleaned)
+    low_cleaned = normalize_unit_key(cleaned)
+    if direct_unit and low_cleaned in VALUE_ALIAS_MAP:
+        return direct_unit, None
+
+    # 2. Check parenthesized sign: e.g. "Pharaoh (Whatenix)" or "UTTV (sign TTD_OnlyMy)"
+    paren_m = re.search(r"\(([^)]+)\)", cleaned)
+    if paren_m:
+        inside = re.sub(r"^(?:signed|sign)\s*(?:by)?\s*", "", paren_m.group(1), flags=re.IGNORECASE).strip()
+        partner = find_sign_partner(inside)
+        if partner:
+            unit_part = re.sub(r"\s*\([^)]+\)\s*", " ", cleaned).strip()
+            unit = find_value_item(unit_part)
+            if unit:
+                return unit, partner
+
+    # 3. Check explicit "sign / signed by" keyword: e.g. "Pharaoh sign Whatenix" or "Whatenix signed UTTV"
+    sign_kw_after = re.match(r"^(.+?)\s+(?:signed|sign)\s*(?:by)?\s+@?([^\s]+)$", cleaned, re.IGNORECASE)
+    if sign_kw_after:
+        partner = find_sign_partner(sign_kw_after.group(2))
+        unit = find_value_item(sign_kw_after.group(1))
+        if unit and partner:
+            return unit, partner
+
+    sign_kw_before = re.match(r"^@?([^\s]+)\s+(?:signed|sign)\s+(.+)$", cleaned, re.IGNORECASE)
+    if sign_kw_before:
+        partner = find_sign_partner(sign_kw_before.group(1))
+        unit = find_value_item(sign_kw_before.group(2))
+        if unit and partner:
+            return unit, partner
+
+    # 4. Prefix or suffix partner name without keyword: e.g. "Whatenix Pharaoh", "Pharaoh Whatenix", "TTD_OnlyMy UTTV"
+    words = cleaned.split()
+    if len(words) >= 2:
+        first_partner = find_sign_partner(words[0])
+        if first_partner and normalize_unit_key(words[0]) in SIGN_ALIAS_MAP:
+            rest_unit = find_value_item(" ".join(words[1:]))
+            if rest_unit:
+                return rest_unit, first_partner
+
+        last_partner = find_sign_partner(words[-1])
+        if last_partner and normalize_unit_key(words[-1]) in SIGN_ALIAS_MAP:
+            rest_unit = find_value_item(" ".join(words[:-1]))
+            if rest_unit:
+                return rest_unit, last_partner
+
+    return direct_unit, None
+
+
 def parse_trade_side(raw_text: str) -> Dict[str, Any]:
     tokens = [t.strip() for t in re.split(r"[\n,;+]+", raw_text) if t.strip()]
-    matched: List[Tuple[Dict[str, Any], int]] = []
+    matched: List[Tuple[Dict[str, Any], int, Optional[Dict[str, Any]]]] = []
     unknown: List[str] = []
 
     for token in tokens:
@@ -1186,15 +1798,14 @@ def parse_trade_side(raw_text: str) -> Dict[str, Any]:
         name_part = token
         low_tok = normalize_unit_key(token)
 
-        # Check direct exact unit/gamepass match first (e.g. "2x money", "2x lucky", "x2 candy")
-        direct_unit = VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[low_tok]) if low_tok in VALUE_ALIAS_MAP else None
-        if direct_unit:
-            matched.append((direct_unit, 1))
+        # Direct exact unit/gamepass match first (e.g. "2x money", "2x lucky", "x2 candy")
+        if low_tok in VALUE_ALIAS_MAP:
+            matched.append((VALUE_ITEMS_CACHE[VALUE_ALIAS_MAP[low_tok]], 1, None))
             continue
 
         # Support ALL multiplier formats (Latin x & Cyrillic х, *, parentheses, prefix & suffix):
         # e.g. "x2 hacked", "2x hacked", "x 2 hacked", "2 hacked", "*2 hacked", "(2x) hacked",
-        #      "hacked x2", "hacked 2x", "hacked 2", "hacked (2)", "hacked(x2)"
+        #      "hacked x2", "hacked 2x", "hacked 2", "hacked (2)", "2x Whatenix Pharaoh"
         m_pre = re.match(r"^(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)\s+(.+)$", token, re.IGNORECASE)
         m_pre_paren = re.match(r"^\(\s*[xх*]?\s*(\d+)\s*[xх*]?\s*\)\s*(.+)$", token, re.IGNORECASE)
         m_suf = re.match(r"^(.+?)\s+(?:[xх*]\s*(\d+)|(\d+)\s*[xх*]?)$", token, re.IGNORECASE)
@@ -1215,38 +1826,26 @@ def parse_trade_side(raw_text: str) -> Dict[str, Any]:
             name_part = m_suf_paren.group(1).strip()
             qty = min(max(int(m_suf_paren.group(2)), 1), 99)
 
-        unit = find_value_item(name_part)
+        unit, partner = extract_unit_and_sign_from_phrase(name_part)
         if unit:
-            matched.append((unit, qty))
+            matched.append((unit, qty, partner))
         else:
             unknown.append(token)
 
     total_min = 0.0
     total_max = 0.0
-    demand_sum = 0.0
-    demand_qty = 0
     oc_count = 0
-    warnings: List[str] = []
 
-    for unit, qty in matched:
-        vmin, vmax, is_oc = parse_value_range(unit["value_text"])
-        if is_oc:
+    for unit, qty, partner in matched:
+        base_min, base_max, base_oc = parse_value_range(unit["value_text"])
+        eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
+        if eff_oc:
             oc_count += qty
-        elif vmin is not None and vmax is not None:
-            total_min += vmin * qty
-            total_max += vmax * qty
-
-        d_num = parse_numeric_value(unit["demand_text"])
-        if d_num is not None:
-            demand_sum += d_num * qty
-            demand_qty += qty
-
-        stab_low = unit["stability_text"].lower()
-        if ("dropping" in stab_low or "underpaid" in stab_low) and unit["name"] not in warnings:
-            warnings.append(unit["name"])
+        elif eff_min is not None and eff_max is not None:
+            total_min += eff_min * qty
+            total_max += eff_max * qty
 
     avg_val = (total_min + total_max) / 2.0
-    avg_demand = (demand_sum / demand_qty) if demand_qty > 0 else 0.0
 
     return {
         "raw": raw_text,
@@ -1255,9 +1854,7 @@ def parse_trade_side(raw_text: str) -> Dict[str, Any]:
         "total_min": total_min,
         "total_max": total_max,
         "avg_val": avg_val,
-        "avg_demand": avg_demand,
         "oc_count": oc_count,
-        "warnings": warnings,
     }
 
 
@@ -1297,14 +1894,14 @@ class TradeCalcResultView(discord.ui.View):
 
 class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
     give_input = discord.ui.TextInput(
-        label="You Give (e.g. x2 hacked, UTTV)",
+        label="You Give (e.g. x2 hacked, Whatenix Pharaoh)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=500,
-        placeholder="x2 hacked, UTTV, Scientist Crate",
+        placeholder="x2 hacked, Whatenix UTTV, Scientist Crate",
     )
     get_input = discord.ui.TextInput(
-        label="You Get (e.g. Pharaoh Cameraman)",
+        label="You Get (e.g. Pharaoh Cameraman, 2x Lucky)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=500,
@@ -1333,7 +1930,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
 
         if not give_side["matched"] and not get_side["matched"]:
             return await interaction.response.send_message(
-                "❌ Could not recognize any units. Check unit names or shortcuts (`UTTV`, `UTC`, `Hacked`, `Pharaoh`, `Engineer`, etc.).",
+                "❌ Could not recognize any units. Check unit names, partner signs (`Whatenix`, `Meddyson`, etc.), or shortcuts (`UTTV`, `UTC`, `Hacked`).",
                 ephemeral=True,
             )
 
@@ -1352,18 +1949,27 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             if not side["matched"]:
                 return "*No recognized units*"
             out = []
-            for unit, qty in side["matched"]:
-                if qty > 1:
-                    vmin, vmax, is_oc = parse_value_range(unit["value_text"])
-                    if not is_oc and vmin is not None and vmax is not None:
-                        sub = f"{vmin * qty:,.0f}" if vmin == vmax else f"{vmin * qty:,.0f} – {vmax * qty:,.0f}"
-                        val_tag = f"`{unit['value_text']}` each = **`{sub}`**"
+            for unit, qty, partner in side["matched"]:
+                base_min, base_max, base_oc = parse_value_range(unit["value_text"])
+                eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
+
+                sign_badge = f" `[✍️ {partner['display_name']} {partner['sign_text']}]`" if partner else ""
+                qty_prefix = f"{qty}x " if qty > 1 else ""
+
+                if eff_oc:
+                    val_part = "`o/c`"
+                elif eff_min is not None and eff_max is not None:
+                    single_str = f"{eff_min:,.0f}" if eff_min == eff_max else f"{eff_min:,.0f} – {eff_max:,.0f}"
+                    if qty > 1:
+                        tot_str = f"{eff_min * qty:,.0f}" if eff_min == eff_max else f"{eff_min * qty:,.0f} – {eff_max * qty:,.0f}"
+                        val_part = f"`{single_str}` each = **`{tot_str}`**"
                     else:
-                        val_tag = f"`{unit['value_text']}`"
-                    out.append(f"• **{qty}x {unit['name']}** — {val_tag} *(Dem {unit['demand_text']})*")
+                        val_part = f"**`{single_str}`**"
                 else:
-                    out.append(f"• **{unit['name']}** — **`{unit['value_text']}`** *(Dem {unit['demand_text']})*")
-            out.append(f"\n**Total Value:** `{format_trade_side_total(side)}` • **Avg Demand:** `{side['avg_demand']:.1f}/10`")
+                    val_part = f"`{unit['value_text']}`"
+
+                out.append(f"• **{qty_prefix}{unit['name']}**{sign_badge} — {val_part}")
+            out.append(f"\n**Total Value:** `{format_trade_side_total(side)}`")
             return "\n".join(out)
 
         embed = discord.Embed(
@@ -1384,7 +1990,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             )
 
         embed.set_footer(
-            text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value Calculator",
+            text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value & Sign Calculator",
             icon_url=interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None,
         )
         view = TradeCalcResultView(owner_id, self.give_input.value, self.get_input.value)
@@ -1403,7 +2009,12 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
         )
 
 
-def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any], site_url: str) -> discord.Embed:
+def build_unit_value_embed(
+    guild: Optional[discord.Guild],
+    item: Dict[str, Any],
+    site_url: str,
+    partner: Optional[Dict[str, Any]] = None,
+) -> discord.Embed:
     stab_lower = item["stability_text"].lower()
     if "overpaid" in stab_lower:
         color = 0x2ECC71
@@ -1418,18 +2029,38 @@ def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any],
     if item.get("prev_value_text") and item["prev_value_text"] != item["value_text"]:
         val_display += f"\n*(Previously: `{item['prev_value_text']}`)*"
 
+    title_str = f"💎 {item['name']}"
+    if partner:
+        title_str += f" [✍️ {partner['display_name']}]"
+
     embed = discord.Embed(
-        title=f"💎 {item['name']}",
+        title=title_str,
         color=color,
         timestamp=datetime.fromtimestamp(item["updated_at"], tz=timezone.utc),
     )
-    embed.add_field(name="💰 Value", value=val_display, inline=True)
+    embed.add_field(name="💰 Base Value", value=val_display, inline=True)
+
+    if partner:
+        base_min, base_max, base_oc = parse_value_range(item["value_text"])
+        eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
+        if eff_oc:
+            signed_val_str = "`o/c`"
+        elif eff_min is not None and eff_max is not None:
+            signed_val_str = f"**`{eff_min:,.0f}`**" if eff_min == eff_max else f"**`{eff_min:,.0f} – {eff_max:,.0f}`**"
+        else:
+            signed_val_str = f"`{item['value_text']}`"
+        embed.add_field(
+            name=f"✍️ Signed ({partner['display_name']} {partner['sign_text']})",
+            value=signed_val_str,
+            inline=True,
+        )
+
     embed.add_field(name="🔥 Demand", value=f"**`{item['demand_text']}`**", inline=True)
     embed.add_field(name="🏷️ Category", value=f"`{item['category']}`", inline=True)
     embed.add_field(name="📊 Stability / Status", value=f"**{item['stability_text']}**", inline=True)
 
     if item.get("sign_value_text"):
-        embed.add_field(name="✍️ Sign Value", value=f"**`{item['sign_value_text']}`**", inline=True)
+        embed.add_field(name="✨ Unit Sign Note", value=f"**`{item['sign_value_text']}`**", inline=True)
 
     short_aliases = [
         a for a in item.get("aliases", "").split(",")
@@ -1446,7 +2077,7 @@ def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any],
         embed.set_thumbnail(url=item["image_url"])
 
     embed.set_footer(
-        text=f"{guild.name if guild else 'CMTD'} • Official Value List",
+        text=f"{guild.name if guild else 'CMTD'} • Official Value & Sign List",
         icon_url=guild.icon.url if (guild and guild.icon) else None,
     )
     return embed
@@ -1494,20 +2125,20 @@ def build_recent_value_changes_embed(guild: Optional[discord.Guild]) -> discord.
 
     lines: List[str] = []
     for item_name, field, old_v, new_v, src, ts in rows:
-        tag = "🌐" if src == "auto-check" else "📊"
+        tag = "🌐" if src == "auto-check" else ("✍️" if "sign" in src else "📊")
         lines.append(f"{tag} **{item_name}** — `{field}`: `{old_v}` ➔ **`{new_v}`** (<t:{ts}:R>)")
 
     last_ts = LAST_VALUE_SYNC_STATS.get("ts", 0)
     sync_line = f"Last website check: <t:{last_ts}:R> (auto-checks every **2 min**)" if last_ts else "Auto-checks every **2 min**"
 
     embed = discord.Embed(
-        title="📈 Recent Value List Changes",
-        description=f"{sync_line}\n\n" + ("\n".join(lines) if lines else "*No recent price changes recorded yet.*"),
+        title="📈 Recent Value & Sign Changes",
+        description=f"{sync_line}\n\n" + ("\n".join(lines) if lines else "*No recent changes recorded yet.*"),
         color=0x2ECC71,
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(
-        text=f"{guild.name if guild else 'CMTD'} • Live 2-Minute Value Monitor",
+        text=f"{guild.name if guild else 'CMTD'} • Live Value & Sign Monitor",
         icon_url=guild.icon.url if (guild and guild.icon) else None,
     )
     return embed
@@ -1603,24 +2234,114 @@ def schedule_debounced_value_vote_refresh(message: discord.Message):
     VALUE_VOTE_UPDATE_TASKS[msg_id] = asyncio.create_task(_worker())
 
 
+def get_sign_post_vote_counts(message_id: int) -> Tuple[int, int]:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM sign_post_votes WHERE message_id = ? AND vote = 1", (message_id,))
+        up = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM sign_post_votes WHERE message_id = ? AND vote = -1", (message_id,))
+        down = c.fetchone()[0]
+    return up, down
+
+
+class SignChangelogVoteView(discord.ui.View):
+    def __init__(self, up_count: int = 0, down_count: int = 0):
+        super().__init__(timeout=None)
+        total = up_count + down_count
+        up_pct = round((up_count / total) * 100) if total > 0 else 0
+        down_pct = round((down_count / total) * 100) if total > 0 else 0
+
+        up_btn = discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label=f"W Sign ({up_count} • {up_pct}%)",
+            emoji="✅",
+            custom_id="sign_vote:up",
+        )
+        down_btn = discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label=f"L Sign ({down_count} • {down_pct}%)",
+            emoji="❌",
+            custom_id="sign_vote:down",
+        )
+        up_btn.callback = self.on_vote_up
+        down_btn.callback = self.on_vote_down
+        self.add_item(up_btn)
+        self.add_item(down_btn)
+
+    async def _handle_vote(self, interaction: discord.Interaction, vote_val: int):
+        if not interaction.message:
+            return
+        msg_id = interaction.message.id
+        user_id = interaction.user.id
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT vote FROM sign_post_votes WHERE message_id = ? AND user_id = ?",
+                (msg_id, user_id),
+            )
+            row = c.fetchone()
+            if row and row[0] == vote_val:
+                c.execute(
+                    "DELETE FROM sign_post_votes WHERE message_id = ? AND user_id = ?",
+                    (msg_id, user_id),
+                )
+                feedback = "➖ Your vote was removed."
+            else:
+                c.execute(
+                    "INSERT OR REPLACE INTO sign_post_votes (message_id, user_id, vote) VALUES (?, ?, ?)",
+                    (msg_id, user_id, vote_val),
+                )
+                feedback = "✅ Voted **W Sign**!" if vote_val == 1 else "❌ Voted **L Sign**!"
+            conn.commit()
+
+        await interaction.response.send_message(feedback, ephemeral=True)
+        schedule_debounced_sign_vote_refresh(interaction.message)
+
+    async def on_vote_up(self, interaction: discord.Interaction):
+        await self._handle_vote(interaction, 1)
+
+    async def on_vote_down(self, interaction: discord.Interaction):
+        await self._handle_vote(interaction, -1)
+
+
+def schedule_debounced_sign_vote_refresh(message: discord.Message):
+    msg_id = message.id
+    existing = SIGN_VOTE_UPDATE_TASKS.get(msg_id)
+    if existing and not existing.done():
+        return
+
+    async def _worker():
+        await asyncio.sleep(1.5)
+        try:
+            up, down = get_sign_post_vote_counts(msg_id)
+            await message.edit(view=SignChangelogVoteView(up_count=up, down_count=down))
+        except Exception:
+            pass
+        finally:
+            SIGN_VOTE_UPDATE_TASKS.pop(msg_id, None)
+
+    SIGN_VOTE_UPDATE_TASKS[msg_id] = asyncio.create_task(_worker())
+
+
 class QuickValueLookupModal(discord.ui.Modal, title="Check Unit Value"):
     unit_input = discord.ui.TextInput(
-        label="Unit Name or Shortcut (e.g. UTTV, Pharaoh)",
+        label="Unit or Partner Sign + Unit (e.g. Whatenix UTTV)",
         style=discord.TextStyle.short,
         required=True,
-        max_length=60,
-        placeholder="Type unit name or shortcut like UTTV, UTC, Engineer...",
+        max_length=80,
+        placeholder="UTTV, Pharaoh, Whatenix Pharaoh, TTD_OnlyMy UTTV...",
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        item = find_value_item(self.unit_input.value)
+        item, partner = extract_unit_and_sign_from_phrase(self.unit_input.value)
         if not item:
             return await interaction.response.send_message(
-                f"❌ Unit `{self.unit_input.value}` was not found in the value list. Try another name or check the full website!",
+                f"❌ Unit `{self.unit_input.value}` was not found in the value list.",
                 ephemeral=True,
             )
         site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
-        embed = build_unit_value_embed(interaction.guild, item, site_url)
+        embed = build_unit_value_embed(interaction.guild, item, site_url, partner=partner)
         view = build_link_view("Open Full Value List", site_url)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -1634,6 +2355,7 @@ class ValueHubView(discord.ui.View):
                 label="Open Official Value List",
                 emoji="🔗",
                 url=site_url,
+                row=0,
             )
         )
         check_btn = discord.ui.Button(
@@ -1641,6 +2363,7 @@ class ValueHubView(discord.ui.View):
             label="Check Unit Value",
             emoji="🔍",
             custom_id="val_hub:check_unit",
+            row=0,
         )
         check_btn.callback = self.on_check_click
         self.add_item(check_btn)
@@ -1650,15 +2373,27 @@ class ValueHubView(discord.ui.View):
             label="Trade Calculator",
             emoji="⚖️",
             custom_id="val_hub:trade_calc",
+            row=0,
         )
         calc_btn.callback = self.on_calc_click
         self.add_item(calc_btn)
+
+        signs_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Sign Partners",
+            emoji="✍️",
+            custom_id="val_hub:sign_partners",
+            row=1,
+        )
+        signs_btn.callback = self.on_signs_click
+        self.add_item(signs_btn)
 
         top_btn = discord.ui.Button(
             style=discord.ButtonStyle.secondary,
             label="Top Values",
             emoji="🏆",
             custom_id="val_hub:top_values",
+            row=1,
         )
         top_btn.callback = self.on_top_click
         self.add_item(top_btn)
@@ -1668,6 +2403,7 @@ class ValueHubView(discord.ui.View):
             label="Recent Changes",
             emoji="📈",
             custom_id="val_hub:recent_changes",
+            row=1,
         )
         recent_btn.callback = self.on_recent_click
         self.add_item(recent_btn)
@@ -1683,6 +2419,10 @@ class ValueHubView(discord.ui.View):
                 ephemeral=True,
             )
         await interaction.response.send_modal(TradeCalcModal(author_id=interaction.user.id))
+
+    async def on_signs_click(self, interaction: discord.Interaction):
+        embed = build_sign_partners_embed(interaction.guild)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def on_top_click(self, interaction: discord.Interaction):
         site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
@@ -1759,7 +2499,6 @@ TRADE_OFFER_MARKERS = (
 
 
 def should_react_wfl_message(message: discord.Message, smart_filter: bool = True) -> bool:
-    # Always react to screenshots / images / embeds
     if message.attachments or message.embeds:
         return True
 
@@ -1771,26 +2510,21 @@ def should_react_wfl_message(message: discord.Message, smart_filter: bool = True
     cleaned = re.sub(r"[^a-z0-9\s]", "", low).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
 
-    # Ignore pure single-phrase voter chatter ("W", "L", "huge w", "dont do it")
     if cleaned in WFL_CHATTER_WORDS:
         return False
 
     if not smart_filter:
         return True
 
-    # In Smart Mode (essential for 80k+ servers), skip plain text replies to other messages
-    # because replies without images are people voting/commenting on someone else's trade.
     if message.reference is not None:
         return False
 
     if "?" in low or any(marker in low for marker in TRADE_OFFER_MARKERS):
         return True
 
-    # Also catch multi-word offers ("uttv and utc for pharaoh", "2x eng + 500 gems")
     if len(cleaned) >= 14 and (" or " in f" {cleaned} " or " for " in f" {cleaned} " or any(ch.isdigit() for ch in cleaned)):
         return True
 
-    # Check if the message mentions any known CMTD unit/shortcut from VALUE_ALIAS_MAP
     words = cleaned.split()
     if len(words) >= 2:
         for w in words:
@@ -1809,7 +2543,6 @@ async def _wfl_queue_worker(guild_id: int):
     while True:
         message, enqueued_at = await queue.get()
         try:
-            # Drop stale items if backlog ever exceeded 60s so live posts always get reactions first
             if time.time() - enqueued_at > 60:
                 continue
             if not message.guild:
@@ -1875,7 +2608,7 @@ def enqueue_wfl_reactions(message: discord.Message, smart_filter: bool = True):
 
 
 # -------------------------------------------------------------
-# 5. Smart Anti-Scam & Phishing Shield (Configurable in /panel)
+# 5. Smart Anti-Scam Shield & Dynamic Auto-Slowmode
 # -------------------------------------------------------------
 URL_EXTRACT_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)", re.IGNORECASE)
 
@@ -1984,6 +2717,42 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
     return True
 
 
+async def handle_dynamic_autoslowmode(message: discord.Message, settings: Dict[str, Any]):
+    if not settings.get("autoslowmode_enabled"):
+        return
+    if not isinstance(message.channel, discord.TextChannel) or not message.guild:
+        return
+
+    ch = message.channel
+    now = time.time()
+    dq = CHANNEL_MSG_TIMESTAMPS.get(ch.id)
+    if dq is None:
+        dq = deque(maxlen=40)
+        CHANNEL_MSG_TIMESTAMPS[ch.id] = dq
+
+    dq.append(now)
+    # Count messages in the last 15 seconds
+    while dq and (now - dq[0]) > 15.0:
+        dq.popleft()
+
+    if len(dq) >= 28 and ch.id not in ACTIVE_AUTO_SLOWMODES:
+        orig_delay = ch.slowmode_delay
+        if orig_delay < 8:
+            ACTIVE_AUTO_SLOWMODES[ch.id] = {
+                "guild_id": message.guild.id,
+                "orig_delay": orig_delay,
+                "activated_at": now,
+            }
+            try:
+                await ch.edit(slowmode_delay=10, reason="Dynamic Auto-Slowmode: high message surge")
+                await ch.send(
+                    "⚡ **High chat traffic detected** — temporary `10s` slowmode enabled until chat calms down.",
+                    delete_after=15,
+                )
+            except Exception:
+                ACTIVE_AUTO_SLOWMODES.pop(ch.id, None)
+
+
 # -------------------------------------------------------------
 # 6. Bot Client Initialization & Persistent Views Setup
 # -------------------------------------------------------------
@@ -2004,6 +2773,7 @@ class CommunityBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(ValueChangelogVoteView())
+        self.add_view(SignChangelogVoteView())
         self.add_view(ValueHubView())
         self.add_view(VoiceKeepAliveView())
         self.add_view(VoiceControlView())
@@ -2028,9 +2798,6 @@ bot = CommunityBot()
 
 # -------------------------------------------------------------
 # 7. Full Server Lockdown System (/closeall, /openall, /lockdown_ignore)
-#    Locks ALL open Text, Voice (connect + chat), Forum & Stage channels
-#    for @everyone AND all non-staff roles (e.g. @Verified / @Member),
-#    while keeping read-only channels (#announcements, #update-logs) untouched!
 # -------------------------------------------------------------
 def is_lockdown_active(guild_id: int) -> bool:
     with get_db() as conn:
@@ -2114,7 +2881,7 @@ def get_all_lockable_channels(guild: discord.Guild) -> List[discord.abc.GuildCha
     return channels
 
 
-@bot.tree.command(name="closeall", description="Lock ALL open text, voice & forum channels for everyone while keeping read-only channels untouched")
+@bot.tree.command(name="closeall", description="Lock ALL open text, voice & forum channels while keeping read-only channels untouched")
 @app_commands.describe(
     reason="Reason shown in locked channels (optional)",
     announce="Send a lock notice message into locked channels (default: True)",
@@ -2138,7 +2905,7 @@ async def closeall_cmd(
         )
     if is_lockdown_active(guild.id):
         return await interaction.response.send_message(
-            "⚠️ Server is **already locked down**! Run `/openall` first before using `/closeall` again so your clean channel snapshot is preserved.",
+            "⚠️ Server is **already locked down**! Run `/openall` first before using `/closeall` again.",
             ephemeral=True,
         )
 
@@ -2153,7 +2920,6 @@ async def closeall_cmd(
         everyone = guild.default_role
         all_channels = get_all_lockable_channels(guild)
 
-        # (channel, list_of_open_non_staff_roles)
         targets_to_lock: List[Tuple[discord.abc.GuildChannel, List[discord.Role]]] = []
         skipped_readonly = 0
         skipped_whitelisted = 0
@@ -2189,8 +2955,6 @@ async def closeall_cmd(
                 ):
                     open_custom_roles.append(target_obj)
 
-            # If @everyone cannot write/connect AND no non-staff role has explicit write/connect overwrite,
-            # this channel is already closed/read-only (e.g. #announcements, #update-logs, #rules).
             if not everyone_can_use and not open_custom_roles:
                 skipped_readonly += 1
                 continue
@@ -2336,7 +3100,7 @@ async def closeall_cmd(
         LOCKDOWN_IN_PROGRESS.discard(guild.id)
 
 
-@bot.tree.command(name="openall", description="Restore all text & voice channels locked by /closeall without opening announcements/logs")
+@bot.tree.command(name="openall", description="Restore all text & voice channels locked by /closeall")
 @app_commands.describe(announce="Send an unlock notice into restored channels (default: True)")
 @app_commands.default_permissions(administrator=True)
 async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
@@ -2376,7 +3140,6 @@ async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
             ephemeral=True,
         )
 
-    # Group snapshots by channel_id
     by_channel: Dict[int, List[Tuple[int, int, int, int, int]]] = {}
     for ch_id, role_id, p_send, p_thr, p_cre, p_conn in role_rows:
         by_channel.setdefault(ch_id, []).append((role_id, p_send, p_thr, p_cre, p_conn))
@@ -2459,7 +3222,7 @@ async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
 
         summary = discord.Embed(
             title="🔓 Server Lockdown Lifted",
-            description="All locked text, voice, forum & stage channels have been restored to their exact pre-lockdown permissions. Read-only channels remained untouched.",
+            description="All locked text, voice, forum & stage channels have been restored to their exact pre-lockdown permissions.",
             color=0x2ECC71,
             timestamp=datetime.now(timezone.utc),
         )
@@ -2513,7 +3276,7 @@ async def lockdown_ignore_cmd(
 
 
 # -------------------------------------------------------------
-# 8. Private Temporary Voice Channels 2.0
+# 8. Private Temporary Voice Channels 2.0 + Linked Squad LFG
 # -------------------------------------------------------------
 def get_user_voice_preset(user_id: int) -> Dict[str, Any]:
     with get_db() as conn:
@@ -2650,12 +3413,351 @@ def remove_temp_voice_record(channel_id: int):
         conn.commit()
 
 
+# --- Squad LFG Helpers (Linked directly to Private Voice Rooms) ---
+def build_lfg_embed(
+    vc: discord.VoiceChannel,
+    owner_id: int,
+    game_mode: str,
+    modifiers: str,
+    note: str = "",
+    is_locked: bool = False,
+) -> discord.Embed:
+    mode_emoji = "🎮"
+    mode_color = 0x5865F2
+    for m_name, m_em, m_col in LFG_GAME_MODES:
+        if m_name.lower() == game_mode.lower():
+            mode_emoji = m_em
+            mode_color = m_col
+            break
+
+    humans = [m for m in vc.members if not m.bot]
+    cur_count = len(humans)
+    max_slots = vc.user_limit
+
+    if is_locked:
+        status_badge = "🔒 **LOCKED BY HOST**"
+        mode_color = 0x95A5A6
+    elif max_slots > 0 and cur_count >= max_slots:
+        status_badge = f"🔴 **FULL ({cur_count}/{max_slots})**"
+        mode_color = 0xE74C3C
+    elif max_slots > 0:
+        filled = min(cur_count, max_slots)
+        bar = "🟩" * filled + "⬜" * max(max_slots - filled, 0)
+        status_badge = f"🟢 **OPEN ({cur_count}/{max_slots})**\n`{bar}`"
+    else:
+        status_badge = f"🟢 **OPEN ({cur_count} / ∞ Unlimited)**"
+
+    desc_parts = [f"**Voice Room:** {vc.mention} (`{vc.name}`)"]
+    if note and note.strip():
+        desc_parts.append(f"📝 **Note:** *{note.strip()}*")
+
+    embed = discord.Embed(
+        title=f"{mode_emoji} Squad LFG • {game_mode}",
+        description="\n".join(desc_parts),
+        color=mode_color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🎯 Game Mode", value=f"**`{game_mode}`**", inline=True)
+    embed.add_field(name="⚙️ Modifiers", value=f"**`{modifiers}`**", inline=True)
+    embed.add_field(name="👑 Host", value=f"<@{owner_id}>", inline=True)
+    embed.add_field(name="👥 Squad Slots", value=status_badge, inline=False)
+    embed.set_footer(
+        text=f"{vc.guild.name} • Live Squad Finder (Auto-deletes when room closes)",
+        icon_url=vc.guild.icon.url if vc.guild.icon else None,
+    )
+    return embed
+
+
+def build_lfg_join_view(guild_id: int, vc_id: int) -> discord.ui.View:
+    view = discord.ui.View()
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label="Join Voice Squad",
+            emoji="🔊",
+            url=f"https://discord.com/channels/{guild_id}/{vc_id}",
+        )
+    )
+    return view
+
+
+async def refresh_lfg_posts_for_voice(vc: discord.VoiceChannel):
+    room = TEMP_VOICE_CACHE.get(vc.id)
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT message_id, channel_id, owner_id, game_mode, modifiers, note FROM lfg_posts WHERE voice_channel_id = ?",
+            (vc.id,),
+        )
+        rows = c.fetchall()
+
+    if not rows:
+        return
+
+    owner_id = room["owner_id"] if room else rows[0][2]
+    is_locked = room.get("is_locked", False) if room else False
+
+    for msg_id, ch_id, row_owner, g_mode, mods, note in rows:
+        target_ch = vc.guild.get_channel(ch_id)
+        if not isinstance(target_ch, discord.TextChannel):
+            continue
+        try:
+            msg = await target_ch.fetch_message(msg_id)
+            embed = build_lfg_embed(
+                vc=vc,
+                owner_id=owner_id,
+                game_mode=g_mode,
+                modifiers=mods,
+                note=note or "",
+                is_locked=is_locked,
+            )
+            await msg.edit(embed=embed, view=build_lfg_join_view(vc.guild.id, vc.id))
+        except discord.NotFound:
+            with get_db() as conn:
+                conn.execute("DELETE FROM lfg_posts WHERE message_id = ?", (msg_id,))
+                conn.commit()
+        except Exception:
+            pass
+
+
+async def delete_lfg_posts_for_voice(guild: discord.Guild, vc_id: int):
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT message_id, channel_id FROM lfg_posts WHERE voice_channel_id = ?", (vc_id,))
+        rows = c.fetchall()
+        c.execute("DELETE FROM lfg_posts WHERE voice_channel_id = ?", (vc_id,))
+        conn.commit()
+
+    for msg_id, ch_id in rows:
+        target_ch = guild.get_channel(ch_id)
+        if isinstance(target_ch, discord.TextChannel):
+            try:
+                msg = await target_ch.fetch_message(msg_id)
+                await msg.delete()
+            except Exception:
+                pass
+
+
 async def delete_temp_voice_channel(channel: discord.VoiceChannel, reason: str):
-    remove_temp_voice_record(channel.id)
+    guild = channel.guild
+    vc_id = channel.id
+    remove_temp_voice_record(vc_id)
+    await delete_lfg_posts_for_voice(guild, vc_id)
     try:
         await channel.delete(reason=reason)
     except Exception:
         pass
+
+
+class LfgNoteModal(discord.ui.Modal, title="Squad LFG Note"):
+    note_input = discord.ui.TextInput(
+        label="Requirements or Goal (Optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=120,
+        placeholder="e.g. Need wave 100+, bring farm & DPS!",
+    )
+
+    def __init__(self, builder_view: "LfgBuilderView"):
+        super().__init__()
+        self.builder_view = builder_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.builder_view.publish_lfg(interaction, note=self.note_input.value.strip())
+
+
+class LfgBuilderView(discord.ui.View):
+    def __init__(self, vc: discord.VoiceChannel, room: Dict[str, Any], lfg_channels: List[discord.TextChannel]):
+        super().__init__(timeout=180)
+        self.vc = vc
+        self.room = room
+        self.lfg_channels = lfg_channels
+        self.selected_mode = "Nightmare"
+        self.selected_modifiers: List[str] = ["No Modifiers"]
+        self.selected_target = str(lfg_channels[0].id)
+
+        mode_options = [
+            discord.SelectOption(
+                label=m_name,
+                value=m_name,
+                emoji=m_em,
+                default=(m_name == self.selected_mode),
+            )
+            for m_name, m_em, _ in LFG_GAME_MODES
+        ]
+        mode_select = discord.ui.Select(
+            placeholder="🎯 Step 1: Choose Game Mode...",
+            options=mode_options,
+            row=0,
+        )
+        mode_select.callback = self.on_mode_select
+        self.add_item(mode_select)
+
+        mod_options = [
+            discord.SelectOption(
+                label=mod_name,
+                value=mod_name,
+                emoji=mod_em,
+                default=(mod_name == "No Modifiers"),
+            )
+            for mod_name, mod_em in LFG_MODIFIERS
+        ]
+        mod_select = discord.ui.Select(
+            placeholder="⚙️ Step 2: Select Modifiers (Optional, multi-select)...",
+            options=mod_options,
+            min_values=1,
+            max_values=len(mod_options),
+            row=1,
+        )
+        mod_select.callback = self.on_mod_select
+        self.add_item(mod_select)
+
+        if len(lfg_channels) >= 2:
+            ch_options = [
+                discord.SelectOption(
+                    label=f"#{lfg_channels[0].name}",
+                    value=str(lfg_channels[0].id),
+                    emoji="1️⃣",
+                    default=True,
+                ),
+                discord.SelectOption(
+                    label=f"#{lfg_channels[1].name}",
+                    value=str(lfg_channels[1].id),
+                    emoji="2️⃣",
+                ),
+                discord.SelectOption(
+                    label="Both LFG Channels",
+                    value="both",
+                    emoji="📢",
+                ),
+            ]
+            ch_select = discord.ui.Select(
+                placeholder="📍 Step 3: Select LFG Channel...",
+                options=ch_options,
+                row=2,
+            )
+            ch_select.callback = self.on_channel_select
+            self.add_item(ch_select)
+
+        pub_btn = discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label="Post Squad LFG",
+            emoji="🚀",
+            row=3,
+        )
+        pub_btn.callback = self.on_publish_click
+        self.add_item(pub_btn)
+
+        note_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Add Note & Post",
+            emoji="📝",
+            row=3,
+        )
+        note_btn.callback = self.on_note_click
+        self.add_item(note_btn)
+
+    async def on_mode_select(self, interaction: discord.Interaction):
+        self.selected_mode = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def on_mod_select(self, interaction: discord.Interaction):
+        vals = interaction.data["values"]
+        if len(vals) > 1 and "No Modifiers" in vals:
+            vals = [v for v in vals if v != "No Modifiers"]
+        self.selected_modifiers = vals
+        await interaction.response.defer()
+
+    async def on_channel_select(self, interaction: discord.Interaction):
+        self.selected_target = interaction.data["values"][0]
+        await interaction.response.defer()
+
+    async def on_publish_click(self, interaction: discord.Interaction):
+        await self.publish_lfg(interaction, note="")
+
+    async def on_note_click(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(LfgNoteModal(self))
+
+    async def publish_lfg(self, interaction: discord.Interaction, note: str = ""):
+        now = time.time()
+        last_lfg = LFG_POST_COOLDOWNS.get(interaction.user.id, 0.0)
+        if now - last_lfg < LFG_COOLDOWN_SECONDS:
+            left = LFG_COOLDOWN_SECONDS - (now - last_lfg)
+            return await interaction.response.send_message(
+                f"⏳ Anti-spam cooldown: please wait **{left:.0f}s** before reposting your squad.",
+                ephemeral=True,
+            )
+
+        if self.vc.id not in TEMP_VOICE_CACHE:
+            return await interaction.response.send_message("❌ This voice room is no longer active.", ephemeral=True)
+
+        LFG_POST_COOLDOWNS[interaction.user.id] = now
+        mods_text = ", ".join(self.selected_modifiers) if self.selected_modifiers else "No Modifiers"
+
+        if self.selected_target == "both":
+            target_channels = self.lfg_channels
+        else:
+            target_channels = [ch for ch in self.lfg_channels if str(ch.id) == self.selected_target] or [self.lfg_channels[0]]
+
+        # Remove any old LFG posts for this voice room before publishing updated one
+        await delete_lfg_posts_for_voice(self.vc.guild, self.vc.id)
+
+        embed = build_lfg_embed(
+            vc=self.vc,
+            owner_id=self.room["owner_id"],
+            game_mode=self.selected_mode,
+            modifiers=mods_text,
+            note=note,
+            is_locked=self.room.get("is_locked", False),
+        )
+        view = build_lfg_join_view(self.vc.guild.id, self.vc.id)
+
+        posted_links: List[str] = []
+        now_ts = int(time.time())
+        with get_db() as conn:
+            for ch in target_channels:
+                try:
+                    sent = await ch.send(embed=embed, view=view)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO lfg_posts (
+                            message_id, channel_id, guild_id, voice_channel_id,
+                            owner_id, game_mode, modifiers, note, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sent.id,
+                            ch.id,
+                            self.vc.guild.id,
+                            self.vc.id,
+                            self.room["owner_id"],
+                            self.selected_mode,
+                            mods_text,
+                            note,
+                            now_ts,
+                        ),
+                    )
+                    posted_links.append(f"{ch.mention} ([Jump]({sent.jump_url}))")
+                except Exception:
+                    pass
+            conn.commit()
+
+        if not posted_links:
+            return await interaction.response.send_message(
+                "❌ Failed to post LFG card (check bot permissions in the LFG channel).",
+                ephemeral=True,
+            )
+
+        msg_text = (
+            f"📣 **Squad LFG published** in {', '.join(posted_links)}!\n"
+            f"• **Mode:** `{self.selected_mode}` | **Modifiers:** `{mods_text}`\n"
+            "• Slot counts update automatically as players join, and the post auto-deletes when your room closes."
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(msg_text, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg_text, ephemeral=True)
 
 
 async def get_or_create_watch_together_invite(vc: discord.VoiceChannel, user: discord.abc.User) -> str:
@@ -2726,8 +3828,8 @@ def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any
         description=(
             f"**Room Owner:** <@{room['owner_id']}>\n"
             f"**Status:** {' • '.join(status_badges)}\n\n"
+            "• Click **`📣 Find Squad`** to post an LFG card with live slot tracking!\n"
             "• Your room name, limit & lock settings are **auto-saved** for your next session.\n"
-            "• Use **Watch Together** to queue YouTube/music right inside this room.\n"
             "-# 🗑️ Auto-deletes automatically as soon as everyone leaves the room."
         ),
         color=0xE74C3C if room.get("is_locked") else 0x2ECC71,
@@ -2835,6 +3937,7 @@ class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
             self.room["last_active_at"] = now_ts
             self.room["warned_inactive"] = False
             save_temp_voice(self.room)
+            await refresh_lfg_posts_for_voice(self.channel)
             await interaction.response.send_message(
                 f"✅ Room renamed to **{new_name}** and saved to your personal preset!",
                 ephemeral=True,
@@ -2869,6 +3972,7 @@ class VoiceLimitModal(discord.ui.Modal, title="Set Room User Limit"):
         self.room["warned_inactive"] = False
         save_temp_voice(self.room)
         await refresh_voice_control_panel(self.channel, self.room)
+        await refresh_lfg_posts_for_voice(self.channel)
         msg = "👥 User limit removed (`Unlimited`) & saved." if limit == 0 else f"👥 User limit set to **{limit}** & saved."
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -2911,6 +4015,7 @@ class VoiceControlView(discord.ui.View):
         room["warned_inactive"] = False
         save_temp_voice(room)
         await refresh_voice_control_panel(vc, room)
+        await refresh_lfg_posts_for_voice(vc)
         await interaction.response.send_message(
             "🔒 Room **locked** (saved to preset)!" if new_locked else "🔓 Room **unlocked** (saved to preset)!",
             ephemeral=True,
@@ -2988,6 +4093,7 @@ class VoiceControlView(discord.ui.View):
         save_temp_voice(room)
         await vc.set_permissions(interaction.user, connect=True, view_channel=True, manage_channels=True)
         await refresh_voice_control_panel(vc, room)
+        await refresh_lfg_posts_for_voice(vc)
         await interaction.response.send_message(f"👑 {interaction.user.mention} claimed ownership of this voice room!")
 
     @discord.ui.select(
@@ -3014,6 +4120,7 @@ class VoiceControlView(discord.ui.View):
         room["warned_inactive"] = False
         save_temp_voice(room)
         await refresh_voice_control_panel(vc, room)
+        await refresh_lfg_posts_for_voice(vc)
         label = "Unlimited" if limit == 0 else f"{limit} slots"
         await interaction.response.send_message(f"⚡ Quick Mode applied: **{label}** (saved to preset)!", ephemeral=True)
 
@@ -3076,6 +4183,33 @@ class VoiceControlView(discord.ui.View):
             return await interaction.response.send_message("⚠️ Cannot block yourself or bots.", ephemeral=True)
         await interaction.response.send_message(f"🚫 Kicked & blocked: {', '.join(blocked_mentions)}", ephemeral=True)
 
+    @discord.ui.button(label="Find Squad", style=discord.ButtonStyle.primary, emoji="📣", custom_id="vc_ctrl:lfg", row=4)
+    async def find_squad_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        s = get_guild_settings(vc.guild.id)
+        lfg_channels: List[discord.TextChannel] = []
+        for cid_key in ("lfg_channel_1_id", "lfg_channel_2_id"):
+            cid = s.get(cid_key)
+            if cid:
+                ch_obj = vc.guild.get_channel(cid)
+                if isinstance(ch_obj, discord.TextChannel) and ch_obj not in lfg_channels:
+                    lfg_channels.append(ch_obj)
+
+        if not lfg_channels:
+            return await interaction.response.send_message(
+                "❌ LFG channels are not configured yet. Ask an admin to set LFG Channel 1 / 2 in `/panel` ➔ `🔊 Voice 2.0`.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            "📣 **Squad LFG Builder**\nSelect your **Game Mode** and **Modifiers** below, then click **Post Squad LFG**:",
+            view=LfgBuilderView(vc, room, lfg_channels),
+            ephemeral=True,
+        )
+
     @discord.ui.button(label="Watch / Music", style=discord.ButtonStyle.success, emoji="🎬", custom_id="vc_ctrl:activity", row=4)
     async def watch_together_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.channel, discord.VoiceChannel):
@@ -3129,7 +4263,7 @@ class VoiceControlView(discord.ui.View):
         vc, room, err = self._get_room_and_verify_owner(interaction)
         if err or not vc or not room:
             return await interaction.response.send_message(err, ephemeral=True)
-        await interaction.response.send_message("🗑️ Closing voice room...", ephemeral=True)
+        await interaction.response.send_message("🗑️ Closing voice room & removing LFG posts...", ephemeral=True)
         await delete_temp_voice_channel(vc, reason=f"Closed by owner {interaction.user}")
 
 
@@ -4408,28 +5542,6 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 # -------------------------------------------------------------
 # 13. Admin Control Panel (/panel) & Sub-Panels
 # -------------------------------------------------------------
-class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
-    threshold_input = discord.ui.TextInput(
-        label="Stars Required (1 - 500)",
-        style=discord.TextStyle.short,
-        required=True,
-        max_length=3,
-        placeholder="e.g. 12",
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-        val = self.threshold_input.value.strip()
-        if not val.isdigit() or not (1 <= int(val) <= 500):
-            return await interaction.response.send_message("❌ Enter a number between 1 and 500.", ephemeral=True)
-        update_guild_settings(interaction.guild.id, star_threshold=int(val))
-        await interaction.response.edit_message(
-            embed=await build_panel_embed(interaction.guild),
-            view=ControlPanelView(),
-        )
-
-
 class ValueUrlModal(discord.ui.Modal, title="Set Value List Website URL"):
     url_input = discord.ui.TextInput(
         label="Official Value List URL",
@@ -4473,76 +5585,106 @@ class ValueSetupView(discord.ui.View):
         )
 
     @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="🏷️ Select Value Changes Ping Role...",
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="✍️ Select Signs Value Channel (Auto-reads history & live posts)...",
         row=1,
     )
-    async def select_value_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+    async def select_signs_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         chosen = select.values[0]
-        update_guild_settings(self.guild_id, value_ping_role_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ Value Changes ping role set to <@&{chosen.id}>.",
+        update_guild_settings(self.guild_id, signs_channel_id=chosen.id)
+        await interaction.response.defer(ephemeral=True)
+        ch_obj = interaction.guild.get_channel(chosen.id) if interaction.guild else None
+        scanned = 0
+        if isinstance(ch_obj, discord.TextChannel):
+            scanned = await scan_signs_channel_history(ch_obj, limit=150)
+        await interaction.edit_original_response(
+            content=(
+                f"✅ **Signs Value channel set to <#{chosen.id}>!**\n"
+                f"• Auto-scanned channel history and synced **{scanned}** sign partner(s) ({len(SIGN_PARTNERS_CACHE)} total in database).\n"
+                "• All new and edited messages in that channel will now update partner signs automatically!"
+            ),
             view=self,
         )
 
     @discord.ui.select(
         cls=discord.ui.RoleSelect,
-        placeholder="🛡️ Select Value Team Roles (Allowed to use /value_post & delete)...",
+        placeholder="🏷️ Select Value/Sign Changes Ping Role...",
+        row=2,
+    )
+    async def select_value_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, value_ping_role_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"✅ Value & Sign Changes ping role set to <@&{chosen.id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🛡️ Select Value Team Roles (/value_post, /sign_post, delete)...",
         min_values=1,
         max_values=10,
-        row=2,
+        row=3,
     )
     async def select_value_managers(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         role_ids_str = ",".join(str(r.id) for r in select.values)
         update_guild_settings(self.guild_id, value_manager_role_ids=role_ids_str)
         mentions = ", ".join(f"<@&{r.id}>" for r in select.values)
         await interaction.response.edit_message(
-            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can now use `/value_post` and `/value_unit_delete`!",
+            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can use `/value_post`, `/sign_post`, `/value_unit_delete`, and `/sign_delete`!",
             view=self,
         )
 
-    @discord.ui.button(label="Set Site URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=3)
-    async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cur_url = get_guild_settings(self.guild_id)["value_list_url"]
-        await interaction.response.send_modal(ValueUrlModal(cur_url))
-
-    @discord.ui.button(label="Sync Website Now", style=discord.ButtonStyle.secondary, emoji="🔄", row=3)
+    @discord.ui.button(label="Sync Web + Signs", style=discord.ButtonStyle.secondary, emoji="🔄", row=4)
     async def sync_web_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        site_url = get_guild_settings(self.guild_id)["value_list_url"]
-        checked, changed = await sync_value_list_from_website(site_url)
+        s = get_guild_settings(self.guild_id)
+        checked, changed = await sync_value_list_from_website(s["value_list_url"])
+        signs_scanned = 0
+        if s.get("signs_channel_id") and interaction.guild:
+            ch_obj = interaction.guild.get_channel(s["signs_channel_id"])
+            if isinstance(ch_obj, discord.TextChannel):
+                signs_scanned = await scan_signs_channel_history(ch_obj, limit=150)
         await interaction.followup.send(
-            f"🔄 Checked **{checked}** items from `{site_url}` (**{changed}** updated)! "
-            f"Auto-sync runs automatically every **2 minutes**. Total cached: **{len(VALUE_ITEMS_CACHE)}**.",
+            f"🔄 **Sync Complete!**\n"
+            f"• Website: checked **{checked}** items (**{changed}** updated, **{len(VALUE_ITEMS_CACHE)}** cached)\n"
+            f"• Signs Channel: synced **{signs_scanned}** partner(s) (**{len(SIGN_PARTNERS_CACHE)}** cached)",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=3)
+    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=4)
     async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
             return
         site_url = get_guild_settings(interaction.guild.id)["value_list_url"]
         embed = discord.Embed(
-            title="💎 Official CMTD Value List & Trade Hub",
+            title="💎 Official CMTD Value & Sign Hub",
             description=(
-                "Check live unit values (auto-checked every **2 minutes**), compare trades, and track price changes right here in Discord!\n\n"
-                "• Click **`🔍 Check Unit Value`** to look up any unit privately.\n"
-                "• Click **`⚖️ Trade Calculator`** (or type `/calc`) to compare **You Give** vs. **You Get** publicly.\n"
-                "• Click **`🏆 Top Values`** or **`📈 Recent Changes`** for live leaderboards & updates."
+                "Check live unit values, partner sign multipliers, and calculate trades right inside Discord!\n\n"
+                "• **`🔍 Check Unit Value`** — look up any unit (including partner signs like `Whatenix Pharaoh`).\n"
+                "• **`⚖️ Trade Calculator`** (or `/calc`) — compare **You Give** vs. **You Get** publicly.\n"
+                "• **`✍️ Sign Partners`** — view all current partner sign percentages.\n"
+                "• **`🏆 Top Values`** & **`📈 Recent Changes`** — live leaderboards & updates."
             ),
             color=0x3498DB,
         )
         embed.set_footer(
-            text=f"{interaction.guild.name} • {len(VALUE_ITEMS_CACHE)} Tracked Units",
+            text=f"{interaction.guild.name} • {len(VALUE_ITEMS_CACHE)} Units • {len(SIGN_PARTNERS_CACHE)} Sign Partners",
             icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
         )
         sent = await interaction.channel.send(embed=embed, view=ValueHubView(site_url))
         await interaction.response.send_message(
-            f"📌 Value List Hub posted! [Jump to Message]({sent.jump_url})",
+            f"📌 Value & Sign Hub posted! [Jump to Message]({sent.jump_url})",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Clear Team Roles", style=discord.ButtonStyle.danger, emoji="🧹", row=3)
+    @discord.ui.button(label="Set URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=4)
+    async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cur_url = get_guild_settings(self.guild_id)["value_list_url"]
+        await interaction.response.send_modal(ValueUrlModal(cur_url))
+
+    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.danger, emoji="🧹", row=4)
     async def clear_managers_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         update_guild_settings(self.guild_id, value_manager_role_ids="")
         await interaction.response.edit_message(
@@ -4552,8 +5694,9 @@ class ValueSetupView(discord.ui.View):
 
 
 class TempVoiceSetupView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id: int):
         super().__init__(timeout=180)
+        self.guild_id = guild_id
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
@@ -4562,22 +5705,54 @@ class TempVoiceSetupView(discord.ui.View):
         row=0,
     )
     async def select_jtc_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        if not interaction.guild:
-            return
         chosen = select.values[0]
-        update_guild_settings(interaction.guild.id, jtc_channel_id=chosen.id)
+        update_guild_settings(self.guild_id, jtc_channel_id=chosen.id)
         await interaction.response.edit_message(
-            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Rooms auto-save personal presets and stay open until everyone leaves.",
+            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>!",
             view=self,
         )
 
-    @discord.ui.button(label="Disable Temp Voice", style=discord.ButtonStyle.danger, emoji="🧹", row=1)
-    async def disable_jtc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            return
-        update_guild_settings(interaction.guild.id, jtc_channel_id=None)
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📣 Select LFG Squad Channel #1...",
+        row=1,
+    )
+    async def select_lfg_ch1(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, lfg_channel_1_id=chosen.id)
         await interaction.response.edit_message(
-            content="🧹 Join-to-Create Private Voice Channels disabled.",
+            content=f"✅ **LFG Channel #1** set to <#{chosen.id}>! Squad cards from `📣 Find Squad` can now be posted here.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📣 Select LFG Squad Channel #2 (Optional)...",
+        row=2,
+    )
+    async def select_lfg_ch2(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, lfg_channel_2_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"✅ **LFG Channel #2** set to <#{chosen.id}>! Players can now choose between both LFG channels.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Clear LFG Channels", style=discord.ButtonStyle.secondary, emoji="🧹", row=3)
+    async def clear_lfg_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, lfg_channel_1_id=None, lfg_channel_2_id=None)
+        await interaction.response.edit_message(
+            content="🧹 LFG Squad channels cleared.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Disable Temp Voice", style=discord.ButtonStyle.danger, emoji="🛑", row=3)
+    async def disable_jtc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, jtc_channel_id=None)
+        await interaction.response.edit_message(
+            content="🛑 Join-to-Create Private Voice Channels disabled.",
             view=None,
         )
 
@@ -4623,7 +5798,7 @@ class AntiScamSetupView(discord.ui.View):
     async def enable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         update_guild_settings(self.guild_id, antiscam_enabled=True)
         await interaction.response.edit_message(
-            content="🛡️ **Anti-Scam & Phishing Shield ENABLED!** Fake Roblox/Discord scam links will be deleted automatically.",
+            content="🛡️ **Anti-Scam & Phishing Shield ENABLED!**",
             view=self,
         )
 
@@ -4632,6 +5807,20 @@ class AntiScamSetupView(discord.ui.View):
         update_guild_settings(self.guild_id, antiscam_enabled=False)
         await interaction.response.edit_message(
             content="🛑 **Anti-Scam & Phishing Shield DISABLED.**",
+            view=self,
+        )
+
+    @discord.ui.button(label="Toggle Auto-Slowmode", style=discord.ButtonStyle.primary, emoji="⚡", row=2)
+    async def toggle_autoslow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cur = get_guild_settings(self.guild_id).get("autoslowmode_enabled", False)
+        new_val = not cur
+        update_guild_settings(self.guild_id, autoslowmode_enabled=new_val)
+        await interaction.response.edit_message(
+            content=(
+                "⚡ **Dynamic Auto-Slowmode ENABLED!** When chat surges (28+ msgs / 15s), slowmode temporarily bumps to `10s` and auto-resets once chat calms down."
+                if new_val
+                else "⚪ **Dynamic Auto-Slowmode DISABLED.**"
+            ),
             view=self,
         )
 
@@ -4671,9 +5860,17 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     wfl = f"<#{s['wfl_channel_id']}>" if s["wfl_channel_id"] else "`Not Set`"
     jtc = f"<#{s['jtc_channel_id']}>" if s["jtc_channel_id"] else "`Not Set`"
     val_ch = f"<#{s['value_channel_id']}>" if s["value_channel_id"] else "`Not Set`"
+    signs_ch = f"<#{s['signs_channel_id']}>" if s.get("signs_channel_id") else "`Not Set`"
     val_role = f"<@&{s['value_ping_role_id']}>" if s["value_ping_role_id"] else "`Not Set`"
     booster = f"<@&{s['booster_role_id']}>" if s["booster_role_id"] else "`Not Set`"
     autorole = f"<@&{s['autorole_id']}>" if s["autorole_id"] else "`Not Set`"
+
+    lfg_list = []
+    if s.get("lfg_channel_1_id"):
+        lfg_list.append(f"<#{s['lfg_channel_1_id']}>")
+    if s.get("lfg_channel_2_id"):
+        lfg_list.append(f"<#{s['lfg_channel_2_id']}>")
+    lfg_display = ", ".join(lfg_list) if lfg_list else "`Not Set`"
 
     mgr_ids = get_value_manager_role_ids(guild.id)
     val_mgr_txt = ", ".join(f"<@&{rid}>" for rid in mgr_ids[:4]) if mgr_ids else "`Default (Manage Messages)`"
@@ -4681,7 +5878,7 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         val_mgr_txt += f" (+{len(mgr_ids) - 4})"
 
     detected_wfl = await resolve_wfl_emojis(guild)
-    wfl_mode_tag = "Smart Trade Filter" if s.get("wfl_smart_filter", True) else "All Posts"
+    wfl_mode_tag = "Smart Filter" if s.get("wfl_smart_filter", True) else "All Posts"
     if len(detected_wfl) == 3:
         wfl_status = f"{' '.join(str(e) for e in detected_wfl)} (`{wfl_mode_tag}`)"
     else:
@@ -4689,33 +5886,23 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
         missing = [n for n in WFL_EMOJI_NAMES if n not in found_names]
         wfl_status = f"`Missing: {', '.join(missing)}`"
 
-    shield_status = "🟢 **Active**" if s["antiscam_enabled"] else "⚪ `Disabled`"
-    if s["antiscam_enabled"] and s["antiscam_log_channel_id"]:
-        shield_status += f" (<#{s['antiscam_log_channel_id']}>)"
-
-    lock_status = "🔴 **LOCKED DOWN**" if is_lockdown_active(guild.id) else "🟢 Normal"
-    last_sync_ts = LAST_VALUE_SYNC_STATS.get("ts", 0)
-    sync_status = f"<t:{last_sync_ts}:R> (every 2m)" if last_sync_ts else "Every 2m"
+    shield_status = "🟢 **On**" if s["antiscam_enabled"] else "⚪ `Off`"
+    slow_status = "⚡ **Auto-Slowmode On**" if s.get("autoslowmode_enabled") else "⚪ `Slowmode Off`"
+    lock_status = "🔴 **LOCKED**" if is_lockdown_active(guild.id) else "🟢 Normal"
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L reactions, Value System (2-min sync), Voice 2.0, Anti-Scam & Lockdown below.",
+        description="Configure Starboard, W/F/L reactions, Value & Sign System, Voice 2.0 + LFG, Anti-Scam & Lockdown.",
         color=0x5865F2,
     )
-    embed.add_field(name="💡 Ideas Channel", value=ideas, inline=True)
-    embed.add_field(name="🌟 Showcase Channel", value=showcase, inline=True)
-    embed.add_field(name="⭐ Star Threshold", value=f"**{s['star_threshold']}** stars", inline=True)
-    embed.add_field(name="⚖️ W/F/L Channel", value=wfl, inline=True)
-    embed.add_field(name="🎯 W/F/L Emojis", value=wfl_status, inline=True)
-    embed.add_field(name="🔊 Voice 2.0 Trigger", value=jtc, inline=True)
-    embed.add_field(name="💎 Value Channel", value=val_ch, inline=True)
-    embed.add_field(name="🏷️ Value Ping Role", value=val_role, inline=True)
-    embed.add_field(name="🛡️ Value Team Roles", value=val_mgr_txt, inline=True)
-    embed.add_field(name="🔄 Last Value Sync", value=sync_status, inline=True)
-    embed.add_field(name="🛡️ Anti-Scam Shield", value=shield_status, inline=True)
-    embed.add_field(name="🔒 Server Lockdown", value=lock_status, inline=True)
-    embed.add_field(name="🚀 Booster / Auto-Role", value=f"{booster} / {autorole}", inline=False)
-    embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} tracked units")
+    embed.add_field(name="💡 Ideas / 🌟 Showcase", value=f"{ideas} / {showcase} (`⭐ {s['star_threshold']}`)", inline=True)
+    embed.add_field(name="⚖️ W/F/L Channel", value=f"{wfl}\n{wfl_status}", inline=True)
+    embed.add_field(name="🔊 Voice 2.0 / 📣 LFG", value=f"Trigger: {jtc}\nLFG: {lfg_display}", inline=True)
+    embed.add_field(name="💎 Value / ✍️ Signs Ch", value=f"Val: {val_ch}\nSigns: {signs_ch}", inline=True)
+    embed.add_field(name="🏷️ Ping / 🛡️ Team Roles", value=f"Ping: {val_role}\nTeam: {val_mgr_txt}", inline=True)
+    embed.add_field(name="🛡️ Security & Lockdown", value=f"{shield_status} • {slow_status}\nLockdown: {lock_status}", inline=True)
+    embed.add_field(name="🚀 Booster / 👋 Auto-Role", value=f"{booster} / {autorole}", inline=False)
+    embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} units • {len(SIGN_PARTNERS_CACHE)} sign partners")
     return embed
 
 
@@ -4763,41 +5950,45 @@ class ControlPanelView(discord.ui.View):
         update_guild_settings(interaction.guild.id, autorole_id=select.values[0].id)
         await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
-    @discord.ui.button(label="Value List", style=discord.ButtonStyle.primary, emoji="💎", row=4)
+    @discord.ui.button(label="Value & Signs", style=discord.ButtonStyle.primary, emoji="💎", row=4)
     async def setup_value_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
         s = get_guild_settings(interaction.guild.id)
         mgr_ids = get_value_manager_role_ids(interaction.guild.id)
         mgr_display = ", ".join(f"<@&{rid}>" for rid in mgr_ids) if mgr_ids else "`Default (Manage Messages / Admin)`"
+        signs_ch_txt = f"<#{s['signs_channel_id']}>" if s.get("signs_channel_id") else "`Not Set`"
         await interaction.response.send_message(
-            f"💎 **Value List & Changelog System**\n"
-            f"• **Website:** {s['value_list_url']}\n"
-            f"• **Tracked Units:** `{len(VALUE_ITEMS_CACHE)}`\n"
-            f"• **Allowed Team Roles (`/value_post` & `/value_unit_delete`):** {mgr_display}\n\n"
-            "Configure your changelog channel, ping role, team roles (multi-select), or post the pinned Value Hub below:",
+            f"💎 **Value List & Partner Signs System**\n"
+            f"• **Website:** {s['value_list_url']} (`{len(VALUE_ITEMS_CACHE)}` units)\n"
+            f"• **Signs Channel (Auto-Scanner):** {signs_ch_txt} (`{len(SIGN_PARTNERS_CACHE)}` partners)\n"
+            f"• **Allowed Team Roles:** {mgr_display}\n\n"
+            "Select channels, roles, or post the pinned Value & Sign Hub below:",
             view=ValueSetupView(interaction.guild.id),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Voice 2.0", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
+    @discord.ui.button(label="Voice + LFG", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
     async def setup_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
         await interaction.response.send_message(
-            "🔊 **Private Voice Rooms 2.0 Setup**\n"
-            "Select a trigger voice channel below. Rooms auto-save personal presets, support Quick Modes & Watch Together, and stay open until everyone leaves:",
-            view=TempVoiceSetupView(),
+            "🔊 **Private Voice Rooms 2.0 & Squad LFG Setup**\n"
+            "Select the Join-to-Create trigger channel and up to **2 LFG channels** where `📣 Find Squad` cards will be posted:",
+            view=TempVoiceSetupView(interaction.guild.id),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Anti-Scam", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
+    @discord.ui.button(label="Security", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
     async def setup_antiscam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
         s = get_guild_settings(interaction.guild.id)
         state_txt = "ENABLED" if s["antiscam_enabled"] else "DISABLED"
+        slow_txt = "ENABLED" if s.get("autoslowmode_enabled") else "DISABLED"
         await interaction.response.send_message(
-            f"🛡️ **Anti-Scam & Phishing Shield** (Currently: **{state_txt}**)\n"
-            "Blocks fake Roblox/Discord scam links in `<0.1ms` without affecting staff or official links:",
+            f"🛡️ **Anti-Scam Shield** (`{state_txt}`) & **⚡ Dynamic Auto-Slowmode** (`{slow_txt}`)\n"
+            "Configure phishing link protection and automatic update-surge slowmode below:",
             view=AntiScamSetupView(interaction.guild.id),
             ephemeral=True,
         )
@@ -4808,8 +5999,7 @@ class ControlPanelView(discord.ui.View):
             return
         await interaction.response.send_message(
             "🔒 **Lockdown Whitelist Configuration**\n"
-            "Use `/closeall` to lock **all** open text, voice, forum & stage channels for everyone (read-only channels like `#announcements` are automatically preserved) and `/openall` to restore them.\n"
-            "Select any extra open channels or categories below that `/closeall` should **never** touch:",
+            "Use `/closeall` to lock **all** open text & voice channels (read-only channels like `#announcements` are preserved) and `/openall` to restore them:",
             view=LockdownSetupView(interaction.guild.id),
             ephemeral=True,
         )
@@ -4938,26 +6128,66 @@ async def unit_name_autocomplete(interaction: discord.Interaction, current: str)
     ]
 
 
-@bot.tree.command(name="value", description="Check the current value, demand & stability of any unit")
+async def sign_partner_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    q = normalize_unit_key(current)
+    matches: List[Dict[str, Any]] = []
+    seen_keys: Set[str] = set()
+
+    for p in SIGN_PARTNERS_CACHE.values():
+        if not q or q in p["partner_key"] or q in p["aliases"]:
+            if p["partner_key"] not in seen_keys:
+                seen_keys.add(p["partner_key"])
+                matches.append(p)
+        if len(matches) >= 25:
+            break
+
+    return [
+        app_commands.Choice(
+            name=f"{p['display_name']} ({p['roblox_username'] or 'Partner'}) — {p['sign_text']}"[:100],
+            value=p["display_name"][:100],
+        )
+        for p in matches
+    ]
+
+
+@bot.tree.command(name="value", description="Check the current value, partner sign value, demand & stability of any unit")
 @app_commands.describe(
     unit="Unit name or shortcut (e.g. UTTV, UTC, Pharaoh Cameraman)",
+    sign="Optional partner sign (e.g. Whatenix, Meddyson, TTD_OnlyMy)",
     public="Show the card publicly in chat (default: False / only visible to you)",
 )
-@app_commands.autocomplete(unit=unit_name_autocomplete)
-async def value_cmd(interaction: discord.Interaction, unit: str, public: bool = False):
-    item = find_value_item(unit)
+@app_commands.autocomplete(unit=unit_name_autocomplete, sign=sign_partner_autocomplete)
+async def value_cmd(
+    interaction: discord.Interaction,
+    unit: str,
+    sign: Optional[str] = None,
+    public: bool = False,
+):
+    item, auto_partner = extract_unit_and_sign_from_phrase(unit)
     if not item:
         return await interaction.response.send_message(
             f"❌ Unit `{unit}` not found in the value list.",
             ephemeral=True,
         )
+    partner = find_sign_partner(sign) if sign else auto_partner
+    if sign and not partner:
+        return await interaction.response.send_message(
+            f"❌ Sign partner `{sign}` not found. Use `/signs` to see all tracked sign partners.",
+            ephemeral=True,
+        )
     site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
-    embed = build_unit_value_embed(interaction.guild, item, site_url)
+    embed = build_unit_value_embed(interaction.guild, item, site_url, partner=partner)
     view = build_link_view("Open Full Value List", site_url)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
 
 
-@bot.tree.command(name="calc", description="Compare a trade publicly using live CMTD values & demand")
+@bot.tree.command(name="signs", description="View all tracked Partner Sign percentages")
+async def signs_cmd(interaction: discord.Interaction):
+    embed = build_sign_partners_embed(interaction.guild)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="calc", description="Compare a trade publicly using live CMTD unit & partner sign values")
 async def calc_cmd(interaction: discord.Interaction):
     remaining = check_calc_cooldown(interaction.user.id)
     if remaining > 0:
@@ -4968,7 +6198,7 @@ async def calc_cmd(interaction: discord.Interaction):
     await interaction.response.send_modal(TradeCalcModal(author_id=interaction.user.id))
 
 
-@bot.tree.command(name="value_changes", description="View recent unit value, demand & stability changes")
+@bot.tree.command(name="value_changes", description="View recent unit value & partner sign changes")
 async def value_changes_cmd(interaction: discord.Interaction):
     site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
     embed = build_recent_value_changes_embed(interaction.guild)
@@ -5018,7 +6248,7 @@ class ValueChangelogModal(discord.ui.Modal, title="Publish Value List Changes"):
         )
         if not isinstance(target_ch, discord.TextChannel):
             return await interaction.response.send_message(
-                "❌ Target Value Changes channel not found. Configure it in `/panel` ➔ `💎 Value List`.",
+                "❌ Target Value Changes channel not found. Configure it in `/panel` ➔ `💎 Value & Signs`.",
                 ephemeral=True,
             )
 
@@ -5070,10 +6300,104 @@ async def value_post_cmd(interaction: discord.Interaction):
         return
     if not has_value_manager_access(interaction.user):
         return await interaction.response.send_message(
-            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value List`.",
+            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value & Signs`.",
             ephemeral=True,
         )
     await interaction.response.send_modal(ValueChangelogModal())
+
+
+class SignChangelogModal(discord.ui.Modal, title="Publish Sign Value Changes"):
+    signs_input = discord.ui.TextInput(
+        label="Sign Changes (Paste your standard format)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=3500,
+        placeholder="@Whatenix (WhatenixTT)\nUsername: Whatenix\nSign Value: +10% -> 25%",
+    )
+    ping_input = discord.ui.TextInput(
+        label="Ping Value Changes Role? (yes / no)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=5,
+        default="no",
+        placeholder="yes or no",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        settings = get_guild_settings(interaction.guild.id)
+        parsed = parse_and_apply_sign_changelog(
+            self.signs_input.value,
+            guild=interaction.guild,
+            source="sign-changelog",
+        )
+        if not parsed:
+            return await interaction.response.send_message(
+                "❌ Could not parse any sign changes. Format example:\n`@Whatenix\nUsername: Whatenix\nSign Value: +10% -> 25%`",
+                ephemeral=True,
+            )
+
+        target_ch = (
+            interaction.guild.get_channel(settings["signs_channel_id"])
+            if settings.get("signs_channel_id")
+            else interaction.channel
+        )
+        if not isinstance(target_ch, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ Target Signs channel not found. Configure it in `/panel` ➔ `💎 Value & Signs`.",
+                ephemeral=True,
+            )
+
+        sections: List[str] = []
+        for entry in parsed:
+            icon = "📈" if entry["trend"] == "up" else ("📉" if entry["trend"] == "down" else "✍️")
+            r_line = f"\n> **Username:** `{entry['roblox']}`" if entry.get("roblox") else ""
+            sections.append(f"{icon} **{entry['name']}**{r_line}\n> {entry['line']}")
+
+        embed = discord.Embed(
+            title="✍️ Official Partner Sign Value Update",
+            description="\n\n".join(sections)[:4000],
+            color=0x9B59B6,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(
+            name=f"Updated by {interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url,
+        )
+        embed.set_footer(
+            text=f"{interaction.guild.name} • Live Sign Database Updated",
+            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+        )
+
+        should_ping = self.ping_input.value.strip().lower() in ("yes", "y", "да", "1", "true")
+        ping_role_id = settings.get("value_ping_role_id")
+        content = f"<@&{ping_role_id}>" if (should_ping and ping_role_id) else None
+        allowed = discord.AllowedMentions(roles=True) if content else discord.AllowedMentions.none()
+
+        sent = await target_ch.send(
+            content=content,
+            embed=embed,
+            view=SignChangelogVoteView(0, 0),
+            allowed_mentions=allowed,
+        )
+        names_str = ", ".join(e["name"] for e in parsed)
+        await interaction.response.send_message(
+            f"✅ Published sign changes in {target_ch.mention} and updated **{len(parsed)}** partner(s) (`{names_str}`)! [Jump to Post]({sent.jump_url})",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="sign_post", description="Publish & auto-update partner sign percentages without accidental pings")
+async def sign_post_cmd(interaction: discord.Interaction):
+    if not interaction.guild:
+        return
+    if not has_value_manager_access(interaction.user):
+        return await interaction.response.send_message(
+            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value & Signs`.",
+            ephemeral=True,
+        )
+    await interaction.response.send_modal(SignChangelogModal())
 
 
 @bot.tree.command(name="value_unit_delete", description="Remove a unit from the bot's value list cache and database")
@@ -5084,7 +6408,7 @@ async def value_unit_delete_cmd(interaction: discord.Interaction, unit: str):
         return
     if not has_value_manager_access(interaction.user):
         return await interaction.response.send_message(
-            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value List`.",
+            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value & Signs`.",
             ephemeral=True,
         )
     removed = delete_value_item(unit)
@@ -5095,6 +6419,29 @@ async def value_unit_delete_cmd(interaction: discord.Interaction, unit: str):
         )
     await interaction.response.send_message(
         f"🗑️ Removed **{removed['name']}** (`{removed['value_text']}`) from the value list.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="sign_delete", description="Remove a partner sign entry from the bot's database")
+@app_commands.describe(partner="Select or type the sign partner name to delete")
+@app_commands.autocomplete(partner=sign_partner_autocomplete)
+async def sign_delete_cmd(interaction: discord.Interaction, partner: str):
+    if not interaction.guild:
+        return
+    if not has_value_manager_access(interaction.user):
+        return await interaction.response.send_message(
+            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value & Signs`.",
+            ephemeral=True,
+        )
+    removed = delete_sign_partner(partner)
+    if not removed:
+        return await interaction.response.send_message(
+            f"❌ Sign partner `{partner}` was not found.",
+            ephemeral=True,
+        )
+    await interaction.response.send_message(
+        f"🗑️ Removed sign partner **{removed['display_name']}** (`{removed['sign_text']}`).",
         ephemeral=True,
     )
 
@@ -5254,14 +6601,16 @@ async def stats_cmd(interaction: discord.Interaction):
         total_ideas = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM polls WHERE is_closed = 0")
         active_polls = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM lfg_posts")
+        active_lfgs = c.fetchone()[0]
 
     embed = discord.Embed(title="📈 Bot Performance & Metrics", color=0x2ECC71)
     embed.add_field(name="🏓 Latency", value=f"`{round(bot.latency * 1000)} ms`", inline=True)
     embed.add_field(name="⏱️ Uptime", value=f"`{hours}h {minutes}m {seconds}s`", inline=True)
-    embed.add_field(name="💎 Value Units", value=f"`{len(VALUE_ITEMS_CACHE)}`", inline=True)
+    embed.add_field(name="💎 Units / ✍️ Signs", value=f"`{len(VALUE_ITEMS_CACHE)}` / `{len(SIGN_PARTNERS_CACHE)}`", inline=True)
+    embed.add_field(name="🔊 Temp Voices / 📣 LFG", value=f"`{len(TEMP_VOICE_CACHE)}` / `{active_lfgs}`", inline=True)
     embed.add_field(name="🌟 Showcased Ideas", value=f"`{total_ideas}`", inline=True)
     embed.add_field(name="📊 Active Polls", value=f"`{active_polls}`", inline=True)
-    embed.add_field(name="🔊 Active Temp Voices", value=f"`{len(TEMP_VOICE_CACHE)}`", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -5348,7 +6697,6 @@ def compute_command_tree_signature() -> str:
 
 
 async def sync_commands_instant_to_guilds(target_guild: Optional[discord.Guild] = None) -> int:
-    # Clear global commands on Discord API so there are zero duplicates, while keeping bot.tree intact
     if bot.user:
         try:
             await bot.http.bulk_upsert_global_commands(bot.user.id, [])
@@ -5372,7 +6720,6 @@ async def sync_commands_instant_to_guilds(target_guild: Optional[discord.Guild] 
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
 
-    # Auto-sync slash commands immediately to guilds whenever commands change
     current_sig = compute_command_tree_signature()
     saved_sig = get_bot_meta("command_tree_sig")
     if current_sig != saved_sig and bot.guilds:
@@ -5384,6 +6731,11 @@ async def on_ready():
         s = get_guild_settings(guild.id)
         if s.get("wfl_channel_id"):
             await resolve_wfl_emojis(guild)
+        if s.get("signs_channel_id"):
+            signs_ch = guild.get_channel(s["signs_channel_id"])
+            if isinstance(signs_ch, discord.TextChannel):
+                synced_signs = await scan_signs_channel_history(signs_ch, limit=150)
+                print(f"[SignsSync] Scanned #{signs_ch.name}: {synced_signs} partner(s) synced ({len(SIGN_PARTNERS_CACHE)} total)")
 
     checked_units, changed_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
     if checked_units:
@@ -5393,6 +6745,8 @@ async def on_ready():
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
         if not isinstance(ch, discord.VoiceChannel):
+            if guild:
+                await delete_lfg_posts_for_voice(guild, ch_id)
             remove_temp_voice_record(ch_id)
             continue
         humans = [m for m in ch.members if not m.bot]
@@ -5420,9 +6774,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await delete_temp_voice_channel(before.channel, reason="All members left temporary voice channel")
         else:
             touch_temp_voice_activity(before.channel.id)
+            await refresh_lfg_posts_for_voice(before.channel)
 
     if after.channel and after.channel.id in TEMP_VOICE_CACHE:
         touch_temp_voice_activity(after.channel.id)
+        await refresh_lfg_posts_for_voice(after.channel)
 
     if jtc_id and after.channel and after.channel.id == jtc_id:
         if not before.channel or before.channel.id != jtc_id:
@@ -5440,8 +6796,20 @@ async def on_message(message: discord.Message):
         if await handle_antiscam_check(message, settings):
             return
 
+        await handle_dynamic_autoslowmode(message, settings)
+
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
+
+        # Auto-parse new sign partner updates posted in #signs-value
+        if settings.get("signs_channel_id") and message.channel.id == settings["signs_channel_id"]:
+            if message.content and "sign" in message.content.lower():
+                parse_and_apply_sign_changelog(
+                    message.content,
+                    guild=message.guild,
+                    mentions=list(message.mentions),
+                    source="signs-channel-live",
+                )
 
         if settings["ideas_channel_id"] and message.channel.id == settings["ideas_channel_id"]:
             try:
@@ -5453,6 +6821,21 @@ async def on_message(message: discord.Message):
             enqueue_wfl_reactions(message, smart_filter=settings.get("wfl_smart_filter", True))
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.author.bot or not after.guild:
+        return
+    settings = get_guild_settings(after.guild.id)
+    if settings.get("signs_channel_id") and after.channel.id == settings["signs_channel_id"]:
+        if after.content and "sign" in after.content.lower():
+            parse_and_apply_sign_changelog(
+                after.content,
+                guild=after.guild,
+                mentions=list(after.mentions),
+                source="signs-channel-edit",
+            )
 
 
 @bot.event
@@ -5497,9 +6880,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @tasks.loop(seconds=20)
 async def background_scheduler():
     now_ts = int(time.time())
+    now_f = time.time()
 
     # 1. Periodic 2-minute website check for Value List price/demand updates
-    if time.time() - LAST_VALUE_WEB_SYNC >= VALUE_SYNC_INTERVAL_SECONDS:
+    if now_f - LAST_VALUE_WEB_SYNC >= VALUE_SYNC_INTERVAL_SECONDS:
         target_url = DEFAULT_VALUE_LIST_URL
         for g_settings in SETTINGS_CACHE.values():
             if g_settings.get("value_list_url"):
@@ -5507,24 +6891,45 @@ async def background_scheduler():
                 break
         asyncio.create_task(sync_value_list_from_website(target_url))
 
-    # 1.5 Periodic RAM cooldown map cleanup (prevents memory growth on 80k+ servers)
+    # 1.5 Periodic RAM cooldown & traffic map cleanup
     if len(VOICE_CREATE_COOLDOWNS) > 2000:
-        cutoff_vc = time.time() - 60.0
+        cutoff_vc = now_f - 60.0
         for uid in [u for u, t in VOICE_CREATE_COOLDOWNS.items() if t < cutoff_vc]:
             VOICE_CREATE_COOLDOWNS.pop(uid, None)
+    if len(LFG_POST_COOLDOWNS) > 2000:
+        cutoff_lfg = now_f - 60.0
+        for uid in [u for u, t in LFG_POST_COOLDOWNS.items() if t < cutoff_lfg]:
+            LFG_POST_COOLDOWNS.pop(uid, None)
     if len(STARBOARD_LOCKS) > 50:
         active_gids = {g.id for g in bot.guilds}
         for gid in [g for g in STARBOARD_LOCKS if g not in active_gids]:
             STARBOARD_LOCKS.pop(gid, None)
-    now_f = time.time()
     for gid in [g for g, until in WFL_BACKOFF_UNTIL.items() if until < now_f]:
         WFL_BACKOFF_UNTIL.pop(gid, None)
 
-    # 2. Backup sweep: delete temporary voice rooms only when completely empty
+    # 1.8 Restore Dynamic Auto-Slowmode once chat traffic calms down
+    for ch_id, info in list(ACTIVE_AUTO_SLOWMODES.items()):
+        if now_f - info["activated_at"] < 45.0:
+            continue
+        dq = CHANNEL_MSG_TIMESTAMPS.get(ch_id)
+        recent_msgs = sum(1 for t in dq if (now_f - t) <= 15.0) if dq else 0
+        if recent_msgs < 8:
+            ACTIVE_AUTO_SLOWMODES.pop(ch_id, None)
+            guild = bot.get_guild(info["guild_id"])
+            ch = guild.get_channel(ch_id) if guild else None
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    await ch.edit(slowmode_delay=info["orig_delay"], reason="Dynamic Auto-Slowmode: traffic normalized")
+                except Exception:
+                    pass
+
+    # 2. Backup sweep: delete temporary voice rooms & linked LFG posts when completely empty
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
         if not isinstance(ch, discord.VoiceChannel):
+            if guild:
+                await delete_lfg_posts_for_voice(guild, ch_id)
             remove_temp_voice_record(ch_id)
             continue
 
