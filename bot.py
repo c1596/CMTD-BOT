@@ -436,7 +436,6 @@ async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) 
         if em:
             found.append(em)
 
-    # If any of the 3 emojis are missing from local cache, fetch directly from Discord API
     if len(found) < 3:
         try:
             fetched_guild_emojis = await guild.fetch_emojis()
@@ -458,7 +457,6 @@ async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) 
             if em:
                 found.append(em)
 
-    # Only cache when all 3 are resolved so transient empty caches never stick
     if len(found) == 3:
         WFL_EMOJI_CACHE[guild.id] = found
     return found
@@ -478,10 +476,8 @@ async def apply_wfl_reactions(message: discord.Message):
                 await asyncio.sleep(0.25)
                 break
             except discord.NotFound:
-                # Message was deleted by user/automod
                 return
             except discord.Forbidden:
-                # Bot lacks Add Reactions or Use External Emojis permission in this channel
                 return
             except discord.HTTPException:
                 await asyncio.sleep(0.6 * (attempt + 1))
@@ -545,7 +541,6 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
         return False
     if not message.guild or not isinstance(message.author, discord.Member):
         return False
-    # Staff immunity
     if message.author.guild_permissions.manage_messages or message.author.guild_permissions.administrator:
         return False
 
@@ -614,7 +609,6 @@ def get_lockdown_whitelist(guild_id: int) -> Dict[int, str]:
 
 
 def toggle_lockdown_whitelist(guild_id: int, target_id: int, target_type: str) -> bool:
-    """Returns True if added to whitelist, False if removed."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
@@ -643,7 +637,7 @@ def encode_perm_bool(val: Optional[bool]) -> int:
         return 1
     if val is False:
         return 0
-    return -1  # None (inherited)
+    return -1
 
 
 def decode_perm_bool(code: int) -> Optional[bool]:
@@ -696,8 +690,6 @@ async def closeall_cmd(
                 skipped_whitelisted += 1
                 continue
 
-            # Check if @everyone can actually send messages right now.
-            # Channels like #announcements, #update-logs, #rules have send_messages=False and are skipped!
             effective_perms = ch.permissions_for(everyone)
             if not effective_perms.send_messages:
                 skipped_readonly += 1
@@ -752,7 +744,6 @@ async def closeall_cmd(
             except Exception:
                 failed_count += 1
 
-            # Rate-limit protection for 80k+ servers
             await asyncio.sleep(0.35)
             if idx % 8 == 0 and idx < len(channels_to_lock):
                 try:
@@ -1079,6 +1070,62 @@ async def delete_temp_voice_channel(channel: discord.VoiceChannel, reason: str):
         pass
 
 
+async def get_or_create_watch_together_invite(vc: discord.VoiceChannel, user: discord.abc.User) -> str:
+    """Reuses existing Watch Together invite or prunes old bot invites if guild hits Discord's 1,000 invite cap."""
+    # 1. Reuse an existing Watch Together invite in this voice channel if available
+    try:
+        for inv in await vc.invites():
+            if inv.target_application and inv.target_application.id == YOUTUBE_ACTIVITY_ID:
+                return inv.url
+    except Exception:
+        pass
+
+    # 2. Try creating (or reusing via unique=False) a Watch Together invite
+    try:
+        invite = await vc.create_invite(
+            max_age=3600,
+            unique=False,
+            target_type=discord.InviteTarget.embedded_application,
+            target_application_id=YOUTUBE_ACTIVITY_ID,
+            reason=f"Watch Together launched by {user}",
+        )
+        return invite.url
+    except discord.HTTPException as e:
+        if e.code != 30016:
+            raise
+
+    # 3. Error 30016: Server reached 1,000 active invites -> prune oldest bot-created invites & retry
+    deleted_any = False
+    try:
+        guild_invites = await vc.guild.invites()
+        bot_invites = [
+            inv for inv in guild_invites
+            if bot.user and inv.inviter and inv.inviter.id == bot.user.id
+        ]
+        bot_invites.sort(key=lambda inv: inv.created_at or datetime.now(timezone.utc))
+        for old_inv in bot_invites[:15]:
+            try:
+                await old_inv.delete(reason="Pruning stale bot activity invites (30016 limit)")
+                deleted_any = True
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if deleted_any:
+        invite = await vc.create_invite(
+            max_age=3600,
+            unique=False,
+            target_type=discord.InviteTarget.embedded_application,
+            target_application_id=YOUTUBE_ACTIVITY_ID,
+            reason=f"Watch Together launched by {user}",
+        )
+        return invite.url
+
+    raise RuntimeError("SERVER_INVITE_CAP_REACHED")
+
+
 def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any]) -> discord.Embed:
     status_badges = []
     status_badges.append("🔒 **Locked**" if room.get("is_locked") else "🔓 **Open**")
@@ -1189,7 +1236,6 @@ class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
     async def on_submit(self, interaction: discord.Interaction):
         now_ts = int(time.time())
         new_name = self.name_input.value.strip()
-        # Always save to user's personal preset even if rename cooldown is active
         save_user_voice_preset(interaction.user.id, custom_name=new_name)
 
         last_ren = self.room.get("last_renamed_at", 0)
@@ -1452,20 +1498,25 @@ class VoiceControlView(discord.ui.View):
             return
         vc = interaction.channel
         touch_temp_voice_activity(vc.id)
+        await interaction.response.defer(ephemeral=True)
         try:
-            invite = await vc.create_invite(
-                max_age=3600,
-                target_type=discord.InviteTarget.embedded_application,
-                target_application_id=YOUTUBE_ACTIVITY_ID,
-                reason=f"Watch Together launched by {interaction.user}",
-            )
-            await interaction.response.send_message(
+            invite_url = await get_or_create_watch_together_invite(vc, interaction.user)
+            await interaction.followup.send(
                 f"🎬 **YouTube / Music Watch Together** is ready for this room!\n"
-                f"Click here to launch the shared player: {invite.url}",
+                f"Click here to launch the shared player: {invite_url}",
                 ephemeral=True,
             )
+        except RuntimeError as e:
+            if str(e) == "SERVER_INVITE_CAP_REACHED":
+                await interaction.followup.send(
+                    "⚠️ This server has reached Discord's **1,000 active invites** limit.\n"
+                    "You can still start **Watch Together (YouTube)** right now by clicking the **🚀 Rocket (Activities)** icon at the bottom of your voice channel controls!",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(f"❌ Could not launch Watch Together: `{e}`", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Could not launch Watch Together (`Create Invite` or `Use Activities` permission needed): `{e}`",
                 ephemeral=True,
             )
@@ -1502,7 +1553,6 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
     guild = member.guild
     now = time.time()
 
-    # Check if user already owns an active room in this guild
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         if room["guild_id"] == guild.id and room["owner_id"] == member.id:
             existing_vc = guild.get_channel(ch_id)
@@ -1516,7 +1566,6 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
             else:
                 remove_temp_voice_record(ch_id)
 
-    # Anti-spam cooldown (15 seconds per user)
     last_created = VOICE_CREATE_COOLDOWNS.get(member.id, 0.0)
     if now - last_created < 15.0:
         return
@@ -1550,7 +1599,6 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
         ),
     }
 
-    # Server Booster Perk: automatic max HD audio bitrate
     bitrate = min(guild.bitrate_limit, 256000) if member.premium_since is not None else 64000
 
     try:
@@ -3371,13 +3419,11 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 @bot.event
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
-    # Warm up W/F/L emoji caches across guilds
     for guild in bot.guilds:
         s = get_guild_settings(guild.id)
         if s.get("wfl_channel_id"):
             await resolve_wfl_emojis(guild)
 
-    # Reconcile temporary voice rooms on startup
     now_ts = int(time.time())
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
@@ -3427,22 +3473,18 @@ async def on_message(message: discord.Message):
     if message.guild:
         settings = get_guild_settings(message.guild.id)
 
-        # 1. Anti-Scam & Phishing Link Shield (fast RAM check)
         if await handle_antiscam_check(message, settings):
             return
 
-        # 2. Track text chat activity inside temporary voice channels
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
 
-        # 3. Ideas Channel auto-star
         if settings["ideas_channel_id"] and message.channel.id == settings["ideas_channel_id"]:
             try:
                 await message.add_reaction("⭐")
             except Exception:
                 pass
 
-        # 4. W/F/L Channel reliable auto-reactions (non-blocking task with retry)
         if settings["wfl_channel_id"] and message.channel.id == settings["wfl_channel_id"]:
             asyncio.create_task(apply_wfl_reactions(message))
 
