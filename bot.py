@@ -7,7 +7,7 @@ import asyncio
 import sqlite3
 import subprocess
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List, Tuple, Set
+from typing import Optional, Dict, Any, List, Tuple, Set, Union
 
 try:
     from zoneinfo import ZoneInfo
@@ -65,11 +65,13 @@ VALUE_ALIAS_MAP: Dict[str, str] = {}
 LAST_VALUE_WEB_SYNC: float = 0.0
 DEFAULT_VALUE_LIST_URL = "https://cameraman-td.vaultedvaluesx.com/value-list"
 
-# Temporary Voice RAM State
+# Trade Calculator Anti-Spam Cooldowns (User ID -> Last Timestamp)
+CALC_COOLDOWNS: Dict[int, float] = {}
+CALC_COOLDOWN_SECONDS = 6.0
+
+# Temporary Voice RAM State (Deletes only when empty or closed by owner)
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
 VOICE_CREATE_COOLDOWNS: Dict[int, float] = {}
-VOICE_WARNING_SECONDS = 240     # 4 minutes: send Keep Alive warning
-VOICE_INACTIVITY_SECONDS = 300  # 5 minutes: delete inactive room
 
 WFL_EMOJI_NAMES = ("w1_win", "w1_fair", "w1_lose")
 POLL_NUM_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣")
@@ -190,7 +192,7 @@ def init_db():
             """
         )
 
-        # Lockdown Snapshots & Whitelist
+        # Lockdown Snapshots (Legacy + Multi-Role Full Channel Snapshots) & Whitelist
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS lockdown_snapshots (
@@ -200,6 +202,20 @@ def init_db():
                 prev_send_in_threads INTEGER,
                 prev_create_threads INTEGER,
                 PRIMARY KEY (guild_id, channel_id)
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lockdown_role_snapshots (
+                guild_id INTEGER,
+                channel_id INTEGER,
+                role_id INTEGER,
+                prev_send_messages INTEGER,
+                prev_send_in_threads INTEGER,
+                prev_create_threads INTEGER,
+                prev_connect INTEGER,
+                PRIMARY KEY (guild_id, channel_id, role_id)
             )
             """
         )
@@ -771,7 +787,7 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
         return 0
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.6; +https://discord.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.8; +https://discord.com)",
         "Accept": "text/html,application/xhtml+xml",
     }
     try:
@@ -1175,6 +1191,15 @@ class ValueHubView(discord.ui.View):
         check_btn.callback = self.on_check_click
         self.add_item(check_btn)
 
+        calc_btn = discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label="Trade Calculator",
+            emoji="⚖️",
+            custom_id="val_hub:trade_calc",
+        )
+        calc_btn.callback = self.on_calc_click
+        self.add_item(calc_btn)
+
         top_btn = discord.ui.Button(
             style=discord.ButtonStyle.secondary,
             label="Top Values",
@@ -1187,10 +1212,290 @@ class ValueHubView(discord.ui.View):
     async def on_check_click(self, interaction: discord.Interaction):
         await interaction.response.send_modal(QuickValueLookupModal())
 
+    async def on_calc_click(self, interaction: discord.Interaction):
+        remaining = check_calc_cooldown(interaction.user.id)
+        if remaining > 0:
+            return await interaction.response.send_message(
+                f"⏳ Please wait **{remaining:.1f}s** before using the Trade Calculator again.",
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(TradeCalcModal())
+
     async def on_top_click(self, interaction: discord.Interaction):
         site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
         embed = build_top_values_embed(interaction.guild)
         view = build_link_view("Open Full Value List", site_url)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# -------------------------------------------------------------
+# 3.1. Trade Calculator Engine (/calc — Public with Anti-Spam)
+# -------------------------------------------------------------
+GAMEPASS_EXACT_NAMES = {"2x money", "2x lucky", "2x speed", "x2 candy"}
+
+
+def check_calc_cooldown(user_id: int) -> float:
+    now = time.time()
+    last_used = CALC_COOLDOWNS.get(user_id, 0.0)
+    elapsed = now - last_used
+    if elapsed < CALC_COOLDOWN_SECONDS:
+        return CALC_COOLDOWN_SECONDS - elapsed
+    return 0.0
+
+
+def record_calc_usage(user_id: int):
+    now = time.time()
+    CALC_COOLDOWNS[user_id] = now
+    if len(CALC_COOLDOWNS) > 5000:
+        cutoff = now - (CALC_COOLDOWN_SECONDS * 2)
+        stale_keys = [uid for uid, ts in CALC_COOLDOWNS.items() if ts < cutoff]
+        for uid in stale_keys:
+            CALC_COOLDOWNS.pop(uid, None)
+
+
+def parse_numeric_range(raw: str) -> Tuple[float, float, bool]:
+    cleaned = raw.strip().lower()
+    if cleaned in ("o/c", "oc", "n/a", "?", "none"):
+        return 0.0, 0.0, True
+    nums = re.findall(r"\d+(?:,\d+)*(?:\.\d+)?", raw)
+    if not nums:
+        return 0.0, 0.0, False
+    if len(nums) == 1:
+        val = float(nums[0].replace(",", ""))
+        return val, val, False
+    v1 = float(nums[0].replace(",", ""))
+    v2 = float(nums[1].replace(",", ""))
+    return min(v1, v2), max(v1, v2), False
+
+
+def parse_demand_numeric(raw: str) -> Optional[float]:
+    m = re.search(r"\d+(?:\.\d+)?", raw or "")
+    return float(m.group(0)) if m else None
+
+
+def parse_trade_side(raw_text: str) -> Dict[str, Any]:
+    tokens = [t.strip() for t in re.split(r"[\n,;]+", raw_text) if t.strip()][:20]
+    items: List[Tuple[Dict[str, Any], int]] = []
+    unknown: List[str] = []
+
+    for token in tokens:
+        qty = 1
+        name_part = token
+
+        if token.lower() not in GAMEPASS_EXACT_NAMES:
+            prefix_m = re.match(r"^(\d+)\s*x?\s+(.+)$", token, re.IGNORECASE)
+            suffix_m = re.match(r"^(.+?)\s+x?(\d+)$", token, re.IGNORECASE)
+            if prefix_m:
+                qty = min(max(int(prefix_m.group(1)), 1), 99)
+                name_part = prefix_m.group(2).strip()
+            elif suffix_m:
+                name_part = suffix_m.group(1).strip()
+                qty = min(max(int(suffix_m.group(2)), 1), 99)
+
+        unit = find_value_item(name_part)
+        if unit:
+            items.append((unit, qty))
+        else:
+            unknown.append(token[:40])
+
+    total_min = 0.0
+    total_max = 0.0
+    demand_sum = 0.0
+    demand_qty = 0
+    oc_count = 0
+    warnings: List[str] = []
+
+    for unit, qty in items:
+        min_v, max_v, is_oc = parse_numeric_range(unit["value_text"])
+        if is_oc:
+            oc_count += qty
+        else:
+            total_min += min_v * qty
+            total_max += max_v * qty
+
+        dem_num = parse_demand_numeric(unit.get("demand_text", ""))
+        if dem_num is not None:
+            demand_sum += dem_num * qty
+            demand_qty += qty
+
+        stab_low = unit.get("stability_text", "").lower()
+        if ("dropping" in stab_low or "underpaid" in stab_low) and unit["name"] not in warnings:
+            warnings.append(unit["name"])
+
+    avg_value = (total_min + total_max) / 2.0
+    avg_demand = (demand_sum / demand_qty) if demand_qty > 0 else 0.0
+
+    return {
+        "raw_text": raw_text,
+        "items": items,
+        "unknown": unknown,
+        "total_min": total_min,
+        "total_max": total_max,
+        "avg_value": avg_value,
+        "avg_demand": avg_demand,
+        "oc_count": oc_count,
+        "warnings": warnings,
+    }
+
+
+def format_trade_side_total(side: Dict[str, Any]) -> str:
+    if side["total_min"] == side["total_max"]:
+        base = f"{int(side['total_min']):,}" if side["total_min"].is_integer() else f"{side['total_min']:,.1f}"
+    else:
+        lo = f"{int(side['total_min']):,}" if side["total_min"].is_integer() else f"{side['total_min']:,.1f}"
+        hi = f"{int(side['total_max']):,}" if side["total_max"].is_integer() else f"{side['total_max']:,.1f}"
+        base = f"{lo} – {hi}"
+    if side["oc_count"] > 0:
+        base += f" + {side['oc_count']} o/c"
+    return base
+
+
+def calculate_trade_offer(give_raw: str, get_raw: str) -> Dict[str, Any]:
+    give = parse_trade_side(give_raw)
+    get = parse_trade_side(get_raw)
+
+    diff = get["avg_value"] - give["avg_value"]
+    denom = max(give["avg_value"], get["avg_value"], 1.0)
+    pct_diff = (diff / denom) * 100.0
+
+    if pct_diff > 5.0:
+        verdict = "WIN"
+        emoji = "🟢"
+        color = 0x2ECC71
+    elif pct_diff < -5.0:
+        verdict = "LOSE"
+        emoji = "🔴"
+        color = 0xE74C3C
+    else:
+        verdict = "FAIR"
+        emoji = "🟡"
+        color = 0xF1C40F
+
+    return {
+        "give": give,
+        "get": get,
+        "diff": diff,
+        "pct_diff": pct_diff,
+        "verdict": verdict,
+        "emoji": emoji,
+        "color": color,
+    }
+
+
+def build_trade_calc_embed(guild: Optional[discord.Guild], calc: Dict[str, Any], wfl_ch_id: Optional[int] = None) -> discord.Embed:
+    give = calc["give"]
+    get = calc["get"]
+    diff = calc["diff"]
+    sign = "+" if diff > 0 else ""
+    diff_num = f"{sign}{int(round(diff)):,}"
+    pct_str = f"{sign}{calc['pct_diff']:.1f}%"
+
+    def _format_lines(side: Dict[str, Any]) -> str:
+        if not side["items"]:
+            return "*No recognized units*"
+        lines = []
+        for unit, qty in side["items"][:12]:
+            prefix = f"{qty}x " if qty > 1 else ""
+            lines.append(f"• **{prefix}{unit['name']}** — `{unit['value_text']}` *(Dem {unit['demand_text']})*")
+        if len(side["items"]) > 12:
+            lines.append(f"*...and {len(side['items']) - 12} more*")
+        return "\n".join(lines)
+
+    give_block = (
+        f"{_format_lines(give)}\n\n"
+        f"💰 **Total:** `{format_trade_side_total(give)}`\n"
+        f"🔥 **Avg Demand:** `{give['avg_demand']:.1f}/10`"
+    )
+    get_block = (
+        f"{_format_lines(get)}\n\n"
+        f"💰 **Total:** `{format_trade_side_total(get)}`\n"
+        f"🔥 **Avg Demand:** `{get['avg_demand']:.1f}/10`"
+    )
+
+    embed = discord.Embed(
+        title=f"⚖️ Trade Verdict: {calc['emoji']} {calc['verdict']} ({diff_num} | {pct_str})",
+        color=calc["color"],
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="📤 You Give", value=give_block[:1024], inline=True)
+    embed.add_field(name="📥 You Get", value=get_block[:1024], inline=True)
+
+    notes: List[str] = []
+    all_unknown = give["unknown"] + get["unknown"]
+    if all_unknown:
+        notes.append(f"⚠️ **Unrecognized:** `{', '.join(all_unknown[:6])}` (check spelling via `/value`)")
+    if get["warnings"]:
+        notes.append(f"📉 **Stability Alert:** You are receiving dropping/underpaid unit(s): **{', '.join(get['warnings'][:5])}**")
+
+    wfl_hint = f"Want community opinions? Post your offer in <#{wfl_ch_id}>!" if wfl_ch_id else "Want community opinions? Post your offer in the W/F/L channel!"
+    notes.append(f"💬 {wfl_hint}")
+    embed.add_field(name="📋 Summary & Notes", value="\n".join(notes)[:1024], inline=False)
+
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • Live Value List Calculator",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
+
+
+class TradeCalcResultView(discord.ui.View):
+    def __init__(self, give_raw: str, get_raw: str):
+        super().__init__(timeout=180)
+        self.give_raw = give_raw
+        self.get_raw = get_raw
+
+    @discord.ui.button(label="Edit Offer", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit_offer_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            TradeCalcModal(give_default=self.give_raw, get_default=self.get_raw)
+        )
+
+
+class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
+    give_input = discord.ui.TextInput(
+        label="You Give (comma or new line, e.g. 2x UTTV)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+        placeholder="2x UTTV, Engineer Cameraman, Scientist Crate",
+    )
+    get_input = discord.ui.TextInput(
+        label="You Get (comma or new line, e.g. Pharaoh)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500,
+        placeholder="Pharaoh Cameraman, 2x Lucky",
+    )
+
+    def __init__(self, give_default: str = "", get_default: str = ""):
+        super().__init__()
+        if give_default:
+            self.give_input.default = give_default
+        if get_default:
+            self.get_input.default = get_default
+
+    async def on_submit(self, interaction: discord.Interaction):
+        remaining = check_calc_cooldown(interaction.user.id)
+        if remaining > 0:
+            return await interaction.response.send_message(
+                f"⏳ Anti-spam cooldown: please wait **{remaining:.1f}s** before calculating again.",
+                ephemeral=True,
+            )
+
+        give_raw = self.give_input.value.strip()
+        get_raw = self.get_input.value.strip()
+        calc = calculate_trade_offer(give_raw, get_raw)
+
+        if not calc["give"]["items"] and not calc["get"]["items"]:
+            return await interaction.response.send_message(
+                "❌ Could not recognize any units in your offer. Check unit names or shortcuts with `/value`.",
+                ephemeral=True,
+            )
+
+        record_calc_usage(interaction.user.id)
+        wfl_ch_id = get_guild_settings(interaction.guild.id).get("wfl_channel_id") if interaction.guild else None
+        embed = build_trade_calc_embed(interaction.guild, calc, wfl_ch_id=wfl_ch_id)
+        view = TradeCalcResultView(give_raw=give_raw, get_raw=get_raw)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
@@ -1341,13 +1646,31 @@ async def resolve_wfl_emojis(guild: discord.Guild, force_refresh: bool = False) 
     return found
 
 
+WFL_CHATTER_WORDS = {
+    "w", "f", "l", "win", "fair", "lose", "loss", "wfl", "worl",
+    "bw", "bl", "sw", "sl", "big w", "huge w", "massive w",
+    "big l", "huge l", "massive l", "small w", "small l",
+    "fairish", "add", "adds", "no", "nah", "yes", "yep", "cap",
+    "idk", "ty", "thx", "thanks", "bradar", "bro", "ok", "okay",
+}
+
+
+def is_wfl_voter_chatter(message: discord.Message) -> bool:
+    if message.attachments or message.embeds:
+        return False
+    cleaned = re.sub(r"[^a-z0-9\s]", "", message.content.lower()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return False
+    return cleaned in WFL_CHATTER_WORDS
+
+
 async def _wfl_queue_worker(guild_id: int):
     queue = WFL_QUEUES[guild_id]
     while True:
         message, enqueued_at = await queue.get()
         try:
-            # Skip stale messages if a massive chat flood occurred
-            if time.time() - enqueued_at > 60:
+            if time.time() - enqueued_at > 180:
                 continue
             if not message.guild:
                 continue
@@ -1359,12 +1682,17 @@ async def _wfl_queue_worker(guild_id: int):
             for emoji in emojis:
                 try:
                     await message.add_reaction(emoji)
-                    # Paced at ~3.1 req/s to stay safely under Discord's 4 req/s reaction bucket
-                    await asyncio.sleep(0.32)
+                    await asyncio.sleep(0.55)
                 except (discord.NotFound, discord.Forbidden):
                     break
-                except discord.HTTPException:
-                    await asyncio.sleep(1.0)
+                except discord.HTTPException as e:
+                    retry_after = float(getattr(e, "retry_after", 1.5) or 1.5)
+                    await asyncio.sleep(retry_after + 0.5)
+                    try:
+                        await message.add_reaction(emoji)
+                        await asyncio.sleep(0.55)
+                    except Exception:
+                        break
         except Exception:
             pass
         finally:
@@ -1374,10 +1702,13 @@ async def _wfl_queue_worker(guild_id: int):
 def enqueue_wfl_reactions(message: discord.Message):
     if not message.guild:
         return
+    if is_wfl_voter_chatter(message):
+        return
+
     guild_id = message.guild.id
     queue = WFL_QUEUES.get(guild_id)
     if queue is None:
-        queue = asyncio.Queue(maxsize=35)
+        queue = asyncio.Queue(maxsize=120)
         WFL_QUEUES[guild_id] = queue
 
     worker = WFL_WORKERS.get(guild_id)
@@ -1540,11 +1871,17 @@ bot = CommunityBot()
 
 
 # -------------------------------------------------------------
-# 7. Server Lockdown System (/closeall, /openall, /lockdown_ignore)
+# 7. Full Server Lockdown System (/closeall, /openall, /lockdown_ignore)
+#    Locks ALL open Text, Voice (connect + chat), Forum & Stage channels
+#    for @everyone AND all non-staff roles (e.g. @Verified / @Member),
+#    while keeping read-only channels (#announcements, #update-logs) untouched!
 # -------------------------------------------------------------
 def is_lockdown_active(guild_id: int) -> bool:
     with get_db() as conn:
         c = conn.cursor()
+        c.execute("SELECT 1 FROM lockdown_role_snapshots WHERE guild_id = ? LIMIT 1", (guild_id,))
+        if c.fetchone() is not None:
+            return True
         c.execute("SELECT 1 FROM lockdown_snapshots WHERE guild_id = ? LIMIT 1", (guild_id,))
         return c.fetchone() is not None
 
@@ -1596,16 +1933,43 @@ def decode_perm_bool(code: int) -> Optional[bool]:
     return None
 
 
-@bot.tree.command(name="closeall", description="Safely lock all open public channels while keeping read-only channels untouched")
+def is_staff_or_bot_role(guild: discord.Guild, role: discord.Role) -> bool:
+    if role.managed:
+        return True
+    if guild.me and role in guild.me.roles:
+        return True
+    perms = role.permissions
+    return (
+        perms.administrator
+        or perms.manage_messages
+        or perms.manage_channels
+        or perms.moderate_members
+        or perms.kick_members
+        or perms.ban_members
+    )
+
+
+def get_all_lockable_channels(guild: discord.Guild) -> List[discord.abc.GuildChannel]:
+    channels: List[discord.abc.GuildChannel] = []
+    channels.extend(guild.text_channels)
+    channels.extend(guild.voice_channels)
+    channels.extend(guild.forums)
+    channels.extend(guild.stage_channels)
+    return channels
+
+
+@bot.tree.command(name="closeall", description="Lock ALL open text, voice & forum channels for everyone while keeping read-only channels untouched")
 @app_commands.describe(
     reason="Reason shown in locked channels (optional)",
-    announce="Send a lock notice message into each locked channel (default: True)",
+    announce="Send a lock notice message into locked channels (default: True)",
+    disconnect_voice="Disconnect non-staff members currently inside voice channels (default: True)",
 )
 @app_commands.default_permissions(administrator=True)
 async def closeall_cmd(
     interaction: discord.Interaction,
     reason: str = "Temporary server lockdown by administration.",
     announce: bool = True,
+    disconnect_voice: bool = True,
 ):
     if not interaction.guild:
         return
@@ -1623,39 +1987,73 @@ async def closeall_cmd(
         )
 
     LOCKDOWN_IN_PROGRESS.add(guild.id)
-    await interaction.response.send_message("🔒 Scanning channel permissions & starting safe lockdown...", ephemeral=True)
+    await interaction.response.send_message(
+        "🔒 Scanning all text, voice, forum & stage channels and starting full lockdown...",
+        ephemeral=True,
+    )
 
     try:
         whitelist = get_lockdown_whitelist(guild.id)
         everyone = guild.default_role
+        all_channels = get_all_lockable_channels(guild)
 
-        channels_to_lock: List[discord.TextChannel] = []
+        # (channel, list_of_open_non_staff_roles)
+        targets_to_lock: List[Tuple[discord.abc.GuildChannel, List[discord.Role]]] = []
         skipped_readonly = 0
         skipped_whitelisted = 0
 
-        for ch in guild.text_channels:
+        for ch in all_channels:
             if ch.id in whitelist or (ch.category_id and ch.category_id in whitelist):
                 skipped_whitelisted += 1
                 continue
 
-            effective_perms = ch.permissions_for(everyone)
-            if not effective_perms.send_messages:
+            is_voice_type = isinstance(ch, (discord.VoiceChannel, discord.StageChannel))
+            eff_everyone = ch.permissions_for(everyone)
+
+            if is_voice_type:
+                everyone_can_use = bool(eff_everyone.connect or eff_everyone.send_messages)
+            else:
+                everyone_can_use = bool(
+                    eff_everyone.send_messages
+                    or eff_everyone.send_messages_in_threads
+                    or eff_everyone.create_public_threads
+                )
+
+            open_custom_roles: List[discord.Role] = []
+            for target_obj, ow in ch.overwrites.items():
+                if not isinstance(target_obj, discord.Role) or target_obj.is_default():
+                    continue
+                if is_staff_or_bot_role(guild, target_obj):
+                    continue
+                if (
+                    ow.send_messages is True
+                    or ow.send_messages_in_threads is True
+                    or ow.create_public_threads is True
+                    or (is_voice_type and ow.connect is True)
+                ):
+                    open_custom_roles.append(target_obj)
+
+            # If @everyone cannot write/connect AND no non-staff role has explicit write/connect overwrite,
+            # this channel is already closed/read-only (e.g. #announcements, #update-logs, #rules).
+            if not everyone_can_use and not open_custom_roles:
                 skipped_readonly += 1
                 continue
 
-            channels_to_lock.append(ch)
+            targets_to_lock.append((ch, open_custom_roles))
 
-        if not channels_to_lock:
+        if not targets_to_lock:
             return await interaction.edit_original_response(
                 content=(
-                    f"ℹ️ No open public channels needed locking.\n"
-                    f"• Read-only skipped (e.g. announcements/logs): `{skipped_readonly}`\n"
+                    f"ℹ️ No open channels needed locking.\n"
+                    f"• Read-only / already locked skipped: `{skipped_readonly}`\n"
                     f"• Whitelisted skipped: `{skipped_whitelisted}`"
                 )
             )
 
-        snapshot_rows = []
-        locked_count = 0
+        role_snapshot_rows = []
+        locked_text_count = 0
+        locked_voice_count = 0
+        disconnected_users = 0
         failed_count = 0
 
         notice_embed = discord.Embed(
@@ -1666,37 +2064,84 @@ async def closeall_cmd(
         )
         notice_embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
 
-        for idx, ch in enumerate(channels_to_lock, start=1):
-            ow = ch.overwrites_for(everyone)
-            snapshot_rows.append(
-                (
-                    guild.id,
-                    ch.id,
-                    encode_perm_bool(ow.send_messages),
-                    encode_perm_bool(ow.send_messages_in_threads),
-                    encode_perm_bool(ow.create_public_threads),
-                )
-            )
-            ow.send_messages = False
-            ow.send_messages_in_threads = False
-            ow.create_public_threads = False
+        for idx, (ch, open_roles) in enumerate(targets_to_lock, start=1):
+            is_voice_type = isinstance(ch, (discord.VoiceChannel, discord.StageChannel))
+            roles_to_modify = [everyone] + open_roles
+            channel_locked_ok = False
 
-            try:
-                await ch.set_permissions(everyone, overwrite=ow, reason=f"Lockdown by {interaction.user}: {reason[:80]}")
-                locked_count += 1
-                if announce:
+            for role_obj in roles_to_modify:
+                ow = ch.overwrites_for(role_obj)
+                role_snapshot_rows.append(
+                    (
+                        guild.id,
+                        ch.id,
+                        role_obj.id,
+                        encode_perm_bool(ow.send_messages),
+                        encode_perm_bool(ow.send_messages_in_threads),
+                        encode_perm_bool(ow.create_public_threads),
+                        encode_perm_bool(ow.connect),
+                    )
+                )
+
+                if role_obj.is_default():
+                    ow.send_messages = False
+                    ow.send_messages_in_threads = False
+                    ow.create_public_threads = False
+                    if is_voice_type:
+                        ow.connect = False
+                else:
+                    if ow.send_messages is True:
+                        ow.send_messages = False
+                    if ow.send_messages_in_threads is True:
+                        ow.send_messages_in_threads = False
+                    if ow.create_public_threads is True:
+                        ow.create_public_threads = False
+                    if is_voice_type and ow.connect is True:
+                        ow.connect = False
+
+                try:
+                    await ch.set_permissions(
+                        role_obj,
+                        overwrite=ow,
+                        reason=f"Full Lockdown by {interaction.user}: {reason[:70]}",
+                    )
+                    channel_locked_ok = True
+                except Exception:
+                    failed_count += 1
+
+            if channel_locked_ok:
+                if is_voice_type:
+                    locked_voice_count += 1
+                    if disconnect_voice:
+                        for m in list(ch.members):
+                            if m.bot:
+                                continue
+                            if (
+                                m.guild_permissions.administrator
+                                or m.guild_permissions.manage_channels
+                                or m.guild_permissions.move_members
+                            ):
+                                continue
+                            try:
+                                await m.move_to(None, reason=f"Server lockdown by {interaction.user}")
+                                disconnected_users += 1
+                            except Exception:
+                                pass
+                else:
+                    locked_text_count += 1
+
+                if announce and isinstance(ch, (discord.TextChannel, discord.VoiceChannel)):
                     try:
-                        await ch.send(embed=notice_embed)
+                        if guild.me and ch.permissions_for(guild.me).send_messages:
+                            await ch.send(embed=notice_embed)
                     except Exception:
                         pass
-            except Exception:
-                failed_count += 1
 
             await asyncio.sleep(0.35)
-            if idx % 8 == 0 and idx < len(channels_to_lock):
+            if idx % 6 == 0 and idx < len(targets_to_lock):
                 try:
                     await interaction.edit_original_response(
-                        content=f"🔒 Locking channels... (**{idx}/{len(channels_to_lock)}**)"
+                        content=f"🔒 Locking all open channels... (**{idx}/{len(targets_to_lock)}**)"
                     )
                 except Exception:
                     pass
@@ -1704,33 +2149,39 @@ async def closeall_cmd(
         with get_db() as conn:
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO lockdown_snapshots
-                (guild_id, channel_id, prev_send_messages, prev_send_in_threads, prev_create_threads)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO lockdown_role_snapshots (
+                    guild_id, channel_id, role_id,
+                    prev_send_messages, prev_send_in_threads, prev_create_threads, prev_connect
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                snapshot_rows,
+                role_snapshot_rows,
             )
             conn.commit()
 
         summary = discord.Embed(
-            title="🔒 Server Lockdown Complete",
+            title="🔒 Full Server Lockdown Complete",
             color=0xE74C3C,
             timestamp=datetime.now(timezone.utc),
         )
-        summary.add_field(name="🔒 Channels Locked", value=f"`{locked_count}`", inline=True)
+        summary.add_field(name="💬 Text / Forum Locked", value=f"`{locked_text_count}`", inline=True)
+        summary.add_field(name="🔊 Voice / Stage Locked", value=f"`{locked_voice_count}`", inline=True)
         summary.add_field(name="🛡️ Read-Only Preserved", value=f"`{skipped_readonly}`", inline=True)
-        summary.add_field(name="📋 Whitelisted Skipped", value=f"`{skipped_whitelisted}`", inline=True)
+        if disconnected_users:
+            summary.add_field(name="👢 Voice Disconnected", value=f"`{disconnected_users}`", inline=True)
+        if skipped_whitelisted:
+            summary.add_field(name="📋 Whitelisted Skipped", value=f"`{skipped_whitelisted}`", inline=True)
         if failed_count:
-            summary.add_field(name="⚠️ Missing Perms", value=f"`{failed_count}`", inline=True)
+            summary.add_field(name="⚠️ Permission Errors", value=f"`{failed_count}`", inline=True)
         summary.add_field(name="📝 Reason", value=reason.strip(), inline=False)
-        summary.set_footer(text="Run /openall when ready to restore exact permissions.")
+        summary.set_footer(text="Run /openall when ready to restore exact permissions for all roles & channels.")
         await interaction.edit_original_response(content=None, embed=summary)
     finally:
         LOCKDOWN_IN_PROGRESS.discard(guild.id)
 
 
-@bot.tree.command(name="openall", description="Restore all channels locked by /closeall without opening announcements/logs")
-@app_commands.describe(announce="Send an unlock notice into each restored channel (default: True)")
+@bot.tree.command(name="openall", description="Restore all text & voice channels locked by /closeall without opening announcements/logs")
+@app_commands.describe(announce="Send an unlock notice into restored channels (default: True)")
 @app_commands.default_permissions(administrator=True)
 async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
     if not interaction.guild:
@@ -1747,79 +2198,112 @@ async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
         c = conn.cursor()
         c.execute(
             """
+            SELECT channel_id, role_id, prev_send_messages, prev_send_in_threads, prev_create_threads, prev_connect
+            FROM lockdown_role_snapshots WHERE guild_id = ?
+            """,
+            (guild.id,),
+        )
+        role_rows = c.fetchall()
+
+        c.execute(
+            """
             SELECT channel_id, prev_send_messages, prev_send_in_threads, prev_create_threads
             FROM lockdown_snapshots WHERE guild_id = ?
             """,
             (guild.id,),
         )
-        rows = c.fetchall()
+        legacy_rows = c.fetchall()
 
-    if not rows:
+    if not role_rows and not legacy_rows:
         return await interaction.response.send_message(
             "ℹ️ No active lockdown snapshot found for this server.",
             ephemeral=True,
         )
 
+    # Group snapshots by channel_id
+    by_channel: Dict[int, List[Tuple[int, int, int, int, int]]] = {}
+    for ch_id, role_id, p_send, p_thr, p_cre, p_conn in role_rows:
+        by_channel.setdefault(ch_id, []).append((role_id, p_send, p_thr, p_cre, p_conn))
+
+    everyone_id = guild.default_role.id
+    for ch_id, p_send, p_thr, p_cre in legacy_rows:
+        if ch_id not in by_channel:
+            by_channel[ch_id] = [(everyone_id, p_send, p_thr, p_cre, -1)]
+
     LOCKDOWN_IN_PROGRESS.add(guild.id)
     await interaction.response.send_message(
-        f"🔓 Restoring permissions for **{len(rows)}** channels from snapshot...",
+        f"🔓 Restoring permissions for **{len(by_channel)}** channels from snapshot...",
         ephemeral=True,
     )
 
     try:
-        everyone = guild.default_role
         restored_count = 0
         missing_count = 0
 
         unlock_embed = discord.Embed(
             title="🔓 Channel Unlocked",
-            description="Chat permissions have been restored by administration.",
+            description="Channel permissions have been restored by administration.",
             color=0x2ECC71,
             timestamp=datetime.now(timezone.utc),
         )
         unlock_embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
 
-        for idx, (ch_id, prev_send, prev_threads, prev_create) in enumerate(rows, start=1):
+        channel_items = list(by_channel.items())
+        for idx, (ch_id, role_entries) in enumerate(channel_items, start=1):
             ch = guild.get_channel(ch_id)
-            if not isinstance(ch, discord.TextChannel):
+            if not isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.ForumChannel, discord.StageChannel)):
                 missing_count += 1
                 continue
 
-            ow = ch.overwrites_for(everyone)
-            ow.send_messages = decode_perm_bool(prev_send)
-            ow.send_messages_in_threads = decode_perm_bool(prev_threads)
-            ow.create_public_threads = decode_perm_bool(prev_create)
+            ch_restored = False
+            for role_id, prev_send, prev_threads, prev_create, prev_connect in role_entries:
+                role_obj = guild.default_role if role_id == everyone_id else guild.get_role(role_id)
+                if not role_obj:
+                    continue
 
-            try:
-                if ow.is_empty():
-                    await ch.set_permissions(everyone, overwrite=None, reason=f"Lockdown lifted by {interaction.user}")
-                else:
-                    await ch.set_permissions(everyone, overwrite=ow, reason=f"Lockdown lifted by {interaction.user}")
+                ow = ch.overwrites_for(role_obj)
+                ow.send_messages = decode_perm_bool(prev_send)
+                ow.send_messages_in_threads = decode_perm_bool(prev_threads)
+                ow.create_public_threads = decode_perm_bool(prev_create)
+                ow.connect = decode_perm_bool(prev_connect)
+
+                try:
+                    if ow.is_empty():
+                        await ch.set_permissions(role_obj, overwrite=None, reason=f"Lockdown lifted by {interaction.user}")
+                    else:
+                        await ch.set_permissions(role_obj, overwrite=ow, reason=f"Lockdown lifted by {interaction.user}")
+                    ch_restored = True
+                except Exception:
+                    pass
+
+            if ch_restored:
                 restored_count += 1
-                if announce:
+                if announce and isinstance(ch, (discord.TextChannel, discord.VoiceChannel)):
                     try:
-                        await ch.send(embed=unlock_embed)
+                        if guild.me and ch.permissions_for(guild.me).send_messages:
+                            await ch.send(embed=unlock_embed)
                     except Exception:
                         pass
-            except Exception:
+            else:
                 missing_count += 1
 
             await asyncio.sleep(0.35)
-            if idx % 8 == 0 and idx < len(rows):
+            if idx % 6 == 0 and idx < len(channel_items):
                 try:
                     await interaction.edit_original_response(
-                        content=f"🔓 Restoring channels... (**{idx}/{len(rows)}**)"
+                        content=f"🔓 Restoring channels... (**{idx}/{len(channel_items)}**)"
                     )
                 except Exception:
                     pass
 
         with get_db() as conn:
+            conn.execute("DELETE FROM lockdown_role_snapshots WHERE guild_id = ?", (guild.id,))
             conn.execute("DELETE FROM lockdown_snapshots WHERE guild_id = ?", (guild.id,))
             conn.commit()
 
         summary = discord.Embed(
             title="🔓 Server Lockdown Lifted",
-            description="All locked channels have been restored to their exact pre-lockdown permissions. Read-only channels remained untouched.",
+            description="All locked text, voice, forum & stage channels have been restored to their exact pre-lockdown permissions. Read-only channels remained untouched.",
             color=0x2ECC71,
             timestamp=datetime.now(timezone.utc),
         )
@@ -1831,15 +2315,15 @@ async def openall_cmd(interaction: discord.Interaction, announce: bool = True):
         LOCKDOWN_IN_PROGRESS.discard(guild.id)
 
 
-@bot.tree.command(name="lockdown_ignore", description="Add or remove a channel/category from /closeall lockdown")
+@bot.tree.command(name="lockdown_ignore", description="Add or remove a text/voice channel or category from /closeall lockdown")
 @app_commands.describe(
-    channel="Text channel to ignore/unignore during /closeall",
+    channel="Text, Voice, Forum or Stage channel to ignore/unignore during /closeall",
     category="Entire category to ignore/unignore during /closeall",
 )
 @app_commands.default_permissions(administrator=True)
 async def lockdown_ignore_cmd(
     interaction: discord.Interaction,
-    channel: Optional[discord.TextChannel] = None,
+    channel: Optional[Union[discord.TextChannel, discord.VoiceChannel, discord.ForumChannel, discord.StageChannel]] = None,
     category: Optional[discord.CategoryChannel] = None,
 ):
     if not interaction.guild:
@@ -1861,7 +2345,7 @@ async def lockdown_ignore_cmd(
             cat = guild.get_channel(tid)
             items_desc.append(f"📁 **{cat.name if cat else tid}** (Category)")
         else:
-            items_desc.append(f"💬 <#{tid}>")
+            items_desc.append(f"💬/🔊 <#{tid}>")
 
     embed = discord.Embed(
         title="📋 Lockdown Whitelist (Ignored by /closeall)",
@@ -2088,7 +2572,7 @@ def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any
             f"**Status:** {' • '.join(status_badges)}\n\n"
             "• Your room name, limit & lock settings are **auto-saved** for your next session.\n"
             "• Use **Watch Together** to queue YouTube/music right inside this room.\n"
-            "-# ⏱️ Auto-deletes when empty or after **5 minutes** of inactivity (with a 1-min warning)."
+            "-# 🗑️ Auto-deletes automatically as soon as everyone leaves the room."
         ),
         color=0xE74C3C if room.get("is_locked") else 0x2ECC71,
     )
@@ -3880,14 +4364,14 @@ class ValueSetupView(discord.ui.View):
     async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
             return
-        site_url = get_guild_settings(self.guild_id)["value_list_url"]
+        site_url = get_guild_settings(interaction.guild.id)["value_list_url"]
         embed = discord.Embed(
-            title="💎 Official CMTD Value List",
+            title="💎 Official CMTD Value List & Trade Hub",
             description=(
-                "Check live unit values, demand, and stability right here in Discord or open the full website!\n\n"
-                "• Click **`🔍 Check Unit Value`** below to look up any unit privately.\n"
-                "• Click **`🏆 Top Values`** to view the Top 15 highest value units.\n"
-                "• Or type `/value` in chat with instant autocomplete."
+                "Check live unit values, demand, stability, and calculate trades right here in Discord!\n\n"
+                "• Click **`🔍 Check Unit Value`** to look up any unit privately.\n"
+                "• Click **`⚖️ Trade Calculator`** (or type `/calc`) to check **Win / Fair / Lose**.\n"
+                "• Click **`🏆 Top Values`** to view the Top 15 highest value units."
             ),
             color=0x3498DB,
         )
@@ -3926,7 +4410,7 @@ class TempVoiceSetupView(discord.ui.View):
         chosen = select.values[0]
         update_guild_settings(interaction.guild.id, jtc_channel_id=chosen.id)
         await interaction.response.edit_message(
-            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Rooms auto-save presets and delete after 5m of inactivity.",
+            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>! Rooms auto-save personal presets and stay open until everyone leaves.",
             view=self,
         )
 
@@ -4002,7 +4486,13 @@ class LockdownSetupView(discord.ui.View):
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text, discord.ChannelType.category],
+        channel_types=[
+            discord.ChannelType.text,
+            discord.ChannelType.voice,
+            discord.ChannelType.forum,
+            discord.ChannelType.stage_voice,
+            discord.ChannelType.category,
+        ],
         placeholder="📋 Toggle Channel or Category in Lockdown Whitelist...",
         row=0,
     )
@@ -4133,7 +4623,7 @@ class ControlPanelView(discord.ui.View):
     async def setup_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             "🔊 **Private Voice Rooms 2.0 Setup**\n"
-            "Select a trigger voice channel below. Rooms auto-save personal presets, support Quick Modes & Watch Together, and auto-delete after 5m of inactivity:",
+            "Select a trigger voice channel below. Rooms auto-save personal presets, support Quick Modes & Watch Together, and stay open until everyone leaves:",
             view=TempVoiceSetupView(),
             ephemeral=True,
         )
@@ -4157,7 +4647,7 @@ class ControlPanelView(discord.ui.View):
             return
         await interaction.response.send_message(
             "🔒 **Lockdown Whitelist Configuration**\n"
-            "Use `/closeall` to safely lock open public channels (read-only channels like `#announcements` are automatically preserved) and `/openall` to restore them.\n"
+            "Use `/closeall` to lock **all** open text, voice, forum & stage channels for everyone (read-only channels like `#announcements` are automatically preserved) and `/openall` to restore them.\n"
             "Select any extra open channels or categories below that `/closeall` should **never** touch:",
             view=LockdownSetupView(interaction.guild.id),
             ephemeral=True,
@@ -4210,6 +4700,17 @@ async def value_cmd(interaction: discord.Interaction, unit: str, public: bool = 
     embed = build_unit_value_embed(interaction.guild, item, site_url)
     view = build_link_view("Open Full Value List", site_url)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
+
+
+@bot.tree.command(name="calc", description="Calculate a trade (Win / Fair / Lose) using live CMTD values")
+async def calc_cmd(interaction: discord.Interaction):
+    remaining = check_calc_cooldown(interaction.user.id)
+    if remaining > 0:
+        return await interaction.response.send_message(
+            f"⏳ Anti-spam cooldown: please wait **{remaining:.1f}s** before using `/calc` again.",
+            ephemeral=True,
+        )
+    await interaction.response.send_modal(TradeCalcModal())
 
 
 @bot.tree.command(name="value_post", description="Publish formatted value list changes & auto-update the bot's value database")
@@ -4586,7 +5087,6 @@ async def on_ready():
     if synced_units:
         print(f"[ValueList] Synced {synced_units} items from website (Total cached: {len(VALUE_ITEMS_CACHE)})")
 
-    now_ts = int(time.time())
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
@@ -4594,8 +5094,8 @@ async def on_ready():
             remove_temp_voice_record(ch_id)
             continue
         humans = [m for m in ch.members if not m.bot]
-        if not humans or (now_ts - room["last_active_at"] >= VOICE_INACTIVITY_SECONDS):
-            await delete_temp_voice_channel(ch, reason="Startup cleanup of empty/inactive temp voice")
+        if not humans:
+            await delete_temp_voice_channel(ch, reason="Startup cleanup of empty temp voice")
 
 
 @bot.event
@@ -4700,7 +5200,7 @@ async def background_scheduler():
     if time.time() - LAST_VALUE_WEB_SYNC >= 900:
         asyncio.create_task(sync_value_list_from_website(DEFAULT_VALUE_LIST_URL))
 
-    # 2. Check temporary voice rooms: empty, 4-min warning, or 5-min inactivity deletion
+    # 2. Backup sweep: delete temporary voice rooms only when completely empty
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
@@ -4709,22 +5209,8 @@ async def background_scheduler():
             continue
 
         humans = [m for m in ch.members if not m.bot]
-        idle_sec = now_ts - room["last_active_at"]
-
         if len(humans) == 0:
             await delete_temp_voice_channel(ch, reason="Temporary voice channel empty")
-        elif idle_sec >= VOICE_INACTIVITY_SECONDS:
-            await delete_temp_voice_channel(ch, reason="Temporary voice channel inactive for 5 minutes")
-        elif idle_sec >= VOICE_WARNING_SECONDS and not room.get("warned_inactive"):
-            room["warned_inactive"] = True
-            save_temp_voice(room)
-            try:
-                await ch.send(
-                    content=f"⏳ <@{room['owner_id']}> This room has been quiet for 4 minutes and will auto-close in **1 minute** unless there is activity or you click below:",
-                    view=VoiceKeepAliveView(),
-                )
-            except Exception:
-                pass
 
     # 3. Check expired polls
     with get_db() as conn:
