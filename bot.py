@@ -42,6 +42,7 @@ except ImportError:
     pass
 
 START_TIME = time.time()
+BOT_OWNER_ID = 1145605899239563304
 
 # -------------------------------------------------------------
 # 2. High-Performance SQLite Database (WAL Mode + RAM Cache)
@@ -1096,7 +1097,6 @@ def parse_and_apply_sign_changelog(
 
     resolved_text = re.sub(r"<@!?(\d+)>", _replace_user_mention, resolved_text)
 
-    # Handle special ex-dev line if present
     results: List[Dict[str, Any]] = []
     low_full = resolved_text.lower()
     ex_dev_match = re.search(r"ex\s*dev\s*sign\s*is\s*:\s*([a-z0-9_.-]+)", low_full)
@@ -1118,7 +1118,6 @@ def parse_and_apply_sign_changelog(
             }
         )
 
-    # Line-by-line state machine parser (works WITH or WITHOUT blank lines between partners!)
     raw_lines = resolved_text.splitlines()
     pending_lines: List[str] = []
     idx = 0
@@ -1132,18 +1131,15 @@ def parse_and_apply_sign_changelog(
                 pending_lines.clear()
             continue
 
-        # Skip role pings, @everyone, @here, URLs, and pure chatter lines
         if re.fullmatch(r"(?:<@&\d+>|@everyone|@here|@\[.*?\]\s*.*)", s, re.IGNORECASE):
             continue
         if s.startswith(("http://", "https://")) or s.lower() in SIGN_CHATTER_LINES:
             continue
 
-        # Check if this line is a "Sign Value: ..." line
         m_sign = SIGN_VALUE_LINE_RE.match(s)
         if m_sign and pending_lines:
             raw_sign_val = m_sign.group(1).strip()
 
-            # Check if the very next line is "Description: ..."
             desc_after = ""
             if idx < len(raw_lines):
                 nxt = raw_lines[idx].strip()
@@ -1215,7 +1211,6 @@ def parse_and_apply_sign_changelog(
             )
             continue
 
-        # Check single-line format: "@Whatenix: +25%" or "Kaptoxa274 - +75%"
         if not pending_lines:
             m_single = SIGN_SINGLE_LINE_RE.match(s)
             if m_single:
@@ -1240,7 +1235,6 @@ def parse_and_apply_sign_changelog(
                     )
                     continue
 
-        # Otherwise accumulate candidate header/metadata lines (keep at most 3 pending lines)
         if len(pending_lines) >= 3:
             pending_lines.pop(0)
         pending_lines.append(s)
@@ -1484,7 +1478,7 @@ async def get_http_session() -> Optional["aiohttp.ClientSession"]:
         HTTP_SESSION = aiohttp.ClientSession(
             timeout=timeout,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.1; +https://discord.com)",
+                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.2; +https://discord.com)",
                 "Accept": "text/html,application/xhtml+xml,application/json",
                 "Cache-Control": "no-cache",
             },
@@ -6691,7 +6685,303 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 
 
 # -------------------------------------------------------------
-# 15. Event Listeners & Background Scheduler
+# 15. Owner-Only Server Inspector (!servers — ID 1145605899239563304)
+# -------------------------------------------------------------
+async def get_guild_invite_url(guild: discord.Guild) -> str:
+    if guild.vanity_url:
+        return guild.vanity_url
+
+    if guild.me and guild.me.guild_permissions.manage_guild:
+        try:
+            invites = await guild.invites()
+            permanent = [inv for inv in invites if inv.max_age == 0 and inv.max_uses == 0]
+            if permanent:
+                return permanent[0].url
+            if invites:
+                return invites[0].url
+        except Exception:
+            pass
+
+    candidate_channels: List[discord.TextChannel] = []
+    if isinstance(guild.system_channel, discord.TextChannel):
+        candidate_channels.append(guild.system_channel)
+    if isinstance(guild.rules_channel, discord.TextChannel) and guild.rules_channel not in candidate_channels:
+        candidate_channels.append(guild.rules_channel)
+    for ch in guild.text_channels:
+        if ch not in candidate_channels:
+            candidate_channels.append(ch)
+
+    for ch in candidate_channels:
+        if guild.me and ch.permissions_for(guild.me).create_instant_invite:
+            try:
+                inv = await ch.create_invite(
+                    max_age=86400,
+                    max_uses=0,
+                    unique=False,
+                    reason="Owner server inspection (!servers)",
+                )
+                return inv.url
+            except Exception:
+                continue
+
+    return "`No invite permission`"
+
+
+def summarize_guild_active_modules(guild: discord.Guild) -> List[str]:
+    s = get_guild_settings(guild.id)
+    active: List[str] = []
+    if s.get("ideas_channel_id") or s.get("showcase_channel_id"):
+        active.append(f"🌟 Starboard (`⭐{s['star_threshold']}`)")
+    if s.get("wfl_channel_id"):
+        active.append("⚖️ W/F/L")
+    if s.get("jtc_channel_id"):
+        lfg_cnt = sum(1 for k in ("lfg_channel_1_id", "lfg_channel_2_id") if s.get(k))
+        active.append(f"🔊 Voice 2.0 (LFG: {lfg_cnt})")
+    if s.get("value_channel_id") or s.get("signs_channel_id"):
+        active.append("💎 Value/Signs")
+    if s.get("antiscam_enabled"):
+        active.append("🛡️ Anti-Scam")
+    if is_lockdown_active(guild.id):
+        active.append("🔒 LOCKED")
+    if s.get("booster_role_id") or s.get("autorole_id"):
+        active.append("🏷️ Roles")
+    return active
+
+
+def build_guild_detailed_settings_embed(guild: discord.Guild, invite_url: str) -> discord.Embed:
+    s = get_guild_settings(guild.id)
+
+    def _ch_str(cid: Optional[int]) -> str:
+        if not cid:
+            return "`Not Set`"
+        ch = guild.get_channel(cid)
+        return f"#{ch.name} (`{cid}`)" if ch else f"`Deleted ({cid})`"
+
+    def _role_str(rid: Optional[int]) -> str:
+        if not rid:
+            return "`Not Set`"
+        r = guild.get_role(rid)
+        return f"@{r.name} (`{rid}`)" if r else f"`Deleted ({rid})`"
+
+    mgr_ids = get_value_manager_role_ids(guild.id)
+    mgr_str = ", ".join(_role_str(rid) for rid in mgr_ids) if mgr_ids else "`Default (Manage Messages)`"
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM starboard_entries WHERE guild_id = ?", (guild.id,))
+        sb_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM polls WHERE guild_id = ? AND is_closed = 0", (guild.id,))
+        poll_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM scheduled_events WHERE guild_id = ? AND started = 0", (guild.id,))
+        ev_count = c.fetchone()[0]
+
+    owner_txt = f"{guild.owner} (`{guild.owner_id}`)" if guild.owner else f"`{guild.owner_id}`"
+    created_ts = int(guild.created_at.timestamp())
+
+    embed = discord.Embed(
+        title=f"🖥️ Server Details: {guild.name}",
+        description=(
+            f"**Server ID:** `{guild.id}`\n"
+            f"**Members:** `{guild.member_count:,}`\n"
+            f"**Owner:** {owner_txt}\n"
+            f"**Created:** <t:{created_ts}:D>\n"
+            f"**Invite Link:** {invite_url}"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.add_field(
+        name="💡 Starboard & ⚖️ W/F/L",
+        value=(
+            f"• Ideas: {_ch_str(s.get('ideas_channel_id'))}\n"
+            f"• Showcase: {_ch_str(s.get('showcase_channel_id'))} (`⭐ {s['star_threshold']}`)\n"
+            f"• W/F/L: {_ch_str(s.get('wfl_channel_id'))} (`{'Smart' if s.get('wfl_smart_filter', True) else 'All'}`)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔊 Voice 2.0 & 📣 LFG",
+        value=(
+            f"• JTC Trigger: {_ch_str(s.get('jtc_channel_id'))}\n"
+            f"• LFG #1: {_ch_str(s.get('lfg_channel_1_id'))}\n"
+            f"• LFG #2: {_ch_str(s.get('lfg_channel_2_id'))}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💎 Value & ✍️ Signs",
+        value=(
+            f"• Value Changes: {_ch_str(s.get('value_channel_id'))}\n"
+            f"• Signs Channel: {_ch_str(s.get('signs_channel_id'))}\n"
+            f"• Ping Role: {_role_str(s.get('value_ping_role_id'))}\n"
+            f"• Team Roles: {mgr_str}\n"
+            f"• URL: `{s.get('value_list_url')}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ Security & 🏷️ Roles",
+        value=(
+            f"• Anti-Scam: `{'ON' if s.get('antiscam_enabled') else 'OFF'}` (Timeout: `{s.get('antiscam_timeout_mins')}m`)\n"
+            f"• Security Log: {_ch_str(s.get('antiscam_log_channel_id'))}\n"
+            f"• Lockdown Active: `{'YES' if is_lockdown_active(guild.id) else 'NO'}`\n"
+            f"• Booster Role: {_role_str(s.get('booster_role_id'))}\n"
+            f"• Auto-Role: {_role_str(s.get('autorole_id'))}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📊 Server DB Activity",
+        value=f"Showcased: `{sb_count}` • Active Polls: `{poll_count}` • Upcoming Events: `{ev_count}`",
+        inline=False,
+    )
+    return embed
+
+
+class ServerLeaveConfirmView(discord.ui.View):
+    def __init__(self, target_guild: discord.Guild):
+        super().__init__(timeout=60)
+        self.target_guild = target_guild
+
+    @discord.ui.button(label="Confirm Leave Server", style=discord.ButtonStyle.danger, emoji="🚪")
+    async def confirm_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != BOT_OWNER_ID:
+            return
+        g_name = self.target_guild.name
+        g_id = self.target_guild.id
+        try:
+            await self.target_guild.leave()
+            await interaction.response.edit_message(
+                content=f"🚪 Bot successfully left **{g_name}** (`{g_id}`).",
+                embed=None,
+                view=None,
+            )
+        except Exception as e:
+            await interaction.response.edit_message(
+                content=f"❌ Failed to leave **{g_name}**: `{e}`",
+                view=None,
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != BOT_OWNER_ID:
+            return
+        await interaction.response.edit_message(content="✅ Cancelled.", embed=None, view=None)
+
+
+class ServerInspectorView(discord.ui.View):
+    def __init__(self, guilds_sorted: List[discord.Guild], summary_embeds: List[discord.Embed]):
+        super().__init__(timeout=300)
+        self.summary_embeds = summary_embeds
+        self.selected_guild_id: Optional[int] = guilds_sorted[0].id if guilds_sorted else None
+
+        if guilds_sorted:
+            options = [
+                discord.SelectOption(
+                    label=f"{g.name[:70]} ({g.member_count:,} уч.)",
+                    value=str(g.id),
+                    description=f"ID: {g.id}",
+                )
+                for g in guilds_sorted[:25]
+            ]
+            select = discord.ui.Select(
+                placeholder="🔍 Inspect Server Settings & Invite...",
+                options=options,
+                row=0,
+            )
+            select.callback = self.on_select_guild
+            self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == BOT_OWNER_ID
+
+    async def on_select_guild(self, interaction: discord.Interaction):
+        gid = int(interaction.data["values"][0])
+        self.selected_guild_id = gid
+        target_guild = bot.get_guild(gid)
+        if not target_guild:
+            return await interaction.response.send_message("❌ Bot is no longer in that server.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        inv_url = await get_guild_invite_url(target_guild)
+        detail_embed = build_guild_detailed_settings_embed(target_guild, inv_url)
+        await interaction.followup.send(
+            embed=detail_embed,
+            view=ServerLeaveConfirmView(target_guild),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Send Report to DMs", style=discord.ButtonStyle.primary, emoji="📩", row=1)
+    async def send_dm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            for emb in self.summary_embeds:
+                await interaction.user.send(embed=emb)
+            await interaction.response.send_message("📩 Full server report sent to your DMs!", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Could not send DM (enable DMs from server members): `{e}`", ephemeral=True)
+
+
+@bot.command(name="servers")
+async def owner_servers_cmd(ctx: commands.Context):
+    if ctx.author.id != BOT_OWNER_ID:
+        return
+
+    guilds_sorted = sorted(bot.guilds, key=lambda g: g.member_count or 0, reverse=True)
+    if not guilds_sorted:
+        return await ctx.send("Bot is not in any servers.")
+
+    total_members = sum(g.member_count or 0 for g in guilds_sorted)
+    entries: List[str] = []
+
+    for idx, g in enumerate(guilds_sorted, start=1):
+        inv_url = await get_guild_invite_url(g)
+        modules = summarize_guild_active_modules(g)
+        mod_str = ", ".join(modules) if modules else "`No modules configured`"
+        entries.append(
+            f"**{idx}. {g.name}** (`{g.id}`)\n"
+            f"> 👥 **Members:** `{g.member_count:,}` | 👑 **Owner:** `{g.owner_id}`\n"
+            f"> 🔗 **Invite:** {inv_url}\n"
+            f"> ⚙️ **Settings:** {mod_str}"
+        )
+
+    embeds: List[discord.Embed] = []
+    chunk: List[str] = []
+    cur_len = 0
+
+    for entry in entries:
+        if cur_len + len(entry) + 2 > 3800 and chunk:
+            emb = discord.Embed(
+                title=f"🌐 Connected Servers ({len(guilds_sorted)} total • {total_members:,} members)",
+                description="\n\n".join(chunk),
+                color=0x2ECC71,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embeds.append(emb)
+            chunk = []
+            cur_len = 0
+        chunk.append(entry)
+        cur_len += len(entry) + 2
+
+    if chunk:
+        emb = discord.Embed(
+            title=f"🌐 Connected Servers ({len(guilds_sorted)} total • {total_members:,} members)",
+            description="\n\n".join(chunk),
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embeds.append(emb)
+
+    view = ServerInspectorView(guilds_sorted, embeds)
+    await ctx.send(embed=embeds[0], view=view)
+    for extra_emb in embeds[1:]:
+        await ctx.send(embed=extra_emb)
+
+
+# -------------------------------------------------------------
+# 16. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
 def compute_command_tree_signature() -> str:
     entries: List[str] = []
@@ -6728,6 +7018,8 @@ async def sync_commands_instant_to_guilds(target_guild: Optional[discord.Guild] 
 @bot.event
 async def on_ready():
     print(f"[Online] Logged in as {bot.user} (ID: {bot.user.id}) | Guilds: {len(bot.guilds)}")
+    for g in sorted(bot.guilds, key=lambda x: x.member_count or 0, reverse=True):
+        print(f"  -> [Guild] {g.name} (ID: {g.id}) | Members: {g.member_count:,}")
 
     current_sig = compute_command_tree_signature()
     saved_sig = get_bot_meta("command_tree_sig")
@@ -6764,6 +7056,17 @@ async def on_ready():
         humans = [m for m in ch.members if not m.bot]
         if not humans:
             await delete_temp_voice_channel(ch, reason="Startup cleanup of empty temp voice")
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    print(f"[GuildJoin] Added to {guild.name} (ID: {guild.id}) | Members: {guild.member_count:,}")
+    await sync_commands_instant_to_guilds(guild)
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    print(f"[GuildRemove] Removed from {guild.name} (ID: {guild.id})")
 
 
 @bot.event
@@ -6811,7 +7114,6 @@ async def on_message(message: discord.Message):
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
 
-        # Auto-parse new sign partner updates posted in #signs-value
         if settings.get("signs_channel_id") and message.channel.id == settings["signs_channel_id"]:
             full_text = _collect_message_full_text(message)
             if full_text.strip():
@@ -7045,7 +7347,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # -------------------------------------------------------------
-# 16. Entrypoint
+# 17. Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
