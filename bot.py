@@ -617,7 +617,6 @@ def find_value_item(query: str) -> Optional[Dict[str, Any]]:
         return None
     if q in VALUE_ALIAS_MAP:
         return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[q])
-    # Prefix / substring fallback
     for alias, key in VALUE_ALIAS_MAP.items():
         if alias.startswith(q):
             return VALUE_ITEMS_CACHE.get(key)
@@ -708,7 +707,6 @@ def upsert_value_item(
 
 
 async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int:
-    """Scrapes item cards & artworks directly from Vaulted Values X HTML."""
     global LAST_VALUE_WEB_SYNC
     if not aiohttp:
         return 0
@@ -727,7 +725,6 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
     except Exception:
         return 0
 
-    # Extract artwork URLs mapped by alt="<Name> artwork"
     img_map: Dict[str, str] = {}
     for m in re.finditer(r'<img[^>]+alt="([^"]+?)\s+artwork"[^>]+src="([^"]+)"', raw_html, re.IGNORECASE):
         u_name = normalize_unit_key(html_lib.unescape(m.group(1)))
@@ -742,7 +739,6 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
             src = "https://cameraman-td.vaultedvaluesx.com" + src
         img_map.setdefault(u_name, src)
 
-    # Strip HTML tags into clean line sequence to parse card blocks reliably
     text_only = re.sub(r"<script[^>]*>.*?</script>", "\n", raw_html, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<style[^>]*>.*?</style>", "\n", text_only, flags=re.DOTALL | re.IGNORECASE)
     text_only = re.sub(r"<[^>]+>", "\n", text_only)
@@ -757,7 +753,6 @@ async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int
     while i < len(lines):
         if lines[i] == "Value" and i + 1 < len(lines):
             val_str = lines[i + 1]
-            # Look backwards 1-3 lines for Name & optional Category
             cand_name = ""
             cand_cat = None
             for back in range(1, 4):
@@ -814,14 +809,6 @@ def parse_numeric_value(raw: str) -> Optional[float]:
 
 
 def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
-    """
-    Parses blocks like:
-    UTTV
-    Value: 4650 -> 4000
-    Status: Underpaid
-    Demand: 5.5 -> 8
-    Sign value: 40% -> 30%
-    """
     blocks = re.split(r"\n\s*\n", raw_text.strip())
     parsed_changes: List[Dict[str, Any]] = []
 
@@ -840,7 +827,7 @@ def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
         entry: Dict[str, Any] = {
             "raw_name": unit_raw,
             "display_name": display_name,
-            "trend": "neutral",  # up | down | neutral
+            "trend": "neutral",
             "lines": [],
         }
 
@@ -1372,7 +1359,39 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
 
 
 # -------------------------------------------------------------
-# 6. Server Lockdown System (/closeall, /openall, /lockdown_ignore)
+# 6. Bot Client Initialization & Persistent Views Setup
+# -------------------------------------------------------------
+class CommunityBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.guilds = True
+        intents.voice_states = True
+        intents.emojis_and_stickers = True
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            help_command=None,
+            max_messages=2500,
+        )
+
+    async def setup_hook(self):
+        self.add_view(ValueChangelogVoteView())
+        self.add_view(ValueHubView())
+        self.add_view(VoiceKeepAliveView())
+        self.add_view(VoiceControlView())
+        self.add_view(PollView())
+        self.add_view(EventFollowView())
+        if not background_scheduler.is_running():
+            background_scheduler.start()
+
+
+bot = CommunityBot()
+
+
+# -------------------------------------------------------------
+# 7. Server Lockdown System (/closeall, /openall, /lockdown_ignore)
 # -------------------------------------------------------------
 def is_lockdown_active(guild_id: int) -> bool:
     with get_db() as conn:
@@ -1705,7 +1724,7 @@ async def lockdown_ignore_cmd(
 
 
 # -------------------------------------------------------------
-# 7. Private Temporary Voice Channels 2.0
+# 8. Private Temporary Voice Channels 2.0
 # -------------------------------------------------------------
 def get_user_voice_preset(user_id: int) -> Dict[str, Any]:
     with get_db() as conn:
@@ -2427,7 +2446,7 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
 
 
 # -------------------------------------------------------------
-# 8. Post Studio Presets & Builders
+# 9. Post Studio Presets & Builders
 # -------------------------------------------------------------
 POST_STYLES: Dict[str, Dict[str, Any]] = {
     "announcement": {
@@ -2793,7 +2812,7 @@ class StyleSwitcherView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 9. Live Interactive Polls System (/poll)
+# 10. Live Interactive Polls System (/poll)
 # -------------------------------------------------------------
 def pack_options(options: List[str]) -> str:
     return "\n".join(opt.replace("\n", " ").strip() for opt in options if opt.strip())
@@ -3141,7 +3160,7 @@ class PollCreatorModal(discord.ui.Modal, title="Create Community Poll"):
 
 
 # -------------------------------------------------------------
-# 10. Event Scheduling System (/event, /event_image, Follow)
+# 11. Event Scheduling System (/event, /event_image, Follow)
 # -------------------------------------------------------------
 def parse_msk_datetime(raw: str) -> Optional[int]:
     raw = raw.strip()
@@ -3430,7 +3449,7 @@ class EventComposerModal(discord.ui.Modal):
 
 
 # -------------------------------------------------------------
-# 11. Starboard / Ideas Showcase System (O(1) Deduplication)
+# 12. Starboard / Ideas Showcase System (O(1) Deduplication)
 # -------------------------------------------------------------
 def build_showcase_embed(message: discord.Message, stars: int) -> discord.Embed:
     if stars >= 50:
@@ -3598,7 +3617,7 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 
 
 # -------------------------------------------------------------
-# 12. Admin Control Panel (/panel) & Sub-Panels
+# 13. Admin Control Panel (/panel) & Sub-Panels
 # -------------------------------------------------------------
 class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
     threshold_input = discord.ui.TextInput(
@@ -3968,7 +3987,7 @@ class ControlPanelView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 13. Slash Commands & Context Menus
+# 14. Slash Commands & Context Menus
 # -------------------------------------------------------------
 async def unit_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     q = normalize_unit_key(current)
@@ -4343,7 +4362,7 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 
 
 # -------------------------------------------------------------
-# 14. Event Listeners & Background Scheduler
+# 15. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -4353,7 +4372,6 @@ async def on_ready():
         if s.get("wfl_channel_id"):
             await resolve_wfl_emojis(guild)
 
-    # Initial website sync for Value List
     synced_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
     if synced_units:
         print(f"[ValueList] Synced {synced_units} items from website (Total cached: {len(VALUE_ITEMS_CACHE)})")
@@ -4612,7 +4630,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # -------------------------------------------------------------
-# 15. Entrypoint
+# 16. Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
