@@ -1313,7 +1313,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
 
     def __init__(
         self,
-        author_id: int,
+        author_id: Optional[int] = None,
         default_give: str = "",
         default_get: str = "",
         orig_message: Optional[discord.Message] = None,
@@ -1327,6 +1327,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             self.get_input.default = default_get
 
     async def on_submit(self, interaction: discord.Interaction):
+        owner_id = self.author_id or interaction.user.id
         give_side = parse_trade_side(self.give_input.value)
         get_side = parse_trade_side(self.get_input.value)
 
@@ -1390,7 +1391,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value Calculator",
             icon_url=interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None,
         )
-        view = TradeCalcResultView(interaction.user.id, self.give_input.value, self.get_input.value)
+        view = TradeCalcResultView(owner_id, self.give_input.value, self.get_input.value)
 
         if self.orig_message:
             try:
@@ -1403,92 +1404,6 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             embed=embed,
             view=view,
             ephemeral=False,
-        )
-
-
-class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
-    give_input = discord.ui.TextInput(
-        label="You Give (comma or new line, e.g. 2x UTTV)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500,
-        placeholder="2x UTTV, Engineer Cameraman, Scientist Crate",
-    )
-    get_input = discord.ui.TextInput(
-        label="You Get (comma or new line, e.g. Pharaoh)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=500,
-        placeholder="Pharaoh Cameraman, 2x Lucky",
-    )
-
-    def __init__(self, default_give: str = "", default_get: str = ""):
-        super().__init__()
-        if default_give:
-            self.give_input.default = default_give
-        if default_get:
-            self.get_input.default = default_get
-
-    async def on_submit(self, interaction: discord.Interaction):
-        give_side = parse_trade_side(self.give_input.value)
-        get_side = parse_trade_side(self.get_input.value)
-
-        if not give_side["matched"] and not get_side["matched"]:
-            return await interaction.response.send_message(
-                "❌ Could not recognize any units. Check unit names or shortcuts (`UTTV`, `UTC`, `Pharaoh`, `Engineer`, etc.).",
-                ephemeral=True,
-            )
-
-        diff = get_side["avg_val"] - give_side["avg_val"]
-        denom = max(give_side["avg_val"], get_side["avg_val"], 1.0)
-        pct_diff = (diff / denom) * 100.0
-
-        if pct_diff > 5.0:
-            verdict = f"🟢 WIN (+{diff:,.0f} • +{pct_diff:.1f}%)"
-            color = 0x2ECC71
-        elif pct_diff < -5.0:
-            verdict = f"🔴 LOSE ({diff:,.0f} • {pct_diff:.1f}%)"
-            color = 0xE74C3C
-        else:
-            sign = "+" if diff > 0 else ""
-            verdict = f"🟡 FAIR ({sign}{diff:,.0f} • {sign}{pct_diff:.1f}%)"
-            color = 0xF1C40F
-
-        def _format_lines(side: Dict[str, Any]) -> str:
-            if not side["matched"]:
-                return "*No recognized units*"
-            out = []
-            for unit, qty in side["matched"]:
-                prefix = f"**{qty}x** " if qty > 1 else ""
-                out.append(f"• {prefix}**{unit['name']}** — `{unit['value_text']}` *(Dem {unit['demand_text']})*")
-            out.append(f"\n**Total:** `{format_trade_side_total(side)}` • **Avg Demand:** `{side['avg_demand']:.1f}/10`")
-            return "\n".join(out)
-
-        embed = discord.Embed(
-            title=f"⚖️ Trade Result: {verdict}",
-            color=color,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="📤 You Give", value=_format_lines(give_side), inline=False)
-        embed.add_field(name="📥 You Get", value=_format_lines(get_side), inline=False)
-
-        notes: List[str] = []
-        all_unknown = give_side["unknown"] + get_side["unknown"]
-        if all_unknown:
-            notes.append(f"⚠️ **Unrecognized:** `{', '.join(all_unknown[:8])}`")
-        if get_side["warnings"]:
-            notes.append(f"📉 **Dropping / Underpaid items received:** `{', '.join(get_side['warnings'])}`")
-        if notes:
-            embed.add_field(name="📋 Notes", value="\n".join(notes), inline=False)
-
-        embed.set_footer(
-            text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value Calculator",
-            icon_url=interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None,
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=TradeCalcResultView(self.give_input.value, self.get_input.value),
-            ephemeral=True,
         )
 
 
