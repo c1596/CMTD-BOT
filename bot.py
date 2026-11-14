@@ -1951,14 +1951,14 @@ class TradeCalcResultView(discord.ui.View):
 
 class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
     give_input = discord.ui.TextInput(
-        label="You Give (e.g. x2 hacked, Whatenix Pharaoh)",
+        label="You Give (Units / Partner Signs)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=500,
         placeholder="x2 hacked, Whatenix UTTV, Scientist Crate",
     )
     get_input = discord.ui.TextInput(
-        label="You Get (e.g. Pharaoh Cameraman, 2x Lucky)",
+        label="You Get (Units / Partner Signs)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=500,
@@ -2383,7 +2383,7 @@ def schedule_debounced_sign_vote_refresh(message: discord.Message):
 
 class QuickValueLookupModal(discord.ui.Modal, title="Check Unit Value"):
     unit_input = discord.ui.TextInput(
-        label="Unit or Partner Sign + Unit (e.g. Whatenix UTTV)",
+        label="Unit or Partner Sign + Unit",
         style=discord.TextStyle.short,
         required=True,
         max_length=80,
@@ -6211,7 +6211,7 @@ async def value_changes_cmd(interaction: discord.Interaction):
 
 class ValueChangelogModal(discord.ui.Modal, title="Publish Value List Changes"):
     changes_input = discord.ui.TextInput(
-        label="Value Changes (Paste your standard format)",
+        label="Value Changes (Standard Format)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=3500,
@@ -6311,7 +6311,7 @@ async def value_post_cmd(interaction: discord.Interaction):
 
 class SignChangelogModal(discord.ui.Modal, title="Publish Sign Value Changes"):
     signs_input = discord.ui.TextInput(
-        label="Sign Changes (Paste your standard format)",
+        label="Sign Changes (Standard Format)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=3500,
