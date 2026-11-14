@@ -1,6 +1,8 @@
+```python
 import os
 import re
 import sys
+import html as html_lib
 import time
 import asyncio
 import sqlite3
@@ -29,6 +31,11 @@ except ImportError:
     from discord.ext import commands, tasks
 
 try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -48,7 +55,14 @@ WFL_EMOJI_CACHE: Dict[int, List[Any]] = {}
 APP_EMOJIS_CACHE: List[Any] = []
 STARBOARD_LOCKS: Dict[int, asyncio.Lock] = {}
 POLL_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
+VALUE_VOTE_UPDATE_TASKS: Dict[int, asyncio.Task] = {}
 LOCKDOWN_IN_PROGRESS: Set[int] = set()
+
+# Value List RAM Cache (O(1) lookup for 80k+ members)
+VALUE_ITEMS_CACHE: Dict[str, Dict[str, Any]] = {}
+VALUE_ALIAS_MAP: Dict[str, str] = {}
+LAST_VALUE_WEB_SYNC: float = 0.0
+DEFAULT_VALUE_LIST_URL = "https://cameraman-td.vaultedvaluesx.com/value-list"
 
 # Temporary Voice RAM State
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -85,7 +99,10 @@ def init_db():
                 jtc_channel_id INTEGER,
                 antiscam_enabled INTEGER DEFAULT 0,
                 antiscam_log_channel_id INTEGER,
-                antiscam_timeout_mins INTEGER DEFAULT 60
+                antiscam_timeout_mins INTEGER DEFAULT 60,
+                value_channel_id INTEGER,
+                value_ping_role_id INTEGER,
+                value_list_url TEXT
             )
             """
         )
@@ -99,10 +116,42 @@ def init_db():
             "antiscam_enabled": "INTEGER DEFAULT 0",
             "antiscam_log_channel_id": "INTEGER",
             "antiscam_timeout_mins": "INTEGER DEFAULT 60",
+            "value_channel_id": "INTEGER",
+            "value_ping_role_id": "INTEGER",
+            "value_list_url": "TEXT",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
                 c.execute(f"ALTER TABLE guild_settings ADD COLUMN {col_name} {col_type}")
+
+        # Value List Items & Changelog Votes
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS value_items (
+                item_key TEXT PRIMARY KEY,
+                name TEXT,
+                aliases TEXT,
+                category TEXT,
+                value_text TEXT,
+                prev_value_text TEXT,
+                demand_text TEXT,
+                stability_text TEXT,
+                sign_value_text TEXT,
+                image_url TEXT,
+                updated_at INTEGER
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS value_post_votes (
+                message_id INTEGER,
+                user_id INTEGER,
+                vote INTEGER,
+                PRIMARY KEY (message_id, user_id)
+            )
+            """
+        )
 
         # Temporary Voice Rooms & Personal Presets (Voice 2.0)
         c.execute(
@@ -314,7 +363,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             """
             SELECT ideas_channel_id, showcase_channel_id, star_threshold,
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
-                   antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins
+                   antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
+                   value_channel_id, value_ping_role_id, value_list_url
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -331,6 +381,9 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "antiscam_enabled": bool(row[7]) if row else False,
             "antiscam_log_channel_id": row[8] if row else None,
             "antiscam_timeout_mins": row[9] if (row and row[9] is not None) else 60,
+            "value_channel_id": row[10] if row else None,
+            "value_ping_role_id": row[11] if row else None,
+            "value_list_url": (row[12] if (row and row[12]) else DEFAULT_VALUE_LIST_URL),
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -347,9 +400,10 @@ def update_guild_settings(guild_id: int, **kwargs):
             INSERT INTO guild_settings (
                 guild_id, ideas_channel_id, showcase_channel_id,
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
-                antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins
+                antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
+                value_channel_id, value_ping_role_id, value_list_url
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -360,7 +414,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 jtc_channel_id = excluded.jtc_channel_id,
                 antiscam_enabled = excluded.antiscam_enabled,
                 antiscam_log_channel_id = excluded.antiscam_log_channel_id,
-                antiscam_timeout_mins = excluded.antiscam_timeout_mins
+                antiscam_timeout_mins = excluded.antiscam_timeout_mins,
+                value_channel_id = excluded.value_channel_id,
+                value_ping_role_id = excluded.value_ping_role_id,
+                value_list_url = excluded.value_list_url
             """,
             (
                 guild_id,
@@ -374,6 +431,9 @@ def update_guild_settings(guild_id: int, **kwargs):
                 1 if current["antiscam_enabled"] else 0,
                 current["antiscam_log_channel_id"],
                 current["antiscam_timeout_mins"],
+                current["value_channel_id"],
+                current["value_ping_role_id"],
+                current["value_list_url"],
             ),
         )
         conn.commit()
@@ -390,32 +450,751 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 
 
 # -------------------------------------------------------------
-# 3. Discord Bot Initialization
+# 3. Value List System (Auto-Sync + /value + /value_post)
 # -------------------------------------------------------------
-class CommunityBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
-        intents.reactions = True
-        intents.voice_states = True
-        super().__init__(
-            command_prefix="!",
-            intents=intents,
-            activity=discord.Activity(type=discord.ActivityType.watching, name="80k+ community ⭐"),
-            status=discord.Status.online,
+KNOWN_UNIT_ALIASES: Dict[str, List[str]] = {
+    "upgraded titan tv man": ["uttv", "upgraded titan tv", "ttv"],
+    "upgraded titan cameraman": ["utc", "upgraded titan cam", "tcm"],
+    "upgraded titan speakerman": ["uts", "upgraded titan speaker", "tsm"],
+    "engineer cameraman": ["eng", "engineer cam", "engineer"],
+    "hacked cameraman": ["hacked cam", "hacked"],
+    "executioner tv man": ["exectioner tv man", "exec", "executioner"],
+    "reinforced titan cameraman": ["rtc", "reinforced tcm"],
+    "reinforced titan speakerman": ["rts", "reinforced tsm"],
+    "large scientist cameraman": ["lsc", "large scientist"],
+    "large laser cameraman": ["llc", "large laser"],
+    "camera attack helicopter": ["cah", "attack heli"],
+    "cinemaman titan": ["cinemaman", "cinema"],
+    "pharaoh cameraman": ["pharaoh"],
+    "chaos cameraman": ["chaos"],
+    "spider tv": ["spider"],
+    "devsigned engineer": ["devsigned eng", "signed engineer"],
+    "devsigned pumpkin farm": ["devsigned pumpkin", "signed pumpkin"],
+    "devsigned scientist": ["signed scientist"],
+}
+
+INITIAL_VALUE_SEED: List[Tuple[str, str, str, str, str]] = [
+    ("Pharaoh Cameraman", "Godly", "23,000", "8.5/10", "Fluctuating"),
+    ("Spider Tv", "Exclusive", "14,000 – 15,000", "9.5/10", "Unstable"),
+    ("Engineer Cameraman", "Exclusive", "6,350", "8/10", "Fluctuating"),
+    ("Chaos Cameraman", "Mythic", "5,000", "9.5/10", "Heavily Overpaid"),
+    ("Upgraded Titan TV Man", "Godly", "4,650", "8/10", "Slowly Dropping | Underpaid"),
+    ("Upgraded Titan Cameraman", "Godly", "2,800", "7/10", "Underpaid | Stable"),
+    ("x2 Candy", "Gamepasses", "2,350", "8/10", "Overpaid"),
+    ("2x Money", "Gamepasses", "2,200", "9/10", "Overpaid"),
+    ("Hacked Cameraman", "Exclusive", "2,000", "9/10", "Fluctuating"),
+    ("Premium Pass", "Gamepasses", "1,900", "6/10", "Overpaid"),
+    ("2x Lucky", "Gamepasses", "1,800", "7/10", "Stable"),
+    ("Executioner TV Man", "Exclusive", "1,700", "8/10", "Stable"),
+    ("Reinforced Titan Cameraman", "Exclusive", "1,100", "4/10", "Dropping"),
+    ("2X Speed", "Gamepasses", "1,050", "7/10", "Stable"),
+    ("Vampire Camera Man", "Exclusive", "750", "1/10", "Dropping"),
+    ("Reinforced Titan Speakerman", "Exclusive", "700", "5/10", "Slowly Dropping"),
+    ("Prototype Duo", "Exclusive", "500", "4/10", "Fluctuating | Underpaid"),
+    ("Scientist Crate", "Crates", "425", "7/10", "Stable"),
+    ("Headless TV Man", "Exclusive", "400", "1/10", "Stable | Underpaid"),
+    ("Jetpack Cameraman", "Exclusive", "350", "3/10", "Underpaid | Slowly Dropping"),
+    ("Large Scientist Cameraman", "Exclusive", "350", "5/10", "Underpaid"),
+    ("Camera Attack Helicopter", "Mythic", "300", "2/10", "Slowly Dropping"),
+    ("CinemaMan Titan", "Mythic", "300", "5.5/10", "Unstable"),
+    ("Large Laser Cameraman", "Mythic", "240", "4/10", "Dropping"),
+    ("Sand Coffin Crate", "Crates", "235", "2/10", "Fluctuating"),
+    ("TV Woman", "Mythic", "235", "2/10", "Stable"),
+    ("Large Prototype Titan", "Mythic", "220", "3.5/10", "Unstable"),
+    ("Upgraded Titan Speakerman", "Mythic", "160", "2.9/10", "Stable"),
+    ("Glitch Plungerman", "Mythic", "150", "4.5/10", "Slowly Dropping"),
+    ("Videotaper Titan", "Mythic", "150", "3/10", "Slowly Dropping"),
+    ("Scientist Cameraman", "Exclusive", "115", "6/10", "Overpaid"),
+    ("Spider Crate", "Crates", "70", "4.5/10", "Stable"),
+    ("Dark Speakerman", "Legendary", "35", "2/10", "Stable"),
+    ("Speaker Helicopter", "Legendary", "35", "1/10", "Stable"),
+    ("Camera Repair Drone", "Legendary", "25", "4/10", "Stable"),
+    ("Camera Spider", "Exclusive", "15", "2/10", "Stable"),
+    ("Halloween Crate", "Crates", "15", "3.5/10", "Stable"),
+    ("Pumpkin Farmer", "Epic", "10", "3/10", "Stable"),
+    ("Woman Crate", "Crates", "7", "1.8/10", "Stable"),
+    ("SpeakerWoman", "Legendary", "3", "1.5/10", "Unstable"),
+    ("Dragon Cameraman", "Legendary", "2", "1/10", "Slowly Dropping"),
+    ("Laser Cameraman Car", "Legendary", "2", "1/10", "Stable"),
+    ("Ninja Cameraman", "Legendary", "2", "1.8/10", "Stable"),
+    ("Titan Cameraman", "Legendary", "2", "1.5/10", "Stable"),
+    ("Titan TV Man", "Legendary", "2", "1.5/10", "Stable"),
+    ("Titan Speakerman", "Legendary", "1", "1/10", "Stable"),
+    ("DevSigned Engineer", "Signed", "o/c", "9/10", "Unstable"),
+    ("DevSigned Pumpkin Farm", "Signed", "o/c", "8/10", "Stable"),
+    ("DevSigned Scientist", "Signed", "o/c", "7/10", "Unstable"),
+]
+
+
+def normalize_unit_key(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip().lower())
+
+
+def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
+    key = normalize_unit_key(name)
+    aliases: Set[str] = {key}
+    for raw_a in existing_aliases.split(","):
+        cleaned = normalize_unit_key(raw_a)
+        if cleaned:
+            aliases.add(cleaned)
+    for known_key, extra_list in KNOWN_UNIT_ALIASES.items():
+        if key == known_key or key in extra_list:
+            aliases.add(known_key)
+            for item in extra_list:
+                aliases.add(normalize_unit_key(item))
+    words = [w for w in re.split(r"[^a-z0-9]+", key) if w]
+    if len(words) >= 3:
+        acronym = "".join(w[0] for w in words)
+        if len(acronym) >= 3:
+            aliases.add(acronym)
+    return ",".join(sorted(aliases))
+
+
+def reload_value_cache():
+    VALUE_ITEMS_CACHE.clear()
+    VALUE_ALIAS_MAP.clear()
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT item_key, name, aliases, category, value_text, prev_value_text,
+                   demand_text, stability_text, sign_value_text, image_url, updated_at
+            FROM value_items
+            """
+        )
+        for row in c.fetchall():
+            item = {
+                "item_key": row[0],
+                "name": row[1],
+                "aliases": row[2] or row[0],
+                "category": row[3] or "Unit",
+                "value_text": row[4] or "N/A",
+                "prev_value_text": row[5] or "",
+                "demand_text": row[6] or "N/A",
+                "stability_text": row[7] or "Stable",
+                "sign_value_text": row[8] or "",
+                "image_url": row[9] or "",
+                "updated_at": row[10] or int(time.time()),
+            }
+            VALUE_ITEMS_CACHE[row[0]] = item
+            VALUE_ALIAS_MAP[row[0]] = row[0]
+            for alias in item["aliases"].split(","):
+                a_clean = normalize_unit_key(alias)
+                if a_clean:
+                    VALUE_ALIAS_MAP[a_clean] = row[0]
+
+
+def seed_initial_values_if_empty():
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM value_items")
+        if c.fetchone()[0] == 0:
+            now_ts = int(time.time())
+            rows = []
+            for name, cat, val, dem, stab in INITIAL_VALUE_SEED:
+                key = normalize_unit_key(name)
+                aliases = build_aliases_for_unit(name)
+                rows.append((key, name, aliases, cat, val, "", dem, stab, "", "", now_ts))
+            c.executemany(
+                """
+                INSERT OR IGNORE INTO value_items (
+                    item_key, name, aliases, category, value_text, prev_value_text,
+                    demand_text, stability_text, sign_value_text, image_url, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+    reload_value_cache()
+
+
+seed_initial_values_if_empty()
+
+
+def find_value_item(query: str) -> Optional[Dict[str, Any]]:
+    q = normalize_unit_key(query)
+    if not q:
+        return None
+    if q in VALUE_ALIAS_MAP:
+        return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[q])
+    # Prefix / substring fallback
+    for alias, key in VALUE_ALIAS_MAP.items():
+        if alias.startswith(q):
+            return VALUE_ITEMS_CACHE.get(key)
+    for alias, key in VALUE_ALIAS_MAP.items():
+        if q in alias:
+            return VALUE_ITEMS_CACHE.get(key)
+    return None
+
+
+def upsert_value_item(
+    name: str,
+    category: Optional[str] = None,
+    value_text: Optional[str] = None,
+    prev_value_text: Optional[str] = None,
+    demand_text: Optional[str] = None,
+    stability_text: Optional[str] = None,
+    sign_value_text: Optional[str] = None,
+    image_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    existing = find_value_item(name)
+    now_ts = int(time.time())
+    if existing:
+        item_key = existing["item_key"]
+        final_name = existing["name"]
+        final_aliases = build_aliases_for_unit(final_name, existing.get("aliases", ""))
+        final_cat = category if category else existing["category"]
+        final_val = value_text if value_text is not None else existing["value_text"]
+        final_prev = prev_value_text if prev_value_text is not None else existing["prev_value_text"]
+        final_dem = demand_text if demand_text is not None else existing["demand_text"]
+        final_stab = stability_text if stability_text is not None else existing["stability_text"]
+        final_sign = sign_value_text if sign_value_text is not None else existing["sign_value_text"]
+        final_img = image_url if image_url else existing["image_url"]
+    else:
+        item_key = normalize_unit_key(name)
+        final_name = name.strip()
+        final_aliases = build_aliases_for_unit(final_name)
+        final_cat = category or "Unit"
+        final_val = value_text or "N/A"
+        final_prev = prev_value_text or ""
+        final_dem = demand_text or "N/A"
+        final_stab = stability_text or "Stable"
+        final_sign = sign_value_text or ""
+        final_img = image_url or ""
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO value_items (
+                item_key, name, aliases, category, value_text, prev_value_text,
+                demand_text, stability_text, sign_value_text, image_url, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_key,
+                final_name,
+                final_aliases,
+                final_cat,
+                final_val,
+                final_prev,
+                final_dem,
+                final_stab,
+                final_sign,
+                final_img,
+                now_ts,
+            ),
+        )
+        conn.commit()
+
+    item_dict = {
+        "item_key": item_key,
+        "name": final_name,
+        "aliases": final_aliases,
+        "category": final_cat,
+        "value_text": final_val,
+        "prev_value_text": final_prev,
+        "demand_text": final_dem,
+        "stability_text": final_stab,
+        "sign_value_text": final_sign,
+        "image_url": final_img,
+        "updated_at": now_ts,
+    }
+    VALUE_ITEMS_CACHE[item_key] = item_dict
+    for a in final_aliases.split(","):
+        if a.strip():
+            VALUE_ALIAS_MAP[a.strip()] = item_key
+    return item_dict
+
+
+async def sync_value_list_from_website(url: str = DEFAULT_VALUE_LIST_URL) -> int:
+    """Scrapes item cards & artworks directly from Vaulted Values X HTML."""
+    global LAST_VALUE_WEB_SYNC
+    if not aiohttp:
+        return 0
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/8.5; +https://discord.com)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return 0
+                raw_html = await resp.text()
+    except Exception:
+        return 0
+
+    # Extract artwork URLs mapped by alt="<Name> artwork"
+    img_map: Dict[str, str] = {}
+    for m in re.finditer(r'<img[^>]+alt="([^"]+?)\s+artwork"[^>]+src="([^"]+)"', raw_html, re.IGNORECASE):
+        u_name = normalize_unit_key(html_lib.unescape(m.group(1)))
+        src = html_lib.unescape(m.group(2))
+        if src.startswith("/"):
+            src = "https://cameraman-td.vaultedvaluesx.com" + src
+        img_map[u_name] = src
+    for m in re.finditer(r'<img[^>]+src="([^"]+)"[^>]+alt="([^"]+?)\s+artwork"', raw_html, re.IGNORECASE):
+        src = html_lib.unescape(m.group(1))
+        u_name = normalize_unit_key(html_lib.unescape(m.group(2)))
+        if src.startswith("/"):
+            src = "https://cameraman-td.vaultedvaluesx.com" + src
+        img_map.setdefault(u_name, src)
+
+    # Strip HTML tags into clean line sequence to parse card blocks reliably
+    text_only = re.sub(r"<script[^>]*>.*?</script>", "\n", raw_html, flags=re.DOTALL | re.IGNORECASE)
+    text_only = re.sub(r"<style[^>]*>.*?</style>", "\n", text_only, flags=re.DOTALL | re.IGNORECASE)
+    text_only = re.sub(r"<[^>]+>", "\n", text_only)
+    lines = [html_lib.unescape(ln).strip() for ln in text_only.splitlines() if html_lib.unescape(ln).strip()]
+
+    categories_set = {
+        "Godly", "Exclusive", "Mythic", "Legendary", "Epic", "Rare",
+        "Uncommon", "Common", "Gamepasses", "Crates", "Signed",
+    }
+    updated_count = 0
+    i = 0
+    while i < len(lines):
+        if lines[i] == "Value" and i + 1 < len(lines):
+            val_str = lines[i + 1]
+            # Look backwards 1-3 lines for Name & optional Category
+            cand_name = ""
+            cand_cat = None
+            for back in range(1, 4):
+                if i - back < 0:
+                    break
+                prev_ln = lines[i - back]
+                if prev_ln in categories_set:
+                    cand_cat = prev_ln
+                elif prev_ln not in ("Filter", "Quick scan", "Full cards") and not prev_ln.endswith("artwork"):
+                    cand_name = prev_ln
+                    break
+
+            dem_str = None
+            stab_str = None
+            for fwd in range(2, 7):
+                if i + fwd >= len(lines):
+                    break
+                if lines[i + fwd] == "Demand" and i + fwd + 1 < len(lines):
+                    dem_str = lines[i + fwd + 1]
+                elif lines[i + fwd] == "Stability" and i + fwd + 1 < len(lines):
+                    stab_str = lines[i + fwd + 1]
+                elif lines[i + fwd] == "Value":
+                    break
+
+            if cand_name and len(cand_name) <= 60:
+                existing = find_value_item(cand_name)
+                prev_val = None
+                if existing and existing["value_text"] != val_str:
+                    prev_val = existing["value_text"]
+                img_url = img_map.get(normalize_unit_key(cand_name))
+                upsert_value_item(
+                    name=cand_name,
+                    category=cand_cat,
+                    value_text=val_str,
+                    prev_value_text=prev_val,
+                    demand_text=dem_str,
+                    stability_text=stab_str,
+                    image_url=img_url,
+                )
+                updated_count += 1
+        i += 1
+
+    if updated_count > 0:
+        LAST_VALUE_WEB_SYNC = time.time()
+    return updated_count
+
+
+def parse_numeric_value(raw: str) -> Optional[float]:
+    nums = re.findall(r"\d+(?:,\d+)*(?:\.\d+)?", raw)
+    if not nums:
+        return None
+    parsed = [float(n.replace(",", "")) for n in nums]
+    return sum(parsed) / len(parsed)
+
+
+def parse_value_changelog_text(raw_text: str) -> List[Dict[str, Any]]:
+    """
+    Parses blocks like:
+    UTTV
+    Value: 4650 -> 4000
+    Status: Underpaid
+    Demand: 5.5 -> 8
+    Sign value: 40% -> 30%
+    """
+    blocks = re.split(r"\n\s*\n", raw_text.strip())
+    parsed_changes: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        unit_raw = lines[0].lstrip("-•* ").strip()
+        if ":" in unit_raw and unit_raw.lower().startswith(("value", "status", "stability", "demand", "sign")):
+            continue
+
+        existing = find_value_item(unit_raw)
+        display_name = existing["name"] if existing else unit_raw
+
+        entry: Dict[str, Any] = {
+            "raw_name": unit_raw,
+            "display_name": display_name,
+            "trend": "neutral",  # up | down | neutral
+            "lines": [],
+        }
+
+        new_val: Optional[str] = None
+        prev_val: Optional[str] = None
+        new_dem: Optional[str] = None
+        new_stab: Optional[str] = None
+        new_sign: Optional[str] = None
+
+        for attr_line in lines[1:]:
+            if ":" not in attr_line:
+                entry["lines"].append(attr_line)
+                continue
+            k_raw, v_raw = attr_line.split(":", 1)
+            k = k_raw.strip().lower()
+            v = v_raw.strip()
+
+            arrow_parts = re.split(r"\s*(?:->|➔|→|=>)\s*", v, maxsplit=1)
+            has_arrow = len(arrow_parts) == 2
+
+            if k.startswith("val"):
+                if has_arrow:
+                    prev_val, new_val = arrow_parts[0].strip(), arrow_parts[1].strip()
+                    n_old = parse_numeric_value(prev_val)
+                    n_new = parse_numeric_value(new_val)
+                    if n_old is not None and n_new is not None:
+                        diff = n_new - n_old
+                        if diff > 0:
+                            entry["trend"] = "up"
+                            diff_str = f" (+{int(diff):,})" if diff.is_integer() else f" (+{diff:,.1f})"
+                        elif diff < 0:
+                            entry["trend"] = "down"
+                            diff_str = f" ({int(diff):,})" if diff.is_integer() else f" ({diff:,.1f})"
+                        else:
+                            diff_str = ""
+                    else:
+                        diff_str = ""
+                    entry["lines"].append(f"**Value:** `{prev_val}` ➔ **`{new_val}`**{diff_str}")
+                else:
+                    new_val = v
+                    entry["lines"].append(f"**Value:** **`{new_val}`**")
+
+            elif k.startswith("dem"):
+                if has_arrow:
+                    old_d, new_dem = arrow_parts[0].strip(), arrow_parts[1].strip()
+                    if "/10" not in new_dem and new_dem.replace(".", "", 1).isdigit():
+                        new_dem_db = f"{new_dem}/10"
+                    else:
+                        new_dem_db = new_dem
+                    new_dem = new_dem_db
+                    entry["lines"].append(f"**Demand:** `{old_d}` ➔ **`{new_dem}`**")
+                else:
+                    new_dem = f"{v}/10" if ("/10" not in v and v.replace(".", "", 1).isdigit()) else v
+                    entry["lines"].append(f"**Demand:** **`{new_dem}`**")
+
+            elif k.startswith(("stat", "stab")):
+                if has_arrow:
+                    old_s, new_stab = arrow_parts[0].strip(), arrow_parts[1].strip()
+                    entry["lines"].append(f"**Status:** `{old_s}` ➔ **`{new_stab}`**")
+                else:
+                    new_stab = v
+                    entry["lines"].append(f"**Status:** **`{new_stab}`**")
+
+            elif k.startswith("sign"):
+                if has_arrow:
+                    old_sg, new_sign = arrow_parts[0].strip(), arrow_parts[1].strip()
+                    entry["lines"].append(f"**Sign Value:** `{old_sg}` ➔ **`{new_sign}`**")
+                else:
+                    new_sign = v
+                    entry["lines"].append(f"**Sign Value:** **`{new_sign}`**")
+            else:
+                entry["lines"].append(f"**{k_raw.strip()}:** {v}")
+
+        upsert_value_item(
+            name=display_name,
+            value_text=new_val,
+            prev_value_text=prev_val,
+            demand_text=new_dem,
+            stability_text=new_stab,
+            sign_value_text=new_sign,
+        )
+        parsed_changes.append(entry)
+
+    return parsed_changes
+
+
+def build_unit_value_embed(guild: Optional[discord.Guild], item: Dict[str, Any], site_url: str) -> discord.Embed:
+    stab_lower = item["stability_text"].lower()
+    if "overpaid" in stab_lower:
+        color = 0x2ECC71
+    elif "dropping" in stab_lower or "underpaid" in stab_lower:
+        color = 0xE74C3C
+    elif "fluctuating" in stab_lower or "unstable" in stab_lower:
+        color = 0xF39C12
+    else:
+        color = 0x3498DB
+
+    val_display = f"**`{item['value_text']}`**"
+    if item.get("prev_value_text") and item["prev_value_text"] != item["value_text"]:
+        val_display += f"\n*(Previously: `{item['prev_value_text']}`)*"
+
+    embed = discord.Embed(
+        title=f"💎 {item['name']}",
+        color=color,
+        timestamp=datetime.fromtimestamp(item["updated_at"], tz=timezone.utc),
+    )
+    embed.add_field(name="💰 Value", value=val_display, inline=True)
+    embed.add_field(name="🔥 Demand", value=f"**`{item['demand_text']}`**", inline=True)
+    embed.add_field(name="🏷️ Category", value=f"`{item['category']}`", inline=True)
+    embed.add_field(name="📊 Stability / Status", value=f"**{item['stability_text']}**", inline=True)
+
+    if item.get("sign_value_text"):
+        embed.add_field(name="✍️ Sign Value", value=f"**`{item['sign_value_text']}`**", inline=True)
+
+    if item.get("image_url") and item["image_url"].startswith(("http://", "https://")):
+        embed.set_thumbnail(url=item["image_url"])
+
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • Official Value List",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
+
+
+def get_value_post_vote_counts(message_id: int) -> Tuple[int, int]:
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM value_post_votes WHERE message_id = ? AND vote = 1", (message_id,))
+        up = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM value_post_votes WHERE message_id = ? AND vote = -1", (message_id,))
+        down = c.fetchone()[0]
+    return up, down
+
+
+class ValueChangelogVoteView(discord.ui.View):
+    def __init__(self, up_count: int = 0, down_count: int = 0):
+        super().__init__(timeout=None)
+        total = up_count + down_count
+        up_pct = round((up_count / total) * 100) if total > 0 else 0
+        down_pct = round((down_count / total) * 100) if total > 0 else 0
+
+        up_btn = discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label=f"W Changes ({up_count} • {up_pct}%)",
+            emoji="👍",
+            custom_id="val_vote:up",
+        )
+        down_btn = discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label=f"L Changes ({down_count} • {down_pct}%)",
+            emoji="👎",
+            custom_id="val_vote:down",
+        )
+        up_btn.callback = self.on_vote_up
+        down_btn.callback = self.on_vote_down
+        self.add_item(up_btn)
+        self.add_item(down_btn)
+
+    async def _handle_vote(self, interaction: discord.Interaction, vote_val: int):
+        if not interaction.message:
+            return
+        msg_id = interaction.message.id
+        user_id = interaction.user.id
+
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT vote FROM value_post_votes WHERE message_id = ? AND user_id = ?",
+                (msg_id, user_id),
+            )
+            row = c.fetchone()
+            if row and row[0] == vote_val:
+                c.execute(
+                    "DELETE FROM value_post_votes WHERE message_id = ? AND user_id = ?",
+                    (msg_id, user_id),
+                )
+                feedback = "➖ Your feedback vote was removed."
+            else:
+                c.execute(
+                    "INSERT OR REPLACE INTO value_post_votes (message_id, user_id, vote) VALUES (?, ?, ?)",
+                    (msg_id, user_id, vote_val),
+                )
+                feedback = "👍 Voted **W Changes**!" if vote_val == 1 else "👎 Voted **L Changes**!"
+            conn.commit()
+
+        await interaction.response.send_message(feedback, ephemeral=True)
+        schedule_debounced_value_vote_refresh(interaction.message)
+
+    async def on_vote_up(self, interaction: discord.Interaction):
+        await self._handle_vote(interaction, 1)
+
+    async def on_vote_down(self, interaction: discord.Interaction):
+        await self._handle_vote(interaction, -1)
+
+
+def schedule_debounced_value_vote_refresh(message: discord.Message):
+    msg_id = message.id
+    existing = VALUE_VOTE_UPDATE_TASKS.get(msg_id)
+    if existing and not existing.done():
+        return
+
+    async def _worker():
+        await asyncio.sleep(1.5)
+        try:
+            up, down = get_value_post_vote_counts(msg_id)
+            await message.edit(view=ValueChangelogVoteView(up_count=up, down_count=down))
+        except Exception:
+            pass
+        finally:
+            VALUE_VOTE_UPDATE_TASKS.pop(msg_id, None)
+
+    VALUE_VOTE_UPDATE_TASKS[msg_id] = asyncio.create_task(_worker())
+
+
+class QuickValueLookupModal(discord.ui.Modal, title="Check Unit Value"):
+    unit_input = discord.ui.TextInput(
+        label="Unit Name or Shortcut (e.g. UTTV, Pharaoh)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=60,
+        placeholder="Type unit name or shortcut like UTTV, UTC, Engineer...",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        item = find_value_item(self.unit_input.value)
+        if not item:
+            return await interaction.response.send_message(
+                f"❌ Unit `{self.unit_input.value}` was not found in the value list. Try another name or check the full website!",
+                ephemeral=True,
+            )
+        site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
+        embed = build_unit_value_embed(interaction.guild, item, site_url)
+        view = build_link_view("Open Full Value List", site_url)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ValueHubView(discord.ui.View):
+    def __init__(self, site_url: str = DEFAULT_VALUE_LIST_URL):
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label="Open Official Value List",
+                emoji="🔗",
+                url=site_url,
+            )
+        )
+        check_btn = discord.ui.Button(
+            style=discord.ButtonStyle.primary,
+            label="Check Unit Value",
+            emoji="🔍",
+            custom_id="val_hub:check_unit",
+        )
+        check_btn.callback = self.on_check_click
+        self.add_item(check_btn)
+
+    async def on_check_click(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(QuickValueLookupModal())
+
+
+class ValueChangelogModal(discord.ui.Modal, title="Publish Official Value Changes"):
+    header_input = discord.ui.TextInput(
+        label="Changelog Title (Optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=120,
+        default="📊 Official Value List Changes",
+    )
+    changes_input = discord.ui.TextInput(
+        label="Changes (Paste your usual unit blocks)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=3500,
+        placeholder="UTTV\nValue: 4650 -> 4000\nStatus: Underpaid\n\nUTC\nValue: 2800 -> 3000",
+    )
+    ping_confirm_input = discord.ui.TextInput(
+        label="Ping Value Changes Role? (yes / no)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=5,
+        default="no",
+        placeholder="Type yes to ping or no to post silently",
+    )
+    note_input = discord.ui.TextInput(
+        label="Extra Note (Optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=300,
+        placeholder="e.g. Adjusted based on recent trade demand.",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        settings = get_guild_settings(interaction.guild.id)
+        target_ch_id = settings.get("value_channel_id")
+        target_ch = interaction.guild.get_channel(target_ch_id) if target_ch_id else interaction.channel
+        if not isinstance(target_ch, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ Value Changelog channel not found. Configure it in `/panel` ➔ `💎 Value List`.",
+                ephemeral=True,
+            )
+
+        parsed = parse_value_changelog_text(self.changes_input.value)
+        if not parsed:
+            return await interaction.response.send_message(
+                "❌ Could not parse any unit changes. Make sure each unit block starts with the unit name.",
+                ephemeral=True,
+            )
+
+        sections: List[str] = []
+        for entry in parsed:
+            icon = "📈" if entry["trend"] == "up" else ("📉" if entry["trend"] == "down" else "⚖️")
+            details = "\n".join(f"> {ln}" for ln in entry["lines"]) if entry["lines"] else "> *Updated*"
+            sections.append(f"{icon} **{entry['display_name']}**\n{details}")
+
+        desc = "\n\n".join(sections)
+        if self.note_input.value.strip():
+            desc += f"\n\n📝 *{self.note_input.value.strip()}*"
+
+        embed = discord.Embed(
+            title=self.header_input.value.strip() or "📊 Official Value List Changes",
+            description=desc[:4000],
+            color=0xF1C40F,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(
+            name=f"Updated by {interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url,
+        )
+        embed.set_footer(
+            text=f"{interaction.guild.name} • Use /value to check any unit",
+            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
         )
 
-    async def setup_hook(self):
-        self.add_view(PollView(option_count=5, closed=False))
-        self.add_view(EventFollowView(count=0, disabled=False))
-        self.add_view(VoiceControlView())
-        self.add_view(VoiceKeepAliveView())
-        if not background_scheduler.is_running():
-            background_scheduler.start()
+        should_ping = self.ping_confirm_input.value.strip().lower() in ("yes", "y", "да", "1", "true")
+        ping_role_id = settings.get("value_ping_role_id")
+        ping_role = interaction.guild.get_role(ping_role_id) if ping_role_id else None
 
+        content = ping_role.mention if (should_ping and ping_role) else None
+        allowed = discord.AllowedMentions(roles=True) if content else discord.AllowedMentions.none()
 
-bot = CommunityBot()
+        sent = await target_ch.send(
+            content=content,
+            embed=embed,
+            view=ValueChangelogVoteView(up_count=0, down_count=0),
+            allowed_mentions=allowed,
+        )
+        ping_note = f" (pinged {ping_role.mention})" if content else " (posted without ping)"
+        await interaction.response.send_message(
+            f"✅ Published **{len(parsed)}** unit update(s) in {target_ch.mention}{ping_note} and synced the `/value` database! [Jump to Post]({sent.jump_url})",
+            ephemeral=True,
+        )
 
 
 # -------------------------------------------------------------
@@ -510,6 +1289,8 @@ SAFE_DOMAINS = {
     "giphy.com",
     "imgur.com",
     "i.imgur.com",
+    "cameraman-td.vaultedvaluesx.com",
+    "vaultedvaluesx.com",
 }
 
 PHISHING_DOMAIN_PATTERNS = (
@@ -925,7 +1706,7 @@ async def lockdown_ignore_cmd(
 
 
 # -------------------------------------------------------------
-# 7. Private Temporary Voice Channels 2.0 (Presets, Quick Modes, Watch Together)
+# 7. Private Temporary Voice Channels 2.0
 # -------------------------------------------------------------
 def get_user_voice_preset(user_id: int) -> Dict[str, Any]:
     with get_db() as conn:
@@ -1071,8 +1852,6 @@ async def delete_temp_voice_channel(channel: discord.VoiceChannel, reason: str):
 
 
 async def get_or_create_watch_together_invite(vc: discord.VoiceChannel, user: discord.abc.User) -> str:
-    """Reuses existing Watch Together invite or prunes old bot invites if guild hits Discord's 1,000 invite cap."""
-    # 1. Reuse an existing Watch Together invite in this voice channel if available
     try:
         for inv in await vc.invites():
             if inv.target_application and inv.target_application.id == YOUTUBE_ACTIVITY_ID:
@@ -1080,7 +1859,6 @@ async def get_or_create_watch_together_invite(vc: discord.VoiceChannel, user: di
     except Exception:
         pass
 
-    # 2. Try creating (or reusing via unique=False) a Watch Together invite
     try:
         invite = await vc.create_invite(
             max_age=3600,
@@ -1094,7 +1872,6 @@ async def get_or_create_watch_together_invite(vc: discord.VoiceChannel, user: di
         if e.code != 30016:
             raise
 
-    # 3. Error 30016: Server reached 1,000 active invites -> prune oldest bot-created invites & retry
     deleted_any = False
     try:
         guild_invites = await vc.guild.invites()
@@ -2846,6 +3623,101 @@ class ThresholdModal(discord.ui.Modal, title="Set Starboard Threshold"):
         )
 
 
+class ValueUrlModal(discord.ui.Modal, title="Set Value List Website URL"):
+    url_input = discord.ui.TextInput(
+        label="Official Value List URL",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=300,
+        placeholder="https://cameraman-td.vaultedvaluesx.com/value-list",
+    )
+
+    def __init__(self, current_url: str):
+        super().__init__()
+        self.url_input.default = current_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        url = self.url_input.value.strip()
+        if not url.startswith(("http://", "https://")):
+            return await interaction.response.send_message("❌ Enter a valid `https://` URL.", ephemeral=True)
+        update_guild_settings(interaction.guild.id, value_list_url=url)
+        await interaction.response.send_message(f"✅ Value list URL updated to: {url}", ephemeral=True)
+
+
+class ValueSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📊 Select Value Changes Channel...",
+        row=0,
+    )
+    async def select_value_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, value_channel_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"✅ Value Changelog channel set to <#{chosen.id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🏷️ Select Value Changes Ping Role...",
+        row=1,
+    )
+    async def select_value_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, value_ping_role_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"✅ Value Changes ping role set to <@&{chosen.id}>.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Set Site URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=2)
+    async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cur_url = get_guild_settings(self.guild_id)["value_list_url"]
+        await interaction.response.send_modal(ValueUrlModal(cur_url))
+
+    @discord.ui.button(label="Sync Website Now", style=discord.ButtonStyle.secondary, emoji="🔄", row=2)
+    async def sync_web_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        site_url = get_guild_settings(self.guild_id)["value_list_url"]
+        count = await sync_value_list_from_website(site_url)
+        await interaction.followup.send(
+            f"🔄 Synced **{count}** items from `{site_url}`! Total units in RAM cache: **{len(VALUE_ITEMS_CACHE)}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=2)
+    async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        site_url = get_guild_settings(self.guild_id)["value_list_url"]
+        embed = discord.Embed(
+            title="💎 Official CMTD Value List",
+            description=(
+                "Check live unit values, demand, and stability right here in Discord or open the full website!\n\n"
+                "• Click **`🔍 Check Unit Value`** below to look up any unit privately.\n"
+                "• Or type `/value` in chat with instant autocomplete."
+            ),
+            color=0x3498DB,
+        )
+        embed.set_footer(
+            text=f"{interaction.guild.name} • {len(VALUE_ITEMS_CACHE)} Tracked Units",
+            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+        )
+        sent = await interaction.channel.send(embed=embed, view=ValueHubView(site_url))
+        await interaction.response.send_message(
+            f"📌 Value List Hub posted! [Jump to Message]({sent.jump_url})",
+            ephemeral=True,
+        )
+
+
 class TempVoiceSetupView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
@@ -2959,6 +3831,8 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     showcase = f"<#{s['showcase_channel_id']}>" if s["showcase_channel_id"] else "`Not Set`"
     wfl = f"<#{s['wfl_channel_id']}>" if s["wfl_channel_id"] else "`Not Set`"
     jtc = f"<#{s['jtc_channel_id']}>" if s["jtc_channel_id"] else "`Not Set`"
+    val_ch = f"<#{s['value_channel_id']}>" if s["value_channel_id"] else "`Not Set`"
+    val_role = f"<@&{s['value_ping_role_id']}>" if s["value_ping_role_id"] else "`Not Set`"
     booster = f"<@&{s['booster_role_id']}>" if s["booster_role_id"] else "`Not Set`"
     autorole = f"<@&{s['autorole_id']}>" if s["autorole_id"] else "`Not Set`"
 
@@ -2978,7 +3852,7 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L reactions, Private Voice 2.0, Anti-Scam Shield & Lockdown below.",
+        description="Configure Starboard, W/F/L reactions, Value System, Voice 2.0, Anti-Scam & Lockdown below.",
         color=0x5865F2,
     )
     embed.add_field(name="💡 Ideas Channel", value=ideas, inline=True)
@@ -2987,10 +3861,12 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="⚖️ W/F/L Channel", value=wfl, inline=True)
     embed.add_field(name="🎯 W/F/L Emojis", value=wfl_status, inline=True)
     embed.add_field(name="🔊 Voice 2.0 Trigger", value=jtc, inline=True)
+    embed.add_field(name="💎 Value Channel", value=val_ch, inline=True)
+    embed.add_field(name="🏷️ Value Ping Role", value=val_role, inline=True)
+    embed.add_field(name="📦 Tracked Units", value=f"`{len(VALUE_ITEMS_CACHE)}` units", inline=True)
     embed.add_field(name="🛡️ Anti-Scam Shield", value=shield_status, inline=True)
     embed.add_field(name="🔒 Server Lockdown", value=lock_status, inline=True)
-    embed.add_field(name="🚀 Booster Role", value=booster, inline=True)
-    embed.add_field(name="👋 Join Auto-Role", value=autorole, inline=True)
+    embed.add_field(name="🚀 Booster / Auto-Role", value=f"{booster} / {autorole}", inline=True)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members")
     return embed
 
@@ -3039,9 +3915,19 @@ class ControlPanelView(discord.ui.View):
         update_guild_settings(interaction.guild.id, autorole_id=select.values[0].id)
         await interaction.response.edit_message(embed=await build_panel_embed(interaction.guild), view=self)
 
-    @discord.ui.button(label="Stars", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
-    async def set_threshold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ThresholdModal())
+    @discord.ui.button(label="Value List", style=discord.ButtonStyle.primary, emoji="💎", row=4)
+    async def setup_value_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
+        s = get_guild_settings(interaction.guild.id)
+        await interaction.response.send_message(
+            f"💎 **Value List & Changelog System**\n"
+            f"• **Website:** {s['value_list_url']}\n"
+            f"• **Tracked Units:** `{len(VALUE_ITEMS_CACHE)}`\n"
+            "Configure your changelog channel, ping role, or post the pinned Value Hub below:",
+            view=ValueSetupView(interaction.guild.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Voice 2.0", style=discord.ButtonStyle.secondary, emoji="🔊", row=4)
     async def setup_voice_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3077,17 +3963,61 @@ class ControlPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Post", style=discord.ButtonStyle.primary, emoji="📢", row=4)
-    async def quick_post_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_modal(
-                PostComposerModal(style_key="announcement", target_channel=interaction.channel)
-            )
+    @discord.ui.button(label="Stars / Post", style=discord.ButtonStyle.secondary, emoji="⭐", row=4)
+    async def set_threshold_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ThresholdModal())
 
 
 # -------------------------------------------------------------
 # 13. Slash Commands & Context Menus
 # -------------------------------------------------------------
+async def unit_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    q = normalize_unit_key(current)
+    matches: List[Dict[str, Any]] = []
+    seen_keys: Set[str] = set()
+
+    for item in VALUE_ITEMS_CACHE.values():
+        if not q or q in item["item_key"] or q in item["aliases"]:
+            if item["item_key"] not in seen_keys:
+                seen_keys.add(item["item_key"])
+                matches.append(item)
+        if len(matches) >= 25:
+            break
+
+    return [
+        app_commands.Choice(
+            name=f"{m['name']} — {m['value_text']} ({m['category']})"[:100],
+            value=m["name"][:100],
+        )
+        for m in matches
+    ]
+
+
+@bot.tree.command(name="value", description="Check the current value, demand & stability of any unit")
+@app_commands.describe(
+    unit="Unit name or shortcut (e.g. UTTV, UTC, Pharaoh Cameraman)",
+    public="Show the card publicly in chat (default: False / only visible to you)",
+)
+@app_commands.autocomplete(unit=unit_name_autocomplete)
+async def value_cmd(interaction: discord.Interaction, unit: str, public: bool = False):
+    item = find_value_item(unit)
+    if not item:
+        return await interaction.response.send_message(
+            f"❌ Unit `{unit}` not found in the value list.",
+            ephemeral=True,
+        )
+    site_url = get_guild_settings(interaction.guild.id)["value_list_url"] if interaction.guild else DEFAULT_VALUE_LIST_URL
+    embed = build_unit_value_embed(interaction.guild, item, site_url)
+    view = build_link_view("Open Full Value List", site_url)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=not public)
+
+
+@bot.tree.command(name="value_post", description="Publish formatted value list changes & auto-update the bot's value database")
+@app_commands.default_permissions(manage_messages=True)
+async def value_post_cmd(interaction: discord.Interaction):
+    await interaction.response.send_modal(ValueChangelogModal())
+
+
 @bot.tree.command(name="panel", description="Open the server configuration panel")
 @app_commands.default_permissions(administrator=True)
 async def panel_cmd(interaction: discord.Interaction):
@@ -3339,9 +4269,9 @@ async def stats_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="📈 Bot Performance & Metrics", color=0x2ECC71)
     embed.add_field(name="🏓 Latency", value=f"`{round(bot.latency * 1000)} ms`", inline=True)
     embed.add_field(name="⏱️ Uptime", value=f"`{hours}h {minutes}m {seconds}s`", inline=True)
+    embed.add_field(name="💎 Value Units", value=f"`{len(VALUE_ITEMS_CACHE)}`", inline=True)
     embed.add_field(name="🌟 Showcased Ideas", value=f"`{total_ideas}`", inline=True)
     embed.add_field(name="📊 Active Polls", value=f"`{active_polls}`", inline=True)
-    embed.add_field(name="📅 Upcoming Events", value=f"`{active_events}`", inline=True)
     embed.add_field(name="🔊 Active Temp Voices", value=f"`{len(TEMP_VOICE_CACHE)}`", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -3423,6 +4353,11 @@ async def on_ready():
         s = get_guild_settings(guild.id)
         if s.get("wfl_channel_id"):
             await resolve_wfl_emojis(guild)
+
+    # Initial website sync for Value List
+    synced_units = await sync_value_list_from_website(DEFAULT_VALUE_LIST_URL)
+    if synced_units:
+        print(f"[ValueList] Synced {synced_units} items from website (Total cached: {len(VALUE_ITEMS_CACHE)})")
 
     now_ts = int(time.time())
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
@@ -3534,7 +4469,11 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def background_scheduler():
     now_ts = int(time.time())
 
-    # 1. Check temporary voice rooms: empty, 4-min warning, or 5-min inactivity deletion
+    # 1. Periodic 15-minute website refresh for Value List
+    if time.time() - LAST_VALUE_WEB_SYNC >= 900:
+        asyncio.create_task(sync_value_list_from_website(DEFAULT_VALUE_LIST_URL))
+
+    # 2. Check temporary voice rooms: empty, 4-min warning, or 5-min inactivity deletion
     for ch_id, room in list(TEMP_VOICE_CACHE.items()):
         guild = bot.get_guild(room["guild_id"])
         ch = guild.get_channel(ch_id) if guild else None
@@ -3560,7 +4499,7 @@ async def background_scheduler():
             except Exception:
                 pass
 
-    # 2. Check expired polls
+    # 3. Check expired polls
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
@@ -3584,7 +4523,7 @@ async def background_scheduler():
             except Exception:
                 pass
 
-    # 3. Check scheduled events reminders & start
+    # 4. Check scheduled events reminders & start
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
