@@ -5798,291 +5798,290 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
                         ch = guild.get_channel(ideas_ch_id)
                         if isinstance(ch, discord.TextChannel):
                             orig_msg = await ch.fetch_message(orig_id)
-                            member = guild.get_member(payload.user_id) or discord.Object(id=payload.user_id)
-                            await orig_msg.remove_reaction("⭐", member)
-                    except Exception:
-                        pass
-                    return
-            else:
-                c.execute(
-                    "SELECT orig_message_id FROM starboard_entries WHERE showcase_message_id = ?",
-                    (payload.message_id,),
-                )
-                row = c.fetchone()
-                if not row:
-                    return
-                orig_id = row[0]
-                showcase_msg_id = payload.message_id
-
-            if is_add:
-                c.execute(
-                    "INSERT OR IGNORE INTO starboard_votes (orig_message_id, user_id) VALUES (?, ?)",
-                    (orig_id, payload.user_id),
-                )
-            else:
-                c.execute(
-                    "DELETE FROM starboard_votes WHERE orig_message_id = ? AND user_id = ?",
-                    (orig_id, payload.user_id),
-                )
-
-            c.execute("SELECT COUNT(*) FROM starboard_votes WHERE orig_message_id = ?", (orig_id,))
-            stars_count = c.fetchone()[0]
-
-            if showcase_msg_id:
-                c.execute(
-                    "UPDATE starboard_entries SET stars_count = ? WHERE orig_message_id = ?",
-                    (stars_count, orig_id),
-                )
-            conn.commit()
-
-        ideas_ch = guild.get_channel(ideas_ch_id)
-        showcase_ch = guild.get_channel(showcase_ch_id)
-        if not isinstance(ideas_ch, discord.TextChannel) or not isinstance(showcase_ch, discord.TextChannel):
-            return
-
-        try:
-            orig_message = await ideas_ch.fetch_message(orig_id)
-        except Exception:
-            return
-
-        embed = build_showcase_embed(orig_message, stars_count)
-        view = build_showcase_view(orig_message.jump_url, stars_count)
-
-        if showcase_msg_id:
-            try:
-                sc_msg = await showcase_ch.fetch_message(showcase_msg_id)
-                await sc_msg.edit(embed=embed, view=view)
-            except discord.NotFound:
-                showcase_msg_id = None
-
-        if not showcase_msg_id and stars_count >= threshold:
-            sent = await showcase_ch.send(embed=embed, view=view)
-            try:
-                await sent.add_reaction("⭐")
-            except Exception:
-                pass
-            with get_db() as conn:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO starboard_entries
-                    (orig_message_id, showcase_message_id, guild_id, channel_id, stars_count)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (orig_id, sent.id, guild.id, ideas_ch_id, stars_count),
-                )
-                conn.commit()
-
-
-# -------------------------------------------------------------
-# 13.5 Exclusive Reaction Roles (Supports Custom Server Emojis, Last-Clicked Wins)
-# -------------------------------------------------------------
-REACTION_ROLE_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
-
-
-def normalize_reaction_emoji_key(emoji: Union[discord.PartialEmoji, discord.Emoji, str]) -> str:
-    if isinstance(emoji, (discord.PartialEmoji, discord.Emoji)):
-        return f"id:{emoji.id}" if emoji.id else f"uni:{emoji.name}"
-    raw = str(emoji).strip()
-    m = re.match(r"^<a?:([a-zA-Z0-9_~]+):(\d+)>$", raw)
-    if m:
-        return f"id:{m.group(2)}"
-    return f"uni:{raw}"
-
-
-def resolve_emoji_from_raw(guild: discord.Guild, raw_emoji: str) -> Optional[Union[discord.PartialEmoji, discord.Emoji, str]]:
-    raw = raw_emoji.strip()
-    if not raw:
-        return None
-    m = re.match(r"^<(a?):([a-zA-Z0-9_~]+):(\d+)>$", raw)
-    if m:
-        eid = int(m.group(3))
-        found = guild.get_emoji(eid) or bot.get_emoji(eid)
-        if found:
-            return found
-        return discord.PartialEmoji(name=m.group(2), id=eid, animated=bool(m.group(1)))
-
-    name_clean = raw.strip(":")
-    for e in guild.emojis:
-        if e.name.lower() == name_clean.lower():
-            return e
-    for e in bot.emojis:
-        if e.name.lower() == name_clean.lower():
-            return e
-    return raw
-
-
-def build_reaction_role_embed(
-    guild: discord.Guild,
-    title: str,
-    description: str,
-    items: List[Tuple[str, str, int, str]],
-    image_url: str = "",
-    required_role_ids: Optional[List[int]] = None,
-) -> discord.Embed:
-    lines: List[str] = []
-    if description.strip():
-        lines.append(description.strip())
-        lines.append("")
-
-    for _, emoji_raw, role_id, label in items:
-        label_part = f" — *{label}*" if label.strip() else ""
-        lines.append(f"{emoji_raw} ➔ <@&{role_id}>{label_part}")
-
-    if required_role_ids:
-        req_mentions = ", ".join(f"<@&{rid}>" for rid in required_role_ids)
-        lines.append(f"\n🔒 **Required Role (at least one):** {req_mentions}")
-
-    lines.append("\n-# 💡 You can hold **only 1 role** from this list at a time — clicking a new reaction automatically replaces your previous choice.")
-
-    embed = discord.Embed(
-        title=title.strip() or "🎭 Choose Your Role",
-        description="\n".join(lines),
-        color=0x5865F2,
+class ReactionRoleAddOptionModal(discord.ui.Modal, title="Bind Emoji to Selected Role"):
+    emoji_input = discord.ui.TextInput(
+        label="Emoji (Custom :name: or Standard Emoji)",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=80,
+        placeholder="e.g. :w1_win: or 🔥 or <:emoji:123456>",
     )
-    if image_url and image_url.strip().startswith(("http://", "https://")):
-        embed.set_image(url=image_url.strip())
-    embed.set_footer(
-        text=f"{guild.name} • Exclusive Reaction Roles",
-        icon_url=guild.icon.url if guild.icon else None,
+    note_input = discord.ui.TextInput(
+        label="Short Note / Label (Optional)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=80,
+        placeholder="e.g. Updates Ping",
     )
-    return embed
+
+    def __init__(self, builder: "ReactionRoleBuilderView", role: discord.Role):
+        super().__init__()
+        self.builder = builder
+        self.role = role
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        guild = interaction.guild
+        emoji_obj = resolve_emoji_from_raw(guild, self.emoji_input.value)
+        if not emoji_obj:
+            return await interaction.response.send_message(
+                f"❌ Could not recognize emoji `{self.emoji_input.value}`.",
+                ephemeral=True,
+            )
+
+        e_key = normalize_reaction_emoji_key(emoji_obj)
+        e_raw = str(emoji_obj)
+        note = self.note_input.value.strip()
+
+        # Replace if same emoji or same role already exists in draft
+        self.builder.items = [
+            it for it in self.builder.items
+            if it[0] != e_key and it[2] != self.role.id
+        ]
+        if len(self.builder.items) >= 20:
+            return await interaction.response.send_message(
+                "❌ Discord allows up to **20** reactions per message.",
+                ephemeral=True,
+            )
+
+        self.builder.items.append((e_key, e_raw, self.role.id, note, emoji_obj))
+        await interaction.response.edit_message(
+            content=self.builder.build_status_text(),
+            embed=self.builder.build_preview_embed(),
+            view=self.builder,
+        )
 
 
-class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post"):
+class ReactionRoleEditTextModal(discord.ui.Modal, title="Edit Post Title & Description"):
     title_input = discord.ui.TextInput(
         label="Post Title",
         style=discord.TextStyle.short,
         required=True,
         max_length=150,
-        default="🎭 Choose Your Ping / Class Role",
-        placeholder="e.g. Select Your Game Ping Role",
     )
     desc_input = discord.ui.TextInput(
         label="Description (Optional)",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=1500,
-        placeholder="React below to pick your role. Only your latest reaction is kept!",
-    )
-    mappings_input = discord.ui.TextInput(
-        label="Emoji | @Role or RoleID | Note (1 per line)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=2000,
-        placeholder=":w1_win: | 123456789012345678 | Updates Ping\n🔥 | @EventPing | Event Alerts",
-    )
-    req_roles_input = discord.ui.TextInput(
-        label="Required Roles (Any 1 needed, IDs/@names)",
-        style=discord.TextStyle.short,
-        required=False,
-        max_length=300,
-        placeholder="Optional: 123456789012345678, Booster, Verified",
     )
 
-    def __init__(self, target_channel: discord.TextChannel, image_url: str = "", preselected_req_ids: Optional[List[int]] = None):
+    def __init__(self, builder: "ReactionRoleBuilderView"):
         super().__init__()
-        self.target_channel = target_channel
-        self.image_url = image_url
-        if preselected_req_ids:
-            self.req_roles_input.default = ", ".join(str(rid) for rid in preselected_req_ids)
+        self.builder = builder
+        self.title_input.default = builder.title
+        self.desc_input.default = builder.description
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            return
-        guild = interaction.guild
+        self.builder.title = self.title_input.value.strip() or "🎭 Choose Your Role"
+        self.builder.description = self.desc_input.value.strip()
+        await interaction.response.edit_message(
+            content=self.builder.build_status_text(),
+            embed=self.builder.build_preview_embed(),
+            view=self.builder,
+        )
 
-        parsed_items: List[Tuple[str, str, int, str, Any]] = []
-        seen_keys: Set[str] = set()
-        errors: List[str] = []
 
-        # Parse optional required roles (member needs AT LEAST ONE of these)
-        req_role_ids: List[int] = []
-        raw_req = self.req_roles_input.value.strip()
-        if raw_req:
-            for token in re.split(r"[,;\n]+", raw_req):
-                t = token.strip()
-                if not t:
-                    continue
-                r_obj: Optional[discord.Role] = None
-                id_m = re.search(r"(\d{15,22})", t)
-                if id_m:
-                    r_obj = guild.get_role(int(id_m.group(1)))
-                if not r_obj:
-                    clean_n = t.lstrip("@").strip().lower()
-                    for r in guild.roles:
-                        if not r.is_default() and r.name.lower() == clean_n:
-                            r_obj = r
-                            break
-                if not r_obj:
-                    errors.append(f"Required role `{t}` not found (use Role ID or exact name).")
-                elif r_obj.id not in req_role_ids:
-                    req_role_ids.append(r_obj.id)
+class ReactionRoleQuickEmojiSelectView(discord.ui.View):
+    """Lets you pick a custom server emoji from a dropdown list instead of typing its name."""
+    def __init__(self, builder: "ReactionRoleBuilderView", role: discord.Role, guild_emojis: List[discord.Emoji]):
+        super().__init__(timeout=90)
+        self.builder = builder
+        self.role = role
+        self.emoji_lookup = {str(e.id): e for e in guild_emojis}
 
-        for idx, raw_line in enumerate(self.mappings_input.value.splitlines(), start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) < 2:
-                errors.append(f"Line {idx}: expected `Emoji | Role` format.")
-                continue
-
-            emoji_token = parts[0]
-            role_token = parts[1]
-            note_token = parts[2] if len(parts) >= 3 else ""
-
-            emoji_obj = resolve_emoji_from_raw(guild, emoji_token)
-            if not emoji_obj:
-                errors.append(f"Line {idx}: invalid emoji `{emoji_token}`.")
-                continue
-
-            e_key = normalize_reaction_emoji_key(emoji_obj)
-            if e_key in seen_keys:
-                errors.append(f"Line {idx}: duplicate emoji `{emoji_token}`.")
-                continue
-
-            role_obj: Optional[discord.Role] = None
-            role_id_m = re.search(r"(\d{15,22})", role_token)
-            if role_id_m:
-                role_obj = guild.get_role(int(role_id_m.group(1)))
-            if not role_obj:
-                clean_rname = role_token.lstrip("@").strip().lower()
-                for r in guild.roles:
-                    if not r.is_default() and r.name.lower() == clean_rname:
-                        role_obj = r
-                        break
-
-            if not role_obj:
-                errors.append(f"Line {idx}: role `{role_token}` not found (use Role ID or exact name).")
-                continue
-            if guild.me and guild.me.top_role <= role_obj:
-                errors.append(f"Line {idx}: bot's highest role must be above **{role_obj.name}**.")
-                continue
-
-            seen_keys.add(e_key)
-            display_emoji = str(emoji_obj)
-            parsed_items.append((e_key, display_emoji, role_obj.id, note_token, emoji_obj))
-
-        if errors:
-            return await interaction.response.send_message(
-                "❌ **Could not create reaction role post:**\n" + "\n".join(f"• {e}" for e in errors[:10]),
-                ephemeral=True,
+        options = [
+            discord.SelectOption(
+                label=f":{e.name}:"[:80],
+                value=str(e.id),
+                emoji=e,
+                description=f"Bind to @{role.name[:60]}",
             )
-        if not parsed_items:
-            return await interaction.response.send_message("❌ Add at least 1 `Emoji | Role` line.", ephemeral=True)
-        if len(parsed_items) > 20:
-            return await interaction.response.send_message("❌ Discord allows up to **20** reactions per message.", ephemeral=True)
+            for e in guild_emojis[:25]
+        ]
+        sel = discord.ui.Select(
+            placeholder=f"🎨 Pick a custom server emoji for @{role.name[:40]}...",
+            options=options,
+            row=0,
+        )
+        sel.callback = self.on_pick_emoji
+        self.add_item(sel)
 
-        await interaction.response.defer(ephemeral=True)
+    @discord.ui.button(label="Type Custom / Standard Emoji Instead", style=discord.ButtonStyle.secondary, emoji="⌨️", row=1)
+    async def type_instead_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ReactionRoleAddOptionModal(self.builder, self.role))
 
-        db_items = [(ek, er, rid, lbl) for ek, er, rid, lbl, _ in parsed_items]
-        embed = build_reaction_role_embed(
-            guild=guild,
-            title=self.title_input.value,
-            description=self.desc_input.value,
+    async def on_pick_emoji(self, interaction: discord.Interaction):
+        eid = interaction.data["values"][0]
+        em_obj = self.emoji_lookup.get(eid)
+        if not em_obj:
+            return await interaction.response.send_message("❌ Emoji not found.", ephemeral=True)
+
+        e_key = normalize_reaction_emoji_key(em_obj)
+        e_raw = str(em_obj)
+        self.builder.items = [
+            it for it in self.builder.items
+            if it[0] != e_key and it[2] != self.role.id
+        ]
+        if len(self.builder.items) >= 20:
+            return await interaction.response.send_message("❌ Maximum 20 reactions reached.", ephemeral=True)
+
+        self.builder.items.append((e_key, e_raw, self.role.id, "", em_obj))
+        await interaction.response.edit_message(
+            content=f"✅ Bound {e_raw} ➔ {self.role.mention}! (Return to the builder message above to add more or click **Publish**)",
+            view=None,
+        )
+        if self.builder.panel_message:
+            try:
+                await self.builder.panel_message.edit(
+                    content=self.builder.build_status_text(),
+                    embed=self.builder.build_preview_embed(),
+                    view=self.builder,
+                )
+            except Exception:
+                pass
+
+
+class ReactionRoleBuilderView(discord.ui.View):
+    def __init__(
+        self,
+        guild: discord.Guild,
+        target_channel: discord.TextChannel,
+        title: str = "🎭 Choose Your Role",
+        description: str = "",
+        image_url: str = "",
+        required_role_ids: Optional[List[int]] = None,
+    ):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.target_channel = target_channel
+        self.title = title
+        self.description = description
+        self.image_url = image_url
+        self.required_role_ids: List[int] = list(required_role_ids or [])
+        self.items: List[Tuple[str, str, int, str, Any]] = []
+        self.panel_message: Optional[discord.Message] = None
+
+    def build_status_text(self) -> str:
+        req_txt = (
+            ", ".join(f"<@&{rid}>" for rid in self.required_role_ids)
+            if self.required_role_ids
+            else "`None (Everyone can react)`"
+        )
+        return (
+            f"🛠️ **Visual Reaction-Role Builder** ➔ Target: {self.target_channel.mention}\n"
+            f"• **Options added:** `{len(self.items)}/20` (Live preview below)\n"
+            f"• **Required Roles (any 1 needed):** {req_txt}\n"
+            "Pick a role from the **1st dropdown** to bind an emoji to it — no IDs needed!"
+        )
+
+    def build_preview_embed(self) -> discord.Embed:
+        db_items = [(ek, er, rid, lbl) for ek, er, rid, lbl, _ in self.items]
+        if not db_items:
+            preview = discord.Embed(
+                title=self.title,
+                description=(
+                    (self.description + "\n\n" if self.description else "")
+                    + "*No roles added yet — pick a role in the dropdown below to add your first button/reaction!*"
+                ),
+                color=0x5865F2,
+            )
+            if self.image_url and self.image_url.startswith(("http://", "https://")):
+                preview.set_image(url=self.image_url)
+            return preview
+        return build_reaction_role_embed(
+            guild=self.guild,
+            title=self.title,
+            description=self.description,
             items=db_items,
             image_url=self.image_url,
-            required_role_ids=req_role_ids,
+            required_role_ids=self.required_role_ids,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="➕ Step 1: Pick a Role to add to the post...",
+        min_values=1,
+        max_values=1,
+        row=0,
+    )
+    async def pick_role_to_add(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role = select.values[0]
+        if role.is_default():
+            return await interaction.response.send_message("❌ Cannot assign `@everyone`.", ephemeral=True)
+        if self.guild.me and self.guild.me.top_role <= role:
+            return await interaction.response.send_message(
+                f"❌ Bot's highest role must be above **{role.name}** in Server Settings ➔ Roles.",
+                ephemeral=True,
+            )
+
+        guild_emojis = list(self.guild.emojis)
+        if guild_emojis:
+            await interaction.response.send_message(
+                f"🎨 Choose an emoji for {role.mention} from your server list, or type any standard/custom emoji:",
+                view=ReactionRoleQuickEmojiSelectView(self, role, guild_emojis),
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_modal(ReactionRoleAddOptionModal(self, role))
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🔒 Step 2 (Optional): Pick Required Roles (any 1 needed)...",
+        min_values=1,
+        max_values=10,
+        row=1,
+    )
+    async def pick_required_roles(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        self.required_role_ids = [r.id for r in select.values if not r.is_default()]
+        await interaction.response.edit_message(
+            content=self.build_status_text(),
+            embed=self.build_preview_embed(),
+            view=self,
+        )
+
+    @discord.ui.button(label="Edit Title / Text", style=discord.ButtonStyle.secondary, emoji="✏️", row=2)
+    async def edit_text_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ReactionRoleEditTextModal(self))
+
+    @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.secondary, emoji="↩️", row=2)
+    async def undo_last_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.items:
+            return await interaction.response.send_message("⚠️ Nothing to remove.", ephemeral=True)
+        self.items.pop()
+        await interaction.response.edit_message(
+            content=self.build_status_text(),
+            embed=self.build_preview_embed(),
+            view=self,
+        )
+
+    @discord.ui.button(label="Clear Required", style=discord.ButtonStyle.secondary, emoji="🔓", row=2)
+    async def clear_req_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.required_role_ids = []
+        await interaction.response.edit_message(
+            content=self.build_status_text(),
+            embed=self.build_preview_embed(),
+            view=self,
+        )
+
+    @discord.ui.button(label="Publish Post", style=discord.ButtonStyle.success, emoji="🚀", row=3)
+    async def publish_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.items:
+            return await interaction.response.send_message(
+                "❌ Add at least **1 role** using the dropdown above before publishing!",
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        db_items = [(ek, er, rid, lbl) for ek, er, rid, lbl, _ in self.items]
+        embed = build_reaction_role_embed(
+            guild=self.guild,
+            title=self.title,
+            description=self.description,
+            items=db_items,
+            image_url=self.image_url,
+            required_role_ids=self.required_role_ids,
         )
 
         try:
@@ -6090,7 +6089,7 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
         except Exception as e:
             return await interaction.followup.send(f"❌ Failed to send message: `{e}`", ephemeral=True)
 
-        req_packed = ",".join(str(rid) for rid in req_role_ids)
+        req_packed = ",".join(str(rid) for rid in self.required_role_ids)
         with get_db() as conn:
             conn.execute(
                 """
@@ -6102,9 +6101,9 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
                 (
                     sent.id,
                     self.target_channel.id,
-                    guild.id,
-                    self.title_input.value.strip(),
-                    self.desc_input.value.strip(),
+                    self.guild.id,
+                    self.title,
+                    self.description,
                     self.image_url,
                     req_packed,
                 ),
@@ -6121,7 +6120,7 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
             conn.commit()
 
         failed_reacts: List[str] = []
-        for _, disp_em, _, _, em_obj in parsed_items:
+        for _, disp_em, _, _, em_obj in self.items:
             try:
                 await sent.add_reaction(em_obj)
                 await asyncio.sleep(0.35)
@@ -6129,15 +6128,16 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
                 failed_reacts.append(disp_em)
 
         warn_note = (
-            f"\n⚠️ Could not pre-react with {', '.join(failed_reacts)} (make sure the emoji is from this server or accessible to the bot)."
+            f"\n⚠️ Could not pre-react with {', '.join(failed_reacts)}."
             if failed_reacts
             else ""
         )
         await interaction.followup.send(
-            f"✅ **Exclusive Reaction Role post published** in {self.target_channel.mention} with **{len(parsed_items)}** role(s)! "
+            f"✅ **Exclusive Reaction Role post published** in {self.target_channel.mention} with **{len(self.items)}** role(s)! "
             f"[Jump to Post]({sent.jump_url}){warn_note}",
             ephemeral=True,
         )
+        self.stop()
 
 
 async def process_reaction_role_event(payload: discord.RawReactionActionEvent, is_add: bool):
@@ -7334,40 +7334,40 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
             start_ts=ev[3],
             followers_count=f_count,
             image_url=image.url,
-            started=bool(ev[4]),
-        )
-        await msg_obj.edit(embed=embed)
-    await interaction.response.send_message("✅ Event banner updated!", ephemeral=True)
-
-
-@bot.tree.command(name="reaction_roles", description="Create an exclusive reaction-role post (supports custom emojis, keeps only latest choice)")
+@bot.tree.command(name="reaction_roles", description="Open the visual builder to create an exclusive reaction-role post (no IDs needed!)")
 @app_commands.describe(
     channel="Channel where the reaction-role post will be sent",
+    title="Optional post title",
+    description="Optional post description",
     image="Optional banner image for the post",
-    required_role_1="Optional required role #1 (user needs at least one of the required roles)",
-    required_role_2="Optional required role #2 (user needs at least one of the required roles)",
-    required_role_3="Optional required role #3 (user needs at least one of the required roles)",
 )
 @app_commands.default_permissions(manage_roles=True)
 async def reaction_roles_cmd(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
+    title: str = "🎭 Choose Your Role",
+    description: str = "",
     image: Optional[discord.Attachment] = None,
-    required_role_1: Optional[discord.Role] = None,
-    required_role_2: Optional[discord.Role] = None,
-    required_role_3: Optional[discord.Role] = None,
 ):
-    pre_ids: List[int] = []
-    for r in (required_role_1, required_role_2, required_role_3):
-        if r and r.id not in pre_ids:
-            pre_ids.append(r.id)
-    await interaction.response.send_modal(
-        ReactionRolePostModal(
-            target_channel=channel,
-            image_url=image.url if image else "",
-            preselected_req_ids=pre_ids,
-        )
+    if not interaction.guild:
+        return
+    builder = ReactionRoleBuilderView(
+        guild=interaction.guild,
+        target_channel=channel,
+        title=title,
+        description=description,
+        image_url=image.url if image else "",
     )
+    await interaction.response.send_message(
+        content=builder.build_status_text(),
+        embed=builder.build_preview_embed(),
+        view=builder,
+        ephemeral=True,
+    )
+    try:
+        builder.panel_message = await interaction.original_response()
+    except Exception:
+        pass
 
 
 @bot.tree.command(name="reaction_role_add", description="Add or update an emoji -> role option on an existing reaction-role post")
