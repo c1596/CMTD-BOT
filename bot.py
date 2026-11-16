@@ -81,6 +81,7 @@ CALC_COOLDOWNS: Dict[int, float] = {}
 CALC_COOLDOWN_SECONDS = 10.0
 LFG_POST_COOLDOWNS: Dict[int, float] = {}
 LFG_COOLDOWN_SECONDS = 25.0
+CLAN_TAG_CHECK_COOLDOWNS: Dict[int, float] = {}
 
 # Temporary Voice RAM State (Deletes only when empty or closed by owner)
 TEMP_VOICE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -139,7 +140,9 @@ def init_db():
                 wfl_smart_filter INTEGER DEFAULT 1,
                 signs_channel_id INTEGER,
                 lfg_channel_1_id INTEGER,
-                lfg_channel_2_id INTEGER
+                lfg_channel_2_id INTEGER,
+                clan_tag_enabled INTEGER DEFAULT 0,
+                clan_tag_role_id INTEGER
             )
             """
         )
@@ -161,6 +164,8 @@ def init_db():
             "signs_channel_id": "INTEGER",
             "lfg_channel_1_id": "INTEGER",
             "lfg_channel_2_id": "INTEGER",
+            "clan_tag_enabled": "INTEGER DEFAULT 0",
+            "clan_tag_role_id": "INTEGER",
         }
         for col_name, col_type in extra_cols.items():
             if col_name not in cols:
@@ -504,7 +509,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
                    booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                    antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                    value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                   wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id
+                   wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
+                   clan_tag_enabled, clan_tag_role_id
             FROM guild_settings WHERE guild_id = ?
             """,
             (guild_id,),
@@ -529,6 +535,8 @@ def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "signs_channel_id": row[15] if row else None,
             "lfg_channel_1_id": row[16] if row else None,
             "lfg_channel_2_id": row[17] if row else None,
+            "clan_tag_enabled": bool(row[18]) if (row and row[18] is not None) else False,
+            "clan_tag_role_id": row[19] if row else None,
         }
         SETTINGS_CACHE[guild_id] = data
         return data
@@ -547,9 +555,10 @@ def update_guild_settings(guild_id: int, **kwargs):
                 star_threshold, booster_role_id, autorole_id, wfl_channel_id, jtc_channel_id,
                 antiscam_enabled, antiscam_log_channel_id, antiscam_timeout_mins,
                 value_channel_id, value_ping_role_id, value_list_url, value_manager_role_ids,
-                wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id
+                wfl_smart_filter, signs_channel_id, lfg_channel_1_id, lfg_channel_2_id,
+                clan_tag_enabled, clan_tag_role_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id) DO UPDATE SET
                 ideas_channel_id = excluded.ideas_channel_id,
                 showcase_channel_id = excluded.showcase_channel_id,
@@ -568,7 +577,9 @@ def update_guild_settings(guild_id: int, **kwargs):
                 wfl_smart_filter = excluded.wfl_smart_filter,
                 signs_channel_id = excluded.signs_channel_id,
                 lfg_channel_1_id = excluded.lfg_channel_1_id,
-                lfg_channel_2_id = excluded.lfg_channel_2_id
+                lfg_channel_2_id = excluded.lfg_channel_2_id,
+                clan_tag_enabled = excluded.clan_tag_enabled,
+                clan_tag_role_id = excluded.clan_tag_role_id
             """,
             (
                 guild_id,
@@ -590,6 +601,8 @@ def update_guild_settings(guild_id: int, **kwargs):
                 current["signs_channel_id"],
                 current["lfg_channel_1_id"],
                 current["lfg_channel_2_id"],
+                1 if current["clan_tag_enabled"] else 0,
+                current["clan_tag_role_id"],
             ),
         )
         conn.commit()
@@ -627,12 +640,25 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 
 
 # -------------------------------------------------------------
-# 3. Value List & Partner Signs System (Full-History Scan + /value + /calc)
+# 3. Value List & Partner Signs System (Strict Prefix Resolver + Aliases)
 # -------------------------------------------------------------
+# Distinct variant/prefix tokens that MUST NOT be blurred with base units
+# (e.g., "Baker Titan Speakerman" != "Titan Speakerman", "Upgraded Titan TV Man" != "Titan TV Man")
+DISTINCT_VARIANT_TOKENS: Set[str] = {
+    "baker", "upgraded", "hyper", "golden", "gold", "dark", "corrupted",
+    "halloween", "hallow", "chef", "santa", "shiny", "devsigned", "signed",
+    "reinforced", "large", "prototype", "headless", "jetpack", "vampire",
+    "glitch", "videotaper", "spider", "cinema", "cinemaman", "executioner",
+    "chaos", "pharaoh", "hacked", "engineer", "scientist", "laser", "ninja",
+    "dragon", "repair", "drone", "woman", "speakerwoman", "tvwoman",
+    "crate", "pass", "lucky", "money", "candy", "speed",
+}
+
 KNOWN_UNIT_ALIASES: Dict[str, List[str]] = {
     "upgraded titan tv man": ["uttv", "upgraded titan tv", "ttv"],
     "upgraded titan cameraman": ["utc", "upgraded titan cam", "tcm"],
     "upgraded titan speakerman": ["uts", "upgraded titan speaker", "tsm"],
+    "baker titan speakerman": ["baker", "baker tts", "baker tsm", "baker speaker"],
     "engineer cameraman": ["eng", "engineer cam", "engineer"],
     "hacked cameraman": ["hacked cam", "hacked"],
     "executioner tv man": ["exectioner tv man", "exec", "executioner"],
@@ -656,6 +682,7 @@ INITIAL_VALUE_SEED: List[Tuple[str, str, str, str, str]] = [
     ("Engineer Cameraman", "Exclusive", "6,350", "8/10", "Fluctuating"),
     ("Chaos Cameraman", "Mythic", "5,000", "9.5/10", "Heavily Overpaid"),
     ("Upgraded Titan TV Man", "Godly", "4,650", "8/10", "Slowly Dropping | Underpaid"),
+    ("Baker Titan Speakerman", "Exclusive", "3,750", "8.5/10", "Fluctuating"),
     ("Upgraded Titan Cameraman", "Godly", "2,800", "7/10", "Underpaid | Stable"),
     ("x2 Candy", "Gamepasses", "2,350", "8/10", "Overpaid"),
     ("2x Money", "Gamepasses", "2,200", "9/10", "Overpaid"),
@@ -724,6 +751,11 @@ def normalize_unit_key(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
 
 
+def _extract_variant_tokens(text: str) -> Set[str]:
+    words = {w for w in re.split(r"[^a-z0-9а-яё]+", normalize_unit_key(text)) if w}
+    return words & DISTINCT_VARIANT_TOKENS
+
+
 def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
     key = normalize_unit_key(name)
     aliases: Set[str] = {key}
@@ -732,7 +764,7 @@ def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
         if cleaned:
             aliases.add(cleaned)
     for known_key, extra_list in KNOWN_UNIT_ALIASES.items():
-        if key == known_key or key in extra_list:
+        if key == known_key:
             aliases.add(known_key)
             for item in extra_list:
                 aliases.add(normalize_unit_key(item))
@@ -746,12 +778,15 @@ def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
 
 def rebuild_alias_map():
     VALUE_ALIAS_MAP.clear()
+    # First pass: register custom aliases
     for item_key, item in VALUE_ITEMS_CACHE.items():
-        VALUE_ALIAS_MAP[item_key] = item_key
         for alias in item.get("aliases", "").split(","):
             a_clean = normalize_unit_key(alias)
-            if a_clean:
+            if a_clean and a_clean != item_key:
                 VALUE_ALIAS_MAP[a_clean] = item_key
+    # Second pass: canonical item keys ALWAYS take highest priority over any alias
+    for item_key in VALUE_ITEMS_CACHE:
+        VALUE_ALIAS_MAP[item_key] = item_key
 
 
 def reload_value_cache():
@@ -1319,23 +1354,86 @@ def build_sign_partners_embed(guild: Optional[discord.Guild]) -> discord.Embed:
     return embed
 
 
-def find_value_item(query: str) -> Optional[Dict[str, Any]]:
+def _is_variant_compatible(query_str: str, candidate_str: str) -> bool:
+    """Prevents 'Baker Titan Speakerman' from colliding with 'Titan Speakerman'."""
+    q_vars = _extract_variant_tokens(query_str)
+    c_vars = _extract_variant_tokens(candidate_str)
+    # Every distinctive prefix/variant in the query must exist in the candidate
+    if not q_vars.issubset(c_vars):
+        return False
+    # If query is a full multi-word unit name without extra variants, don't randomly map to a prefixed variant either
+    if len(q_vars) == 0 and len(c_vars) > 0 and len(query_str.split()) >= 2:
+        return False
+    return True
+
+
+def find_value_item(query: str, strict_exact: bool = False) -> Optional[Dict[str, Any]]:
     q = normalize_unit_key(query)
     if not q:
         return None
+
+    # 1. Exact canonical key match (highest priority)
+    if q in VALUE_ITEMS_CACHE:
+        return VALUE_ITEMS_CACHE[q]
+
+    # 2. Exact alias match
     if q in VALUE_ALIAS_MAP:
         return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[q])
+
+    if strict_exact:
+        return None
+
+    # 3. Prefix match (prefer longest matching alias/key, respecting variant prefixes)
+    prefix_matches: List[Tuple[int, str]] = []
     for alias, key in VALUE_ALIAS_MAP.items():
-        if alias.startswith(q):
-            return VALUE_ITEMS_CACHE.get(key)
-    for alias, key in VALUE_ALIAS_MAP.items():
-        if q in alias:
-            return VALUE_ITEMS_CACHE.get(key)
-    if len(q) >= 4 and VALUE_ALIAS_MAP:
-        close = difflib.get_close_matches(q, list(VALUE_ALIAS_MAP.keys()), n=1, cutoff=0.78)
-        if close:
-            return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[close[0]])
+        if alias.startswith(q) and _is_variant_compatible(q, alias):
+            prefix_matches.append((len(alias), key))
+    if prefix_matches:
+        prefix_matches.sort(key=lambda x: x[0])
+        return VALUE_ITEMS_CACHE.get(prefix_matches[0][1])
+
+    # 4. Substring match (only when query >= 4 chars and variant-compatible)
+    if len(q) >= 4:
+        sub_matches: List[Tuple[int, str]] = []
+        for alias, key in VALUE_ALIAS_MAP.items():
+            if q in alias and _is_variant_compatible(q, alias):
+                sub_matches.append((len(alias), key))
+        if sub_matches:
+            sub_matches.sort(key=lambda x: x[0])
+            return VALUE_ITEMS_CACHE.get(sub_matches[0][1])
+
+    # 5. Typo fuzzy match (high cutoff + strict variant token check)
+    if len(q) >= 5 and VALUE_ALIAS_MAP:
+        close = difflib.get_close_matches(q, list(VALUE_ALIAS_MAP.keys()), n=5, cutoff=0.84)
+        for c_alias in close:
+            if _is_variant_compatible(q, c_alias):
+                return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[c_alias])
+
     return None
+
+
+def add_custom_unit_alias(unit_query: str, new_alias: str) -> Optional[Dict[str, Any]]:
+    target = find_value_item(unit_query)
+    if not target:
+        return None
+    clean_alias = normalize_unit_key(new_alias)
+    if not clean_alias:
+        return None
+
+    alias_set = {normalize_unit_key(a) for a in target.get("aliases", "").split(",") if normalize_unit_key(a)}
+    alias_set.add(clean_alias)
+    packed = ",".join(sorted(alias_set))
+    target["aliases"] = packed
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE value_items SET aliases = ? WHERE item_key = ?",
+            (packed, target["item_key"]),
+        )
+        conn.commit()
+
+    rebuild_alias_map()
+    return target
 
 
 def delete_value_item(query: str) -> Optional[Dict[str, Any]]:
@@ -1374,13 +1472,21 @@ def upsert_value_item(
     image_url: Optional[str] = None,
     source: str = "manual",
 ) -> Tuple[Dict[str, Any], bool]:
-    existing = find_value_item(name)
+    # Use strict_exact=True when creating/syncing by full name so "Baker Titan Speakerman"
+    # NEVER overwrites "Titan Speakerman" (2) and always creates/updates its own entry (3750)!
+    clean_display = name.strip()
+    exact_key = normalize_unit_key(clean_display)
+    existing = VALUE_ITEMS_CACHE.get(exact_key)
+    if not existing and source in ("changelog", "manual"):
+        existing = find_value_item(clean_display, strict_exact=False)
+
     now_ts = int(time.time())
     changed_fields: List[Tuple[str, str, str]] = []
 
     if existing:
         item_key = existing["item_key"]
-        final_name = existing["name"]
+        # Update display name casing if website provides cleaner casing
+        final_name = clean_display if (source == "auto-check" and clean_display) else existing["name"]
         final_aliases = build_aliases_for_unit(final_name, existing.get("aliases", ""))
         final_cat = category if category else existing["category"]
         final_val = value_text if value_text is not None else existing["value_text"]
@@ -1399,8 +1505,8 @@ def upsert_value_item(
         if sign_value_text is not None and sign_value_text != existing["sign_value_text"]:
             changed_fields.append(("Sign Value", existing["sign_value_text"] or "None", sign_value_text))
     else:
-        item_key = normalize_unit_key(name)
-        final_name = name.strip()
+        item_key = exact_key
+        final_name = clean_display
         final_aliases = build_aliases_for_unit(final_name)
         final_cat = category or "Unit"
         final_val = value_text or "N/A"
@@ -1463,9 +1569,7 @@ def upsert_value_item(
         "updated_at": effective_ts,
     }
     VALUE_ITEMS_CACHE[item_key] = item_dict
-    for a in final_aliases.split(","):
-        if a.strip():
-            VALUE_ALIAS_MAP[a.strip()] = item_key
+    rebuild_alias_map()
     return item_dict, bool(changed_fields)
 
 
@@ -1478,7 +1582,7 @@ async def get_http_session() -> Optional["aiohttp.ClientSession"]:
         HTTP_SESSION = aiohttp.ClientSession(
             timeout=timeout,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.2; +https://discord.com)",
+                "User-Agent": "Mozilla/5.0 (compatible; CMTDBot/10.3; +https://discord.com)",
                 "Accept": "text/html,application/xhtml+xml,application/json",
                 "Cache-Control": "no-cache",
             },
@@ -1571,7 +1675,7 @@ def _parse_and_apply_website_html(raw_html: str) -> Tuple[int, int]:
     for key, rec in parsed_records.items():
         cand_name = rec["name"] or key
         val_str = rec["value_text"]
-        existing = find_value_item(cand_name)
+        existing = VALUE_ITEMS_CACHE.get(normalize_unit_key(cand_name))
         prev_val = None
         if existing and val_str and existing["value_text"] != val_str:
             prev_val = existing["value_text"]
@@ -1925,6 +2029,74 @@ def format_trade_side_total(side: Dict[str, Any]) -> str:
     return base
 
 
+def build_trade_comparison_embed(
+    guild: Optional[discord.Guild],
+    user: discord.abc.User,
+    give_side: Dict[str, Any],
+    get_side: Dict[str, Any],
+) -> discord.Embed:
+    diff = get_side["avg_val"] - give_side["avg_val"]
+    denom = max(give_side["avg_val"], get_side["avg_val"], 1.0)
+    pct_diff = abs(diff / denom) * 100.0
+
+    if diff > 0:
+        diff_summary = f"📥 **You Get** is **`+{diff:,.0f}`** (`{pct_diff:.1f}%`) higher in value"
+    elif diff < 0:
+        diff_summary = f"📤 **You Give** is **`+{abs(diff):,.0f}`** (`{pct_diff:.1f}%`) higher in value"
+    else:
+        diff_summary = "⚖️ Both sides have **equal** numeric value (`0` difference)"
+
+    def _format_lines(side: Dict[str, Any]) -> str:
+        if not side["matched"]:
+            return "*No recognized units*"
+        out = []
+        for unit, qty, partner in side["matched"]:
+            base_min, base_max, base_oc = parse_value_range(unit["value_text"])
+            eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
+
+            sign_badge = f" `[✍️ {partner['display_name']} {partner['sign_text']}]`" if partner else ""
+            qty_prefix = f"{qty}x " if qty > 1 else ""
+
+            if eff_oc:
+                val_part = "`o/c`"
+            elif eff_min is not None and eff_max is not None:
+                single_str = f"{eff_min:,.0f}" if eff_min == eff_max else f"{eff_min:,.0f} – {eff_max:,.0f}"
+                if qty > 1:
+                    tot_str = f"{eff_min * qty:,.0f}" if eff_min == eff_max else f"{eff_min * qty:,.0f} – {eff_max * qty:,.0f}"
+                    val_part = f"`{single_str}` each = **`{tot_str}`**"
+                else:
+                    val_part = f"**`{single_str}`**"
+            else:
+                val_part = f"`{unit['value_text']}`"
+
+            out.append(f"• **{qty_prefix}{unit['name']}**{sign_badge} — {val_part}")
+        out.append(f"\n**Total Value:** `{format_trade_side_total(side)}`")
+        return "\n".join(out)
+
+    embed = discord.Embed(
+        title="⚖️ Trade Value Comparison",
+        description=f"Calculated for {user.mention}\n{diff_summary}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="📤 You Give", value=_format_lines(give_side), inline=False)
+    embed.add_field(name="📥 You Get", value=_format_lines(get_side), inline=False)
+
+    all_unknown = give_side["unknown"] + get_side["unknown"]
+    if all_unknown:
+        embed.add_field(
+            name="⚠️ Unrecognized Items",
+            value=f"`{', '.join(all_unknown[:8])}`",
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"{guild.name if guild else 'CMTD'} • Live Value & Sign Calculator",
+        icon_url=guild.icon.url if (guild and guild.icon) else None,
+    )
+    return embed
+
+
 class TradeCalcResultView(discord.ui.View):
     def __init__(self, author_id: int, give_raw: str, get_raw: str):
         super().__init__(timeout=300)
@@ -1955,7 +2127,7 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=500,
-        placeholder="x2 hacked, Whatenix UTTV, Scientist Crate",
+        placeholder="x2 hacked, Whatenix Baker, Scientist Crate",
     )
     get_input = discord.ui.TextInput(
         label="You Get (Units / Partner Signs)",
@@ -1987,69 +2159,11 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
 
         if not give_side["matched"] and not get_side["matched"]:
             return await interaction.response.send_message(
-                "❌ Could not recognize any units. Check unit names, partner signs (`Whatenix`, `Meddyson`, etc.), or shortcuts (`UTTV`, `UTC`, `Hacked`).",
+                "❌ Could not recognize any units. Check unit names, partner signs (`Whatenix`, `Meddyson`, etc.), or shortcuts (`Baker`, `UTTV`, `UTC`).",
                 ephemeral=True,
             )
 
-        diff = get_side["avg_val"] - give_side["avg_val"]
-        denom = max(give_side["avg_val"], get_side["avg_val"], 1.0)
-        pct_diff = abs(diff / denom) * 100.0
-
-        if diff > 0:
-            diff_summary = f"📥 **You Get** is **`+{diff:,.0f}`** (`{pct_diff:.1f}%`) higher in value"
-        elif diff < 0:
-            diff_summary = f"📤 **You Give** is **`+{abs(diff):,.0f}`** (`{pct_diff:.1f}%`) higher in value"
-        else:
-            diff_summary = "⚖️ Both sides have **equal** numeric value (`0` difference)"
-
-        def _format_lines(side: Dict[str, Any]) -> str:
-            if not side["matched"]:
-                return "*No recognized units*"
-            out = []
-            for unit, qty, partner in side["matched"]:
-                base_min, base_max, base_oc = parse_value_range(unit["value_text"])
-                eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
-
-                sign_badge = f" `[✍️ {partner['display_name']} {partner['sign_text']}]`" if partner else ""
-                qty_prefix = f"{qty}x " if qty > 1 else ""
-
-                if eff_oc:
-                    val_part = "`o/c`"
-                elif eff_min is not None and eff_max is not None:
-                    single_str = f"{eff_min:,.0f}" if eff_min == eff_max else f"{eff_min:,.0f} – {eff_max:,.0f}"
-                    if qty > 1:
-                        tot_str = f"{eff_min * qty:,.0f}" if eff_min == eff_max else f"{eff_min * qty:,.0f} – {eff_max * qty:,.0f}"
-                        val_part = f"`{single_str}` each = **`{tot_str}`**"
-                    else:
-                        val_part = f"**`{single_str}`**"
-                else:
-                    val_part = f"`{unit['value_text']}`"
-
-                out.append(f"• **{qty_prefix}{unit['name']}**{sign_badge} — {val_part}")
-            out.append(f"\n**Total Value:** `{format_trade_side_total(side)}`")
-            return "\n".join(out)
-
-        embed = discord.Embed(
-            title="⚖️ Trade Value Comparison",
-            description=f"Calculated for {interaction.user.mention}\n{diff_summary}",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="📤 You Give", value=_format_lines(give_side), inline=False)
-        embed.add_field(name="📥 You Get", value=_format_lines(get_side), inline=False)
-
-        all_unknown = give_side["unknown"] + get_side["unknown"]
-        if all_unknown:
-            embed.add_field(
-                name="⚠️ Unrecognized Items",
-                value=f"`{', '.join(all_unknown[:8])}`",
-                inline=False,
-            )
-
-        embed.set_footer(
-            text=f"{interaction.guild.name if interaction.guild else 'CMTD'} • Live Value & Sign Calculator",
-            icon_url=interaction.guild.icon.url if (interaction.guild and interaction.guild.icon) else None,
-        )
+        embed = build_trade_comparison_embed(interaction.guild, interaction.user, give_side, get_side)
         view = TradeCalcResultView(owner_id, self.give_input.value, self.get_input.value)
 
         if self.orig_message:
@@ -2064,6 +2178,25 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
             view=view,
             ephemeral=False,
         )
+
+
+def parse_freeform_trade_message(raw_text: str) -> Tuple[str, str]:
+    """Splits a chat trade message into (give_text, get_text) if separators exist."""
+    cleaned = re.sub(r"<@!?\d+>|<@&\d+>|<#\d+>", " ", raw_text)
+    cleaned = re.sub(
+        r"\b(?:trading|lf|looking\s+for|offering|offer|my|me|their|them|for|w/f/l|wfl|worl|nlf|adds?|plz|pls|fast|quick)\b\s*:?",
+        lambda m: " ||SPLIT|| " if m.group(0).strip().lower().rstrip(":") in ("for", "lf", "looking for", "their", "them") else " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    for sep in ("->", "➔", "→", "=>", " vs ", "||SPLIT||"):
+        if sep in cleaned:
+            parts = cleaned.split(sep, 1)
+            left = parts[0].replace("||SPLIT||", " ").strip(" :-|")
+            right = parts[1].replace("||SPLIT||", " ").strip(" :-|")
+            if left and right:
+                return left, right
+    return cleaned.replace("||SPLIT||", " ").strip(), ""
 
 
 def build_unit_value_embed(
@@ -2121,12 +2254,12 @@ def build_unit_value_embed(
 
     short_aliases = [
         a for a in item.get("aliases", "").split(",")
-        if a and a != item["item_key"] and len(a) <= 16
+        if a and a != item["item_key"] and len(a) <= 18
     ]
     if short_aliases:
         embed.add_field(
             name="⌨️ Shortcuts",
-            value=", ".join(f"`{a}`" for a in short_aliases[:5]),
+            value=", ".join(f"`{a}`" for a in short_aliases[:6]),
             inline=False,
         )
 
@@ -2387,7 +2520,7 @@ class QuickValueLookupModal(discord.ui.Modal, title="Check Unit Value"):
         style=discord.TextStyle.short,
         required=True,
         max_length=80,
-        placeholder="UTTV, Pharaoh, Whatenix Pharaoh, TTD_OnlyMy UTTV...",
+        placeholder="Baker, UTTV, Whatenix Pharaoh, TTD_OnlyMy UTTV...",
     )
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -2775,7 +2908,44 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
 
 
 # -------------------------------------------------------------
-# 6. Bot Client Initialization & Persistent Views Setup
+# 6. Opt-In Server Clan Tag Reward (Disabled by Default)
+# -------------------------------------------------------------
+async def check_and_sync_member_clan_tag(member: discord.Member, settings: Dict[str, Any]):
+    """Checks if a member is wearing this server's Clan Tag (primary_guild) when enabled in /panel."""
+    if not settings.get("clan_tag_enabled"):
+        return
+    role_id = settings.get("clan_tag_role_id")
+    if not role_id:
+        return
+    role = member.guild.get_role(role_id)
+    if not role or not member.guild.me or member.guild.me.top_role <= role:
+        return
+
+    now = time.time()
+    last_chk = CLAN_TAG_CHECK_COOLDOWNS.get(member.id, 0.0)
+    if now - last_chk < 45.0:
+        return
+    CLAN_TAG_CHECK_COOLDOWNS[member.id] = now
+
+    pg = getattr(member, "primary_guild", None)
+    wearing_tag = bool(
+        pg is not None
+        and getattr(pg, "id", None) == member.guild.id
+        and getattr(pg, "identity_enabled", True)
+    )
+
+    has_role = role in member.roles
+    try:
+        if wearing_tag and not has_role:
+            await member.add_roles(role, reason="Wearing server Clan Tag")
+        elif not wearing_tag and has_role:
+            await member.remove_roles(role, reason="Removed server Clan Tag")
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------
+# 7. Bot Client Initialization & Persistent Views Setup
 # -------------------------------------------------------------
 class CommunityBot(commands.Bot):
     def __init__(self):
@@ -2818,7 +2988,7 @@ bot = CommunityBot()
 
 
 # -------------------------------------------------------------
-# 7. Full Server Lockdown System (/closeall, /openall, /lockdown_ignore)
+# 8. Full Server Lockdown System (/closeall, /openall, /lockdown_ignore)
 # -------------------------------------------------------------
 def is_lockdown_active(guild_id: int) -> bool:
     with get_db() as conn:
@@ -3297,7 +3467,7 @@ async def lockdown_ignore_cmd(
 
 
 # -------------------------------------------------------------
-# 8. Private Temporary Voice Channels 2.0 + Linked Squad LFG
+# 9. Private Temporary Voice Channels 2.0 + Linked Squad LFG
 # -------------------------------------------------------------
 def get_user_voice_preset(user_id: int) -> Dict[str, Any]:
     with get_db() as conn:
@@ -3434,6 +3604,15 @@ def remove_temp_voice_record(channel_id: int):
         conn.commit()
 
 
+async def update_voice_channel_status_text(vc: discord.VoiceChannel, status_text: Optional[str]):
+    """Sets the live Voice Channel Status line visible directly under the channel name in Discord."""
+    try:
+        if hasattr(vc, "edit"):
+            await vc.edit(status=status_text[:500] if status_text else None)
+    except Exception:
+        pass
+
+
 def build_lfg_embed(
     vc: discord.VoiceChannel,
     owner_id: int,
@@ -3516,6 +3695,12 @@ async def refresh_lfg_posts_for_voice(vc: discord.VoiceChannel):
 
     owner_id = room["owner_id"] if room else rows[0][2]
     is_locked = room.get("is_locked", False) if room else False
+    g_mode = rows[0][3]
+    mods = rows[0][4]
+    humans_cnt = len([m for m in vc.members if not m.bot])
+    slots_txt = f"{humans_cnt}/{vc.user_limit}" if vc.user_limit > 0 else f"{humans_cnt} in squad"
+    mod_suffix = f" • {mods}" if mods and mods != "No Modifiers" else ""
+    await update_voice_channel_status_text(vc, f"🎮 {g_mode} [{slots_txt}]{mod_suffix}")
 
     for msg_id, ch_id, row_owner, g_mode, mods, note in rows:
         target_ch = vc.guild.get_channel(ch_id)
@@ -3768,10 +3953,15 @@ class LfgBuilderView(discord.ui.View):
                 ephemeral=True,
             )
 
+        humans_cnt = len([m for m in self.vc.members if not m.bot])
+        slots_txt = f"{humans_cnt}/{self.vc.user_limit}" if self.vc.user_limit > 0 else f"{humans_cnt} in squad"
+        mod_suffix = f" • {mods_text}" if mods_text != "No Modifiers" else ""
+        await update_voice_channel_status_text(self.vc, f"🎮 {self.selected_mode} [{slots_txt}]{mod_suffix}")
+
         msg_text = (
             f"📣 **Squad LFG published** in {', '.join(posted_links)}!\n"
             f"• **Mode:** `{self.selected_mode}` | **Modifiers:** `{mods_text}`\n"
-            "• Slot counts update automatically as players join, and the post auto-deletes when your room closes."
+            "• Slot counts & voice status update automatically as players join, and the post auto-deletes when your room closes."
         )
         if interaction.response.is_done():
             await interaction.followup.send(msg_text, ephemeral=True)
@@ -3848,6 +4038,7 @@ def build_voice_control_embed(channel: discord.VoiceChannel, room: Dict[str, Any
             f"**Room Owner:** <@{room['owner_id']}>\n"
             f"**Status:** {' • '.join(status_badges)}\n\n"
             "• Click **`📣 Find Squad`** to post an LFG card with live slot tracking!\n"
+            "• Right-click / long-press any user in chat ➔ **Apps ➔ `🔊 Invite to Voice`** to invite them directly.\n"
             "• Your room name, limit & lock settings are **auto-saved** for your next session.\n"
             "-# 🗑️ Auto-deletes automatically as soon as everyone leaves the room."
         ),
@@ -3920,6 +4111,81 @@ class VoiceTransferView(discord.ui.View):
         await self.vc.set_permissions(target, connect=True, view_channel=True, manage_channels=True)
         await refresh_voice_control_panel(self.vc, self.room)
         await interaction.response.edit_message(content=f"👑 Ownership transferred to {target.mention}!", view=None)
+
+
+class VoiceStatusModal(discord.ui.Modal, title="Set Voice Channel Status"):
+    status_input = discord.ui.TextInput(
+        label="Live Status Text (Shown under channel name)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=100,
+        placeholder="e.g. Trading Pharaoh | Need +1 Nightmare (leave blank to clear)",
+    )
+
+    def __init__(self, channel: discord.VoiceChannel, room: Dict[str, Any]):
+        super().__init__()
+        self.channel = channel
+        self.room = room
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.status_input.value.strip()
+        await update_voice_channel_status_text(self.channel, raw if raw else None)
+        touch_temp_voice_activity(self.channel.id)
+        if raw:
+            await interaction.response.send_message(f"💬 Voice channel status updated to: **{raw}**", ephemeral=True)
+        else:
+            await interaction.response.send_message("💬 Voice channel status cleared.", ephemeral=True)
+
+
+class ActiveMembersKickView(discord.ui.View):
+    def __init__(self, vc: discord.VoiceChannel, room: Dict[str, Any]):
+        super().__init__(timeout=60)
+        self.vc = vc
+        self.room = room
+
+        active_others = [
+            m for m in vc.members
+            if not m.bot and m.id != room["owner_id"]
+        ]
+        options = [
+            discord.SelectOption(
+                label=f"{m.display_name[:80]}",
+                value=str(m.id),
+                description=f"@{m.name} • Kick & Block from room",
+            )
+            for m in active_others[:25]
+        ]
+        select = discord.ui.Select(
+            placeholder="🔨 Select active member(s) in this room to kick...",
+            options=options,
+            min_values=1,
+            max_values=min(len(options), 5),
+            row=0,
+        )
+        select.callback = self.on_kick_select
+        self.add_item(select)
+
+    async def on_kick_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if interaction.user.id != self.room["owner_id"]:
+            return await interaction.response.send_message("❌ Only the room owner can use this.", ephemeral=True)
+
+        kicked: List[str] = []
+        for uid_str in select.values:
+            member = self.vc.guild.get_member(int(uid_str))
+            if not member or member.bot or member.id == self.room["owner_id"]:
+                continue
+            await self.vc.set_permissions(member, connect=False, reason="Kicked & blocked by room owner")
+            if member in self.vc.members:
+                try:
+                    await member.move_to(None, reason="Kicked by room owner")
+                except Exception:
+                    pass
+            kicked.append(member.mention)
+
+        touch_temp_voice_activity(self.vc.id)
+        if not kicked:
+            return await interaction.response.edit_message(content="⚠️ Selected members already left.", view=None)
+        await interaction.response.edit_message(content=f"🔨 Kicked & blocked from room: {', '.join(kicked)}", view=None)
 
 
 class VoiceRenameModal(discord.ui.Modal, title="Rename Voice Room"):
@@ -4170,39 +4436,7 @@ class VoiceControlView(discord.ui.View):
             return await interaction.response.send_message("⚠️ Please select human members.", ephemeral=True)
         await interaction.response.send_message(f"✅ Granted access to: {', '.join(allowed_mentions)}", ephemeral=True)
 
-    @discord.ui.select(
-        cls=discord.ui.UserSelect,
-        placeholder="🚫 Kick & Block Users from connecting...",
-        min_values=1,
-        max_values=5,
-        custom_id="vc_ctrl:block",
-        row=3,
-    )
-    async def block_users_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
-        vc, room, err = self._get_room_and_verify_owner(interaction)
-        if err or not vc or not room:
-            return await interaction.response.send_message(err, ephemeral=True)
-
-        blocked_mentions = []
-        for target in select.values:
-            if target.bot or target.id == room["owner_id"]:
-                continue
-            await vc.set_permissions(target, connect=False, reason="Blocked by room owner")
-            if isinstance(target, discord.Member) and target in vc.members:
-                try:
-                    await target.move_to(None, reason="Kicked by room owner")
-                except Exception:
-                    pass
-            blocked_mentions.append(target.mention)
-
-        room["last_active_at"] = int(time.time())
-        room["warned_inactive"] = False
-        save_temp_voice(room)
-        if not blocked_mentions:
-            return await interaction.response.send_message("⚠️ Cannot block yourself or bots.", ephemeral=True)
-        await interaction.response.send_message(f"🚫 Kicked & blocked: {', '.join(blocked_mentions)}", ephemeral=True)
-
-    @discord.ui.button(label="Find Squad", style=discord.ButtonStyle.primary, emoji="📣", custom_id="vc_ctrl:lfg", row=4)
+    @discord.ui.button(label="Find Squad", style=discord.ButtonStyle.primary, emoji="📣", custom_id="vc_ctrl:lfg", row=3)
     async def find_squad_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc, room, err = self._get_room_and_verify_owner(interaction)
         if err or not vc or not room:
@@ -4228,6 +4462,58 @@ class VoiceControlView(discord.ui.View):
             view=LfgBuilderView(vc, room, lfg_channels),
             ephemeral=True,
         )
+
+    @discord.ui.button(label="Status", style=discord.ButtonStyle.secondary, emoji="💬", custom_id="vc_ctrl:status", row=3)
+    async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await interaction.response.send_modal(VoiceStatusModal(vc, room))
+
+    @discord.ui.button(label="Quick Kick", style=discord.ButtonStyle.secondary, emoji="🔨", custom_id="vc_ctrl:quickkick", row=3)
+    async def quick_kick_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        active_others = [m for m in vc.members if not m.bot and m.id != room["owner_id"]]
+        if not active_others:
+            return await interaction.response.send_message("👥 Nobody else is currently in your voice channel.", ephemeral=True)
+
+        await interaction.response.send_message(
+            "🔨 Select members currently inside your room to kick & block:",
+            view=ActiveMembersKickView(vc, room),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Mute All", style=discord.ButtonStyle.secondary, emoji="🔇", custom_id="vc_ctrl:muteall", row=3)
+    async def mute_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, room, err = self._get_room_and_verify_owner(interaction)
+        if err or not vc or not room:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+        others = [m for m in vc.members if not m.bot and m.id != room["owner_id"]]
+        if not others:
+            return await interaction.response.send_message("👥 Nobody else is currently in your voice channel.", ephemeral=True)
+
+        any_unmuted = any(not (m.voice and m.voice.mute) for m in others)
+        target_mute = any_unmuted
+        changed = 0
+        for m in others:
+            try:
+                await m.edit(mute=target_mute, reason=f"Room Mute All toggled by {interaction.user}")
+                changed += 1
+            except Exception:
+                pass
+
+        touch_temp_voice_activity(vc.id)
+        if changed == 0:
+            return await interaction.response.send_message(
+                "⚠️ Could not mute members (bot needs `Mute Members` permission in this category).",
+                ephemeral=True,
+            )
+        state_word = "muted" if target_mute else "unmuted"
+        await interaction.response.send_message(f"🔇 **{changed}** member(s) in your room {state_word}.", ephemeral=True)
 
     @discord.ui.button(label="Watch / Music", style=discord.ButtonStyle.success, emoji="🎬", custom_id="vc_ctrl:activity", row=4)
     async def watch_together_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4327,6 +4613,7 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
             connect=True,
             manage_channels=True,
             move_members=True,
+            mute_members=True,
             send_messages=True,
         ),
         member: discord.PermissionOverwrite(
@@ -4388,7 +4675,7 @@ async def handle_join_to_create(member: discord.Member, trigger_channel: discord
 
 
 # -------------------------------------------------------------
-# 9. Post Studio Presets & Builders
+# 10. Post Studio Presets & Builders
 # -------------------------------------------------------------
 POST_STYLES: Dict[str, Dict[str, Any]] = {
     "announcement": {
@@ -4754,7 +5041,7 @@ class StyleSwitcherView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 10. Live Interactive Polls System (/poll)
+# 11. Live Interactive Polls System (/poll)
 # -------------------------------------------------------------
 def pack_options(options: List[str]) -> str:
     return "\n".join(opt.replace("\n", " ").strip() for opt in options if opt.strip())
@@ -5102,12 +5389,12 @@ class PollCreatorModal(discord.ui.Modal, title="Create Community Poll"):
 
 
 # -------------------------------------------------------------
-# 11. Event Scheduling System (/event, /event_image, Follow)
+# 12. Event Scheduling System (/event, /event_image, Follow)
 # -------------------------------------------------------------
 def parse_msk_datetime(raw: str) -> Optional[int]:
     raw = raw.strip()
     now_msk = datetime.now(MSK_TZ)
-    for fmt in ("%d.%m.%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M"):
+    for fmt in ("%d.%m.%Y %H:%M", "%d/%m.%Y %H:%M", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(raw, fmt).replace(tzinfo=MSK_TZ)
             return int(dt.timestamp())
@@ -5391,7 +5678,7 @@ class EventComposerModal(discord.ui.Modal):
 
 
 # -------------------------------------------------------------
-# 12. Starboard / Ideas Showcase System (O(1) Deduplication)
+# 13. Starboard / Ideas Showcase System (O(1) Deduplication)
 # -------------------------------------------------------------
 def build_showcase_embed(message: discord.Message, stars: int) -> discord.Embed:
     if stars >= 50:
@@ -5559,7 +5846,7 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 
 
 # -------------------------------------------------------------
-# 13. Admin Control Panel (/panel) & Sub-Panels
+# 14. Admin Control Panel (/panel) & Sub-Panels
 # -------------------------------------------------------------
 class ValueUrlModal(discord.ui.Modal, title="Set Value List Website URL"):
     url_input = discord.ui.TextInput(
@@ -5641,7 +5928,7 @@ class ValueSetupView(discord.ui.View):
 
     @discord.ui.select(
         cls=discord.ui.RoleSelect,
-        placeholder="🛡️ Select Value Team Roles (/value_post, /sign_post, delete)...",
+        placeholder="🛡️ Select Value Team Roles (/value_post, /sign_post, /alias_add)...",
         min_values=1,
         max_values=10,
         row=3,
@@ -5651,7 +5938,7 @@ class ValueSetupView(discord.ui.View):
         update_guild_settings(self.guild_id, value_manager_role_ids=role_ids_str)
         mentions = ", ".join(f"<@&{r.id}>" for r in select.values)
         await interaction.response.edit_message(
-            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can use `/value_post`, `/sign_post`, `/value_unit_delete`, and `/sign_delete`!",
+            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can use `/value_post`, `/sign_post`, `/alias_add`, `/value_unit_delete`, and `/sign_delete`!",
             view=self,
         )
 
@@ -5683,6 +5970,7 @@ class ValueSetupView(discord.ui.View):
                 "Check live unit values, partner sign multipliers, and calculate trades right inside Discord!\n\n"
                 "• **`🔍 Check Unit Value`** — look up any unit (including partner signs like `Whatenix Pharaoh`).\n"
                 "• **`⚖️ Trade Calculator`** (or `/calc`) — compare **You Give** vs. **You Get** publicly.\n"
+                "• **Right-Click / Long-Press any Trade Message ➔ `Apps` ➔ `⚖️ Check Trade Value`** — instant trade & sign calculation!\n"
                 "• **`✍️ Sign Partners`** — view all current partner sign percentages.\n"
                 "• **`🏆 Top Values`** & **`📈 Recent Changes`** — live leaderboards & updates."
             ),
@@ -5813,7 +6101,20 @@ class AntiScamSetupView(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(label="Enable Shield", style=discord.ButtonStyle.success, emoji="🛡️", row=2)
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🏷️ [Opt-In] Select Role for Wearing Server Clan Tag...",
+        row=2,
+    )
+    async def select_clan_tag_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        chosen = select.values[0]
+        update_guild_settings(self.guild_id, clan_tag_role_id=chosen.id)
+        await interaction.response.edit_message(
+            content=f"🏷️ **Clan Tag Reward Role** set to <@&{chosen.id}>! Use the toggle button below to enable/disable.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Enable Shield", style=discord.ButtonStyle.success, emoji="🛡️", row=3)
     async def enable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         update_guild_settings(self.guild_id, antiscam_enabled=True)
         await interaction.response.edit_message(
@@ -5821,11 +6122,27 @@ class AntiScamSetupView(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(label="Disable Shield", style=discord.ButtonStyle.danger, emoji="🛑", row=2)
+    @discord.ui.button(label="Disable Shield", style=discord.ButtonStyle.danger, emoji="🛑", row=3)
     async def disable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         update_guild_settings(self.guild_id, antiscam_enabled=False)
         await interaction.response.edit_message(
             content="🛑 **Anti-Scam & Phishing Shield DISABLED.**",
+            view=self,
+        )
+
+    @discord.ui.button(label="Toggle Clan Tag Role", style=discord.ButtonStyle.primary, emoji="🏷️", row=3)
+    async def toggle_clan_tag_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_guild_settings(self.guild_id)
+        new_state = not s.get("clan_tag_enabled", False)
+        if new_state and not s.get("clan_tag_role_id"):
+            return await interaction.response.send_message(
+                "⚠️ Select a **Clan Tag Reward Role** in the dropdown above first!",
+                ephemeral=True,
+            )
+        update_guild_settings(self.guild_id, clan_tag_enabled=new_state)
+        status_word = "ENABLED" if new_state else "DISABLED"
+        await interaction.response.edit_message(
+            content=f"🏷️ **Server Clan Tag Auto-Role {status_word}!**",
             view=self,
         )
 
@@ -5893,10 +6210,15 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
 
     shield_status = "🟢 **On**" if s["antiscam_enabled"] else "⚪ `Off`"
     lock_status = "🔴 **LOCKED**" if is_lockdown_active(guild.id) else "🟢 Normal"
+    clan_tag_txt = (
+        f"🟢 <@&{s['clan_tag_role_id']}>"
+        if (s.get("clan_tag_enabled") and s.get("clan_tag_role_id"))
+        else "⚪ `Off (Opt-In)`"
+    )
 
     embed = discord.Embed(
         title="⚙️ Server Control Panel",
-        description="Configure Starboard, W/F/L reactions, Value & Sign System, Voice 2.0 + LFG, Anti-Scam & Lockdown.",
+        description="Configure Starboard, W/F/L reactions, Value & Sign System, Voice 2.0 + LFG, Anti-Scam, Clan Tag Reward & Lockdown.",
         color=0x5865F2,
     )
     embed.add_field(name="💡 Ideas / 🌟 Showcase", value=f"{ideas} / {showcase} (`⭐ {s['star_threshold']}`)", inline=True)
@@ -5905,7 +6227,7 @@ async def build_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="💎 Value / ✍️ Signs Ch", value=f"Val: {val_ch}\nSigns: {signs_ch}", inline=True)
     embed.add_field(name="🏷️ Ping / 🛡️ Team Roles", value=f"Ping: {val_role}\nTeam: {val_mgr_txt}", inline=True)
     embed.add_field(name="🛡️ Shield & Lockdown", value=f"Anti-Scam: {shield_status}\nLockdown: {lock_status}", inline=True)
-    embed.add_field(name="🚀 Booster / 👋 Auto-Role", value=f"{booster} / {autorole}", inline=False)
+    embed.add_field(name="🚀 Booster / 👋 Auto-Role / 🏷️ Clan Tag", value=f"{booster} / {autorole} / {clan_tag_txt}", inline=False)
     embed.set_footer(text=f"{guild.name} • {guild.member_count:,} members • {len(VALUE_ITEMS_CACHE)} units • {len(SIGN_PARTNERS_CACHE)} sign partners")
     return embed
 
@@ -5983,15 +6305,16 @@ class ControlPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Anti-Scam", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
+    @discord.ui.button(label="Security & Tag", style=discord.ButtonStyle.secondary, emoji="🛡️", row=4)
     async def setup_antiscam_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild:
             return
         s = get_guild_settings(interaction.guild.id)
         state_txt = "ENABLED" if s["antiscam_enabled"] else "DISABLED"
+        tag_txt = "ENABLED" if s.get("clan_tag_enabled") else "DISABLED (Opt-In)"
         await interaction.response.send_message(
-            f"🛡️ **Anti-Scam & Phishing Shield** is currently **{state_txt}**.\n"
-            "Configure log channel and timeout punishment below:",
+            f"🛡️ **Anti-Scam Shield:** **{state_txt}** | 🏷️ **Clan Tag Auto-Role:** **{tag_txt}**\n"
+            "Configure Anti-Scam logs/timeouts or enable automatic role rewards for members wearing your server's Clan Tag:",
             view=AntiScamSetupView(interaction.guild.id),
             ephemeral=True,
         )
@@ -6017,7 +6340,7 @@ class ControlPanelView(discord.ui.View):
 
 
 # -------------------------------------------------------------
-# 14. Slash Commands & Right-Click Context Menus
+# 15. Slash Commands & Right-Click Context Menus
 # -------------------------------------------------------------
 @bot.tree.command(name="panel", description="Open the Server Control Panel")
 @app_commands.default_permissions(administrator=True)
@@ -6155,7 +6478,7 @@ async def sign_partner_autocomplete(interaction: discord.Interaction, current: s
 
 @bot.tree.command(name="value", description="Check the current value, partner sign value, demand & stability of any unit")
 @app_commands.describe(
-    unit="Unit name or shortcut (e.g. UTTV, UTC, Pharaoh Cameraman)",
+    unit="Unit name or shortcut (e.g. Baker, UTTV, UTC, Pharaoh Cameraman)",
     sign="Optional partner sign (e.g. Whatenix, Meddyson, TTD_OnlyMy)",
     public="Show the card publicly in chat (default: False / only visible to you)",
 )
@@ -6209,13 +6532,39 @@ async def value_changes_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+@bot.tree.command(name="alias_add", description="Add a short shortcut/alias to any unit for /value and /calc")
+@app_commands.describe(
+    unit="Select the unit to attach a shortcut to",
+    shortcut="Short alias (e.g. baker, baker tts, uttv)",
+)
+@app_commands.autocomplete(unit=unit_name_autocomplete)
+async def alias_add_cmd(interaction: discord.Interaction, unit: str, shortcut: str):
+    if not interaction.guild:
+        return
+    if not has_value_manager_access(interaction.user):
+        return await interaction.response.send_message(
+            "❌ You need Administrator or one of the Value Team roles configured in `/panel` ➔ `💎 Value & Signs`.",
+            ephemeral=True,
+        )
+    updated = add_custom_unit_alias(unit, shortcut)
+    if not updated:
+        return await interaction.response.send_message(
+            f"❌ Unit `{unit}` not found or invalid shortcut.",
+            ephemeral=True,
+        )
+    await interaction.response.send_message(
+        f"✅ Shortcut **`{normalize_unit_key(shortcut)}`** added to **{updated['name']}** (`{updated['value_text']}`)!",
+        ephemeral=True,
+    )
+
+
 class ValueChangelogModal(discord.ui.Modal, title="Publish Value List Changes"):
     changes_input = discord.ui.TextInput(
         label="Value Changes (Standard Format)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=3500,
-        placeholder="UTTV\nValue: 4650 -> 4000\nStatus: Underpaid\n\nUTC\nValue: 2800 -> 3000",
+        placeholder="UTTV\nValue: 4650 -> 4000\nStatus: Underpaid\n\nBaker Titan Speakerman\nValue: 3750",
     )
     ping_input = discord.ui.TextInput(
         label="Ping Value Changes Role? (yes / no)",
@@ -6617,7 +6966,125 @@ async def stats_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- Right-Click Context Menus ---
+# --- Right-Click / Long-Press Context Menus ---
+@bot.tree.context_menu(name="⚖️ Check Trade Value")
+async def ctx_check_trade_value(interaction: discord.Interaction, message: discord.Message):
+    """Right-click / long-press any trade message in chat to calculate unit & partner sign values."""
+    if not message.content or not message.content.strip():
+        return await interaction.response.send_message(
+            "❌ That message has no text to calculate. Use `/calc` to enter items manually.",
+            ephemeral=True,
+        )
+
+    give_txt, get_txt = parse_freeform_trade_message(message.content)
+    give_side = parse_trade_side(give_txt) if give_txt else {"matched": [], "unknown": [], "total_min": 0.0, "total_max": 0.0, "avg_val": 0.0, "oc_count": 0}
+    get_side = parse_trade_side(get_txt) if get_txt else {"matched": [], "unknown": [], "total_min": 0.0, "total_max": 0.0, "avg_val": 0.0, "oc_count": 0}
+
+    if not give_side["matched"] and not get_side["matched"]:
+        return await interaction.response.send_message(
+            "❌ Could not find any known unit names or partner signs in that message.",
+            ephemeral=True,
+        )
+
+    if get_side["matched"]:
+        embed = build_trade_comparison_embed(interaction.guild, interaction.user, give_side, get_side)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        # Single-sided list (e.g. "Trading 2x Whatenix Baker, Pharaoh") -> show total value breakdown
+        lines = []
+        for unit, qty, partner in give_side["matched"]:
+            base_min, base_max, base_oc = parse_value_range(unit["value_text"])
+            eff_min, eff_max, eff_oc = apply_partner_sign_to_range(base_min, base_max, base_oc, partner)
+            sign_badge = f" `[✍️ {partner['display_name']} {partner['sign_text']}]`" if partner else ""
+            qty_prefix = f"{qty}x " if qty > 1 else ""
+            if eff_oc:
+                val_part = "`o/c`"
+            elif eff_min is not None and eff_max is not None:
+                tot_str = f"{eff_min * qty:,.0f}" if eff_min == eff_max else f"{eff_min * qty:,.0f} – {eff_max * qty:,.0f}"
+                val_part = f"**`{tot_str}`**"
+            else:
+                val_part = f"`{unit['value_text']}`"
+            lines.append(f"• **{qty_prefix}{unit['name']}**{sign_badge} — {val_part}")
+        lines.append(f"\n**Combined Value:** `{format_trade_side_total(give_side)}`")
+
+        embed = discord.Embed(
+            title="💎 Message Items Value Breakdown",
+            description="\n".join(lines),
+            color=0x3498DB,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_footer(text="Tip: Use /calc to compare both sides of a trade.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.context_menu(name="🔊 Invite to Voice")
+async def ctx_invite_to_voice(interaction: discord.Interaction, member: discord.Member):
+    """Right-click / long-press any user in chat to invite them directly into your private voice room."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+    if member.bot or member.id == interaction.user.id:
+        return await interaction.response.send_message("❌ You cannot invite bots or yourself.", ephemeral=True)
+
+    target_vc: Optional[discord.VoiceChannel] = None
+    if interaction.user.voice and isinstance(interaction.user.voice.channel, discord.VoiceChannel):
+        if interaction.user.voice.channel.id in TEMP_VOICE_CACHE:
+            target_vc = interaction.user.voice.channel
+
+    if not target_vc:
+        for ch_id, room in list(TEMP_VOICE_CACHE.items()):
+            if room["guild_id"] == interaction.guild.id and room["owner_id"] == interaction.user.id:
+                vc_obj = interaction.guild.get_channel(ch_id)
+                if isinstance(vc_obj, discord.VoiceChannel):
+                    target_vc = vc_obj
+                    break
+
+    if not target_vc:
+        return await interaction.response.send_message(
+            "❌ You don't have an active private voice room right now! Join the Join-to-Create channel first.",
+            ephemeral=True,
+        )
+
+    try:
+        await target_vc.set_permissions(
+            member,
+            connect=True,
+            view_channel=True,
+            reason=f"Invited to private voice by {interaction.user}",
+        )
+    except Exception as e:
+        return await interaction.response.send_message(f"❌ Could not grant room access: `{e}`", ephemeral=True)
+
+    touch_temp_voice_activity(target_vc.id)
+    join_view = build_lfg_join_view(interaction.guild.id, target_vc.id)
+
+    dm_sent = False
+    try:
+        dm_embed = discord.Embed(
+            title="🔊 Private Voice Room Invite",
+            description=(
+                f"**{interaction.user.display_name}** invited you to join their private voice room in **{interaction.guild.name}**!\n"
+                f"**Room:** {target_vc.mention} (`{target_vc.name}`)"
+            ),
+            color=0x2ECC71,
+        )
+        await member.send(embed=dm_embed, view=join_view)
+        dm_sent = True
+    except Exception:
+        pass
+
+    if dm_sent:
+        await interaction.response.send_message(
+            f"✅ Granted {member.mention} access to {target_vc.mention} and sent them a direct invite button!",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            f"✅ Granted {member.mention} access to {target_vc.mention}! *(Their DMs are closed — they can click below or join directly from the voice list)*",
+            view=join_view,
+            ephemeral=True,
+        )
+
+
 @bot.tree.context_menu(name="✏️ Edit Bot Post")
 @app_commands.default_permissions(manage_messages=True)
 async def ctx_edit_post(interaction: discord.Interaction, message: discord.Message):
@@ -6685,7 +7152,7 @@ async def ctx_edit_event(interaction: discord.Interaction, message: discord.Mess
 
 
 # -------------------------------------------------------------
-# 15. Owner-Only Server Inspector (!servers — ID 1145605899239563304)
+# 16. Owner-Only Server Inspector (!servers — ID 1145605899239563304)
 # -------------------------------------------------------------
 async def get_guild_invite_url(guild: discord.Guild) -> str:
     if guild.vanity_url:
@@ -6741,10 +7208,12 @@ def summarize_guild_active_modules(guild: discord.Guild) -> List[str]:
         active.append("💎 Value/Signs")
     if s.get("antiscam_enabled"):
         active.append("🛡️ Anti-Scam")
+    if s.get("clan_tag_enabled"):
+        active.append("🏷️ Clan Tag")
     if is_lockdown_active(guild.id):
         active.append("🔒 LOCKED")
     if s.get("booster_role_id") or s.get("autorole_id"):
-        active.append("🏷️ Roles")
+        active.append("🎭 Roles")
     return active
 
 
@@ -6827,6 +7296,7 @@ def build_guild_detailed_settings_embed(guild: discord.Guild, invite_url: str) -
         value=(
             f"• Anti-Scam: `{'ON' if s.get('antiscam_enabled') else 'OFF'}` (Timeout: `{s.get('antiscam_timeout_mins')}m`)\n"
             f"• Security Log: {_ch_str(s.get('antiscam_log_channel_id'))}\n"
+            f"• Clan Tag Reward: `{'ON' if s.get('clan_tag_enabled') else 'OFF'}` ({_role_str(s.get('clan_tag_role_id'))})\n"
             f"• Lockdown Active: `{'YES' if is_lockdown_active(guild.id) else 'NO'}`\n"
             f"• Booster Role: {_role_str(s.get('booster_role_id'))}\n"
             f"• Auto-Role: {_role_str(s.get('autorole_id'))}"
@@ -6981,7 +7451,7 @@ async def owner_servers_cmd(ctx: commands.Context):
 
 
 # -------------------------------------------------------------
-# 16. Event Listeners & Background Scheduler
+# 17. Event Listeners & Background Scheduler
 # -------------------------------------------------------------
 def compute_command_tree_signature() -> str:
     entries: List[str] = []
@@ -7111,6 +7581,9 @@ async def on_message(message: discord.Message):
         if await handle_antiscam_check(message, settings):
             return
 
+        if isinstance(message.author, discord.Member) and settings.get("clan_tag_enabled"):
+            asyncio.create_task(check_and_sync_member_clan_tag(message.author, settings))
+
         if message.channel.id in TEMP_VOICE_CACHE:
             touch_temp_voice_activity(message.channel.id)
 
@@ -7175,12 +7648,14 @@ async def on_member_join(member: discord.Member):
                 await member.add_roles(role, reason="Join Auto-Role")
             except Exception:
                 pass
+    if settings.get("clan_tag_enabled"):
+        await check_and_sync_member_clan_tag(member, settings)
 
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    settings = get_guild_settings(after.guild.id)
     if before.premium_since is not None and after.premium_since is None:
-        settings = get_guild_settings(after.guild.id)
         booster_role_id = settings["booster_role_id"]
         if booster_role_id:
             role = after.guild.get_role(booster_role_id)
@@ -7189,6 +7664,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                     await after.remove_roles(role, reason="Server Boost expired")
                 except Exception:
                     pass
+    if settings.get("clan_tag_enabled"):
+        await check_and_sync_member_clan_tag(after, settings)
 
 
 @tasks.loop(seconds=20)
@@ -7214,6 +7691,10 @@ async def background_scheduler():
         cutoff_lfg = now_f - 60.0
         for uid in [u for u, t in LFG_POST_COOLDOWNS.items() if t < cutoff_lfg]:
             LFG_POST_COOLDOWNS.pop(uid, None)
+    if len(CLAN_TAG_CHECK_COOLDOWNS) > 3000:
+        cutoff_tag = now_f - 90.0
+        for uid in [u for u, t in CLAN_TAG_CHECK_COOLDOWNS.items() if t < cutoff_tag]:
+            CLAN_TAG_CHECK_COOLDOWNS.pop(uid, None)
     if len(STARBOARD_LOCKS) > 50:
         active_gids = {g.id for g in bot.guilds}
         for gid in [g for g in STARBOARD_LOCKS if g not in active_gids]:
@@ -7347,7 +7828,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # -------------------------------------------------------------
-# 17. Entrypoint
+# 18. Entrypoint
 # -------------------------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
