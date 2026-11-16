@@ -474,6 +474,33 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_active ON scheduled_events(started, start_ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_value_history_ts ON value_history(changed_at DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_lfg_vc ON lfg_posts(voice_channel_id)")
+
+        # Exclusive Reaction Roles (Last-Clicked Wins)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reaction_role_panels (
+                message_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                guild_id INTEGER,
+                title TEXT,
+                description TEXT,
+                image_url TEXT,
+                color INTEGER DEFAULT 5793266
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reaction_role_items (
+                message_id INTEGER,
+                emoji_key TEXT,
+                emoji_raw TEXT,
+                role_id INTEGER,
+                label TEXT,
+                PRIMARY KEY (message_id, emoji_key)
+            )
+            """
+        )
         conn.commit()
     print(f"[Database] Ready (WAL Mode) at: {DB_PATH}")
 
@@ -5846,320 +5873,320 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
 
 
 # -------------------------------------------------------------
-# 14. Admin Control Panel (/panel) & Sub-Panels
+# 13.5 Exclusive Reaction Roles (Supports Custom Server Emojis, Last-Clicked Wins)
 # -------------------------------------------------------------
-class ValueUrlModal(discord.ui.Modal, title="Set Value List Website URL"):
-    url_input = discord.ui.TextInput(
-        label="Official Value List URL",
+REACTION_ROLE_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def normalize_reaction_emoji_key(emoji: Union[discord.PartialEmoji, discord.Emoji, str]) -> str:
+    if isinstance(emoji, (discord.PartialEmoji, discord.Emoji)):
+        return f"id:{emoji.id}" if emoji.id else f"uni:{emoji.name}"
+    raw = str(emoji).strip()
+    m = re.match(r"^<a?:([a-zA-Z0-9_~]+):(\d+)>$", raw)
+    if m:
+        return f"id:{m.group(2)}"
+    return f"uni:{raw}"
+
+
+def resolve_emoji_from_raw(guild: discord.Guild, raw_emoji: str) -> Optional[Union[discord.PartialEmoji, discord.Emoji, str]]:
+    raw = raw_emoji.strip()
+    if not raw:
+        return None
+    m = re.match(r"^<(a?):([a-zA-Z0-9_~]+):(\d+)>$", raw)
+    if m:
+        eid = int(m.group(3))
+        found = guild.get_emoji(eid) or bot.get_emoji(eid)
+        if found:
+            return found
+        return discord.PartialEmoji(name=m.group(2), id=eid, animated=bool(m.group(1)))
+
+    name_clean = raw.strip(":")
+    for e in guild.emojis:
+        if e.name.lower() == name_clean.lower():
+            return e
+    for e in bot.emojis:
+        if e.name.lower() == name_clean.lower():
+            return e
+    return raw
+
+
+def build_reaction_role_embed(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    items: List[Tuple[str, str, int, str]],
+    image_url: str = "",
+) -> discord.Embed:
+    lines: List[str] = []
+    if description.strip():
+        lines.append(description.strip())
+        lines.append("")
+
+    for _, emoji_raw, role_id, label in items:
+        label_part = f" — *{label}*" if label.strip() else ""
+        lines.append(f"{emoji_raw} ➔ <@&{role_id}>{label_part}")
+
+    lines.append("\n-# 💡 You can hold **only 1 role** from this list at a time — clicking a new reaction automatically replaces your previous choice.")
+
+    embed = discord.Embed(
+        title=title.strip() or "🎭 Choose Your Role",
+        description="\n".join(lines),
+        color=0x5865F2,
+    )
+    if image_url and image_url.strip().startswith(("http://", "https://")):
+        embed.set_image(url=image_url.strip())
+    embed.set_footer(
+        text=f"{guild.name} • Exclusive Reaction Roles",
+        icon_url=guild.icon.url if guild.icon else None,
+    )
+    return embed
+
+
+class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post"):
+    title_input = discord.ui.TextInput(
+        label="Post Title",
         style=discord.TextStyle.short,
         required=True,
-        max_length=300,
-        placeholder="https://cameraman-td.vaultedvaluesx.com/value-list",
+        max_length=150,
+        default="🎭 Choose Your Ping / Class Role",
+        placeholder="e.g. Select Your Game Ping Role",
+    )
+    desc_input = discord.ui.TextInput(
+        label="Description (Optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1500,
+        placeholder="React below to pick your role. Only your latest reaction is kept!",
+    )
+    mappings_input = discord.ui.TextInput(
+        label="Emoji | @Role or RoleID | Note (1 per line)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+        placeholder=":w1_win: | 123456789012345678 | Updates Ping\n🔥 | @EventPing | Event Alerts",
     )
 
-    def __init__(self, current_url: str):
+    def __init__(self, target_channel: discord.TextChannel, image_url: str = ""):
         super().__init__()
-        self.url_input.default = current_url
+        self.target_channel = target_channel
+        self.image_url = image_url
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
             return
-        url = self.url_input.value.strip()
-        if not url.startswith(("http://", "https://")):
-            return await interaction.response.send_message("❌ Enter a valid `https://` URL.", ephemeral=True)
-        update_guild_settings(interaction.guild.id, value_list_url=url)
-        await interaction.response.send_message(f"✅ Value list URL updated to: {url}", ephemeral=True)
+        guild = interaction.guild
 
+        parsed_items: List[Tuple[str, str, int, str, Any]] = []
+        seen_keys: Set[str] = set()
+        errors: List[str] = []
 
-class ValueSetupView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
+        for idx, raw_line in enumerate(self.mappings_input.value.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 2:
+                errors.append(f"Line {idx}: expected `Emoji | Role` format.")
+                continue
 
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="📊 Select Value Changes Channel...",
-        row=0,
-    )
-    async def select_value_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, value_channel_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ Value Changelog channel set to <#{chosen.id}>.",
-            view=self,
-        )
+            emoji_token = parts[0]
+            role_token = parts[1]
+            note_token = parts[2] if len(parts) >= 3 else ""
 
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="✍️ Select Signs Value Channel (Scans 100% of history)...",
-        row=1,
-    )
-    async def select_signs_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, signs_channel_id=chosen.id)
-        await interaction.response.defer(ephemeral=True)
-        ch_obj = interaction.guild.get_channel(chosen.id) if interaction.guild else None
-        scanned_msgs, synced_partners = (0, 0)
-        if isinstance(ch_obj, discord.TextChannel):
-            scanned_msgs, synced_partners = await scan_signs_channel_history(ch_obj)
-        await interaction.edit_original_response(
-            content=(
-                f"✅ **Signs Value channel set to <#{chosen.id}>!**\n"
-                f"• Read all **{scanned_msgs}** messages in channel history and synced **{synced_partners}** sign partner(s) (**{len(SIGN_PARTNERS_CACHE)}** total in database).\n"
-                "• All new and edited messages in that channel will now update partner signs automatically!"
-            ),
-            view=self,
-        )
+            emoji_obj = resolve_emoji_from_raw(guild, emoji_token)
+            if not emoji_obj:
+                errors.append(f"Line {idx}: invalid emoji `{emoji_token}`.")
+                continue
 
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="🏷️ Select Value/Sign Changes Ping Role...",
-        row=2,
-    )
-    async def select_value_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, value_ping_role_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ Value & Sign Changes ping role set to <@&{chosen.id}>.",
-            view=self,
-        )
+            e_key = normalize_reaction_emoji_key(emoji_obj)
+            if e_key in seen_keys:
+                errors.append(f"Line {idx}: duplicate emoji `{emoji_token}`.")
+                continue
 
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="🛡️ Select Value Team Roles (/value_post, /sign_post, /alias_add)...",
-        min_values=1,
-        max_values=10,
-        row=3,
-    )
-    async def select_value_managers(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        role_ids_str = ",".join(str(r.id) for r in select.values)
-        update_guild_settings(self.guild_id, value_manager_role_ids=role_ids_str)
-        mentions = ", ".join(f"<@&{r.id}>" for r in select.values)
-        await interaction.response.edit_message(
-            content=f"🛡️ **Value Team Roles updated:** {mentions}\nMembers with any of these roles can use `/value_post`, `/sign_post`, `/alias_add`, `/value_unit_delete`, and `/sign_delete`!",
-            view=self,
-        )
+            role_obj: Optional[discord.Role] = None
+            role_id_m = re.search(r"(\d{15,22})", role_token)
+            if role_id_m:
+                role_obj = guild.get_role(int(role_id_m.group(1)))
+            if not role_obj:
+                clean_rname = role_token.lstrip("@").strip().lower()
+                for r in guild.roles:
+                    if not r.is_default() and r.name.lower() == clean_rname:
+                        role_obj = r
+                        break
 
-    @discord.ui.button(label="Sync Web + Signs", style=discord.ButtonStyle.secondary, emoji="🔄", row=4)
-    async def sync_web_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        s = get_guild_settings(self.guild_id)
-        checked, changed = await sync_value_list_from_website(s["value_list_url"])
-        scanned_msgs, signs_synced = (0, 0)
-        if s.get("signs_channel_id") and interaction.guild:
-            ch_obj = interaction.guild.get_channel(s["signs_channel_id"])
-            if isinstance(ch_obj, discord.TextChannel):
-                scanned_msgs, signs_synced = await scan_signs_channel_history(ch_obj)
-        await interaction.followup.send(
-            f"🔄 **Full Sync Complete!**\n"
-            f"• Website: checked **{checked}** items (**{changed}** updated, **{len(VALUE_ITEMS_CACHE)}** cached)\n"
-            f"• Signs Channel: read **{scanned_msgs}** messages, synced **{signs_synced}** partner(s) (**{len(SIGN_PARTNERS_CACHE)}** cached)",
-            ephemeral=True,
-        )
+            if not role_obj:
+                errors.append(f"Line {idx}: role `{role_token}` not found (use Role ID or exact name).")
+                continue
+            if guild.me and guild.me.top_role <= role_obj:
+                errors.append(f"Line {idx}: bot's highest role must be above **{role_obj.name}**.")
+                continue
 
-    @discord.ui.button(label="Post Value Hub", style=discord.ButtonStyle.primary, emoji="📌", row=4)
-    async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
-            return
-        site_url = get_guild_settings(interaction.guild.id)["value_list_url"]
-        embed = discord.Embed(
-            title="💎 Official CMTD Value & Sign Hub",
-            description=(
-                "Check live unit values, partner sign multipliers, and calculate trades right inside Discord!\n\n"
-                "• **`🔍 Check Unit Value`** — look up any unit (including partner signs like `Whatenix Pharaoh`).\n"
-                "• **`⚖️ Trade Calculator`** (or `/calc`) — compare **You Give** vs. **You Get** publicly.\n"
-                "• **Right-Click / Long-Press any Trade Message ➔ `Apps` ➔ `⚖️ Check Trade Value`** — instant trade & sign calculation!\n"
-                "• **`✍️ Sign Partners`** — view all current partner sign percentages.\n"
-                "• **`🏆 Top Values`** & **`📈 Recent Changes`** — live leaderboards & updates."
-            ),
-            color=0x3498DB,
-        )
-        embed.set_footer(
-            text=f"{interaction.guild.name} • {len(VALUE_ITEMS_CACHE)} Units • {len(SIGN_PARTNERS_CACHE)} Sign Partners",
-            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
-        )
-        sent = await interaction.channel.send(embed=embed, view=ValueHubView(site_url))
-        await interaction.response.send_message(
-            f"📌 Value & Sign Hub posted! [Jump to Message]({sent.jump_url})",
-            ephemeral=True,
-        )
+            seen_keys.add(e_key)
+            display_emoji = str(emoji_obj)
+            parsed_items.append((e_key, display_emoji, role_obj.id, note_token, emoji_obj))
 
-    @discord.ui.button(label="Set URL", style=discord.ButtonStyle.secondary, emoji="🔗", row=4)
-    async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cur_url = get_guild_settings(self.guild_id)["value_list_url"]
-        await interaction.response.send_modal(ValueUrlModal(cur_url))
-
-    @discord.ui.button(label="Clear Roles", style=discord.ButtonStyle.danger, emoji="🧹", row=4)
-    async def clear_managers_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(self.guild_id, value_manager_role_ids="")
-        await interaction.response.edit_message(
-            content="🧹 Custom Value Team roles cleared (reverted to `Manage Messages` / `Administrator`).",
-            view=self,
-        )
-
-
-class TempVoiceSetupView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
-
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.voice],
-        placeholder="🔊 Select Join-to-Create Trigger Voice Channel...",
-        row=0,
-    )
-    async def select_jtc_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, jtc_channel_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ Join-to-Create trigger set to <#{chosen.id}>!",
-            view=self,
-        )
-
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="📣 Select LFG Squad Channel #1...",
-        row=1,
-    )
-    async def select_lfg_ch1(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, lfg_channel_1_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ **LFG Channel #1** set to <#{chosen.id}>! Squad cards from `📣 Find Squad` can now be posted here.",
-            view=self,
-        )
-
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="📣 Select LFG Squad Channel #2 (Optional)...",
-        row=2,
-    )
-    async def select_lfg_ch2(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, lfg_channel_2_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"✅ **LFG Channel #2** set to <#{chosen.id}>! Players can now choose between both LFG channels.",
-            view=self,
-        )
-
-    @discord.ui.button(label="Clear LFG Channels", style=discord.ButtonStyle.secondary, emoji="🧹", row=3)
-    async def clear_lfg_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(self.guild_id, lfg_channel_1_id=None, lfg_channel_2_id=None)
-        await interaction.response.edit_message(
-            content="🧹 LFG Squad channels cleared.",
-            view=self,
-        )
-
-    @discord.ui.button(label="Disable Temp Voice", style=discord.ButtonStyle.danger, emoji="🛑", row=3)
-    async def disable_jtc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(self.guild_id, jtc_channel_id=None)
-        await interaction.response.edit_message(
-            content="🛑 Join-to-Create Private Voice Channels disabled.",
-            view=None,
-        )
-
-
-class AntiScamSetupView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
-
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[discord.ChannelType.text],
-        placeholder="📋 Select Security Log Channel (Optional)...",
-        row=0,
-    )
-    async def select_log_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, antiscam_log_channel_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"📋 Anti-Scam security log channel set to <#{chosen.id}>.",
-            view=self,
-        )
-
-    @discord.ui.select(
-        placeholder="⏱️ Select Auto-Timeout Duration for Scammers...",
-        options=[
-            discord.SelectOption(label="Delete Message Only (No Timeout)", value="0"),
-            discord.SelectOption(label="1 Hour Timeout + Delete", value="60"),
-            discord.SelectOption(label="24 Hours Timeout + Delete", value="1440"),
-        ],
-        row=1,
-    )
-    async def select_timeout(self, interaction: discord.Interaction, select: discord.ui.Select):
-        mins = int(select.values[0])
-        update_guild_settings(self.guild_id, antiscam_timeout_mins=mins)
-        label = "Delete only" if mins == 0 else f"{mins} minutes timeout"
-        await interaction.response.edit_message(
-            content=f"⏱️ Anti-Scam punishment updated to: **{label}**.",
-            view=self,
-        )
-
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect,
-        placeholder="🏷️ [Opt-In] Select Role for Wearing Server Clan Tag...",
-        row=2,
-    )
-    async def select_clan_tag_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        chosen = select.values[0]
-        update_guild_settings(self.guild_id, clan_tag_role_id=chosen.id)
-        await interaction.response.edit_message(
-            content=f"🏷️ **Clan Tag Reward Role** set to <@&{chosen.id}>! Use the toggle button below to enable/disable.",
-            view=self,
-        )
-
-    @discord.ui.button(label="Enable Shield", style=discord.ButtonStyle.success, emoji="🛡️", row=3)
-    async def enable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(self.guild_id, antiscam_enabled=True)
-        await interaction.response.edit_message(
-            content="🛡️ **Anti-Scam & Phishing Shield ENABLED!**",
-            view=self,
-        )
-
-    @discord.ui.button(label="Disable Shield", style=discord.ButtonStyle.danger, emoji="🛑", row=3)
-    async def disable_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        update_guild_settings(self.guild_id, antiscam_enabled=False)
-        await interaction.response.edit_message(
-            content="🛑 **Anti-Scam & Phishing Shield DISABLED.**",
-            view=self,
-        )
-
-    @discord.ui.button(label="Toggle Clan Tag Role", style=discord.ButtonStyle.primary, emoji="🏷️", row=3)
-    async def toggle_clan_tag_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = get_guild_settings(self.guild_id)
-        new_state = not s.get("clan_tag_enabled", False)
-        if new_state and not s.get("clan_tag_role_id"):
+        if errors:
             return await interaction.response.send_message(
-                "⚠️ Select a **Clan Tag Reward Role** in the dropdown above first!",
+                "❌ **Could not create reaction role post:**\n" + "\n".join(f"• {e}" for e in errors[:10]),
                 ephemeral=True,
             )
-        update_guild_settings(self.guild_id, clan_tag_enabled=new_state)
-        status_word = "ENABLED" if new_state else "DISABLED"
-        await interaction.response.edit_message(
-            content=f"🏷️ **Server Clan Tag Auto-Role {status_word}!**",
-            view=self,
+        if not parsed_items:
+            return await interaction.response.send_message("❌ Add at least 1 `Emoji | Role` line.", ephemeral=True)
+        if len(parsed_items) > 20:
+            return await interaction.response.send_message("❌ Discord allows up to **20** reactions per message.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        db_items = [(ek, er, rid, lbl) for ek, er, rid, lbl, _ in parsed_items]
+        embed = build_reaction_role_embed(
+            guild=guild,
+            title=self.title_input.value,
+            description=self.desc_input.value,
+            items=db_items,
+            image_url=self.image_url,
+        )
+
+        try:
+            sent = await self.target_channel.send(embed=embed)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Failed to send message: `{e}`", ephemeral=True)
+
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reaction_role_panels (
+                    message_id, channel_id, guild_id, title, description, image_url
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sent.id,
+                    self.target_channel.id,
+                    guild.id,
+                    self.title_input.value.strip(),
+                    self.desc_input.value.strip(),
+                    self.image_url,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO reaction_role_items (
+                    message_id, emoji_key, emoji_raw, role_id, label
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(sent.id, ek, er, rid, lbl) for ek, er, rid, lbl in db_items],
+            )
+            conn.commit()
+
+        failed_reacts: List[str] = []
+        for _, disp_em, _, _, em_obj in parsed_items:
+            try:
+                await sent.add_reaction(em_obj)
+                await asyncio.sleep(0.35)
+            except Exception:
+                failed_reacts.append(disp_em)
+
+        warn_note = (
+            f"\n⚠️ Could not pre-react with {', '.join(failed_reacts)} (make sure the emoji is from this server or accessible to the bot)."
+            if failed_reacts
+            else ""
+        )
+        await interaction.followup.send(
+            f"✅ **Exclusive Reaction Role post published** in {self.target_channel.mention} with **{len(parsed_items)}** role(s)! "
+            f"[Jump to Post]({sent.jump_url}){warn_note}",
+            ephemeral=True,
         )
 
 
-class LockdownSetupView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
+async def process_reaction_role_event(payload: discord.RawReactionActionEvent, is_add: bool):
+    if not payload.guild_id:
+        return
+    if bot.user and payload.user_id == bot.user.id:
+        return
 
-    @discord.ui.select(
-        cls=discord.ui.ChannelSelect,
-        channel_types=[
-            discord.ChannelType.text,
-            discord.ChannelType.voice,
-            discord.ChannelType.forum,
-            discord.ChannelType.stage_voice,
-            discord.ChannelType.category,
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT emoji_key, emoji_raw, role_id FROM reaction_role_items WHERE message_id = ?",
+            (payload.message_id,),
+        )
+        rows = c.fetchall()
+
+    if not rows:
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    if not member:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except Exception:
+            return
+    if member.bot:
+        return
+
+    clicked_key = normalize_reaction_emoji_key(payload.emoji)
+    panel_map: Dict[str, Tuple[str, int]] = {ek: (er, rid) for ek, er, rid in rows}
+    if clicked_key not in panel_map:
+        return
+
+    lock_key = (payload.message_id, member.id)
+    user_lock = REACTION_ROLE_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with user_lock:
+        try:
+            _, target_role_id = panel_map[clicked_key]
+            target_role = guild.get_role(target_role_id)
+
+            if not is_add:
+                # User removed their reaction -> remove that role
+                if target_role and target_role in member.roles:
+                    try:
+                        await member.remove_roles(target_role, reason="Reaction role unselected")
+                    except Exception:
+                        pass
+                return
+
+            # User added a reaction -> keep ONLY this role and strip all other roles from this panel
+            all_panel_role_ids = {rid for _, rid in panel_map.values()}
+            roles_to_remove = [
+                r for r in member.roles
+                if r.id in all_panel_role_ids and r.id != target_role_id
+            ]
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove, reason="Exclusive reaction role switched")
+                except Exception:
+                    pass
+
+            if target_role and target_role not in member.roles:
+                try:
+                    await member.add_roles(target_role, reason="Exclusive reaction role selected")
+                except Exception:
+                    pass
+
+            # Remove the user's previous reactions on this message so only the latest reaction stays
+            ch = guild.get_channel(payload.channel_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    msg = await ch.fetch_message(payload.message_id)
+                    for other_key, (other_raw, _) in panel_map.items():
+                        if other_key == clicked_key:
+                            continue
+                        em_obj = resolve_emoji_from_raw(guild, other_raw)
+                        if em_obj:
+                            try:
+                                await msg.remove_reaction(em_obj, member)
+                                await asyncio.sleep(0.25)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        finally:
+            if len(REACTION_ROLE_LOCKS) > 2000:
+                REACTION_ROLE_LOCKS.clear()
         ],
         placeholder="📋 Toggle Channel or Category in Lockdown Whitelist...",
         row=0,
@@ -6941,6 +6968,106 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
     await interaction.response.send_message("✅ Event banner updated!", ephemeral=True)
 
 
+@bot.tree.command(name="reaction_roles", description="Create an exclusive reaction-role post (supports custom emojis, keeps only latest choice)")
+@app_commands.describe(
+    channel="Channel where the reaction-role post will be sent",
+    image="Optional banner image for the post",
+)
+@app_commands.default_permissions(manage_roles=True)
+async def reaction_roles_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    image: Optional[discord.Attachment] = None,
+):
+    await interaction.response.send_modal(
+        ReactionRolePostModal(
+            target_channel=channel,
+            image_url=image.url if image else "",
+        )
+    )
+
+
+@bot.tree.command(name="reaction_role_add", description="Add or update an emoji -> role option on an existing reaction-role post")
+@app_commands.describe(
+    message="Message ID or link of the reaction-role post",
+    emoji="Server custom emoji (e.g. :w1_win: or paste emoji) or standard emoji",
+    role="Role to assign when clicked",
+    note="Optional short description next to the role",
+)
+@app_commands.default_permissions(manage_roles=True)
+async def reaction_role_add_cmd(
+    interaction: discord.Interaction,
+    message: str,
+    emoji: str,
+    role: discord.Role,
+    note: str = "",
+):
+    if not interaction.guild or not interaction.channel:
+        return
+    ch_id, msg_id = parse_message_reference(message, interaction.channel.id)
+    if not ch_id or not msg_id:
+        return await interaction.response.send_message("❌ Invalid Message ID or Link.", ephemeral=True)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT title, description, image_url FROM reaction_role_panels WHERE message_id = ?",
+            (msg_id,),
+        )
+        panel = c.fetchone()
+        if not panel:
+            return await interaction.response.send_message(
+                "❌ That message is not a reaction-role post created with `/reaction_roles`.",
+                ephemeral=True,
+            )
+
+        emoji_obj = resolve_emoji_from_raw(interaction.guild, emoji)
+        if not emoji_obj:
+            return await interaction.response.send_message("❌ Could not recognize that emoji.", ephemeral=True)
+        if interaction.guild.me and interaction.guild.me.top_role <= role:
+            return await interaction.response.send_message(
+                f"❌ Bot's highest role must be above **{role.name}**.",
+                ephemeral=True,
+            )
+
+        e_key = normalize_reaction_emoji_key(emoji_obj)
+        e_raw = str(emoji_obj)
+        c.execute(
+            """
+            INSERT OR REPLACE INTO reaction_role_items (message_id, emoji_key, emoji_raw, role_id, label)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (msg_id, e_key, e_raw, role.id, note.strip()),
+        )
+        c.execute(
+            "SELECT emoji_key, emoji_raw, role_id, label FROM reaction_role_items WHERE message_id = ?",
+            (msg_id,),
+        )
+        all_items = c.fetchall()
+        conn.commit()
+
+    target_ch = interaction.guild.get_channel(ch_id)
+    if isinstance(target_ch, discord.TextChannel):
+        try:
+            msg_obj = await target_ch.fetch_message(msg_id)
+            embed = build_reaction_role_embed(
+                guild=interaction.guild,
+                title=panel[0],
+                description=panel[1] or "",
+                items=all_items,
+                image_url=panel[2] or "",
+            )
+            await msg_obj.edit(embed=embed)
+            await msg_obj.add_reaction(emoji_obj)
+        except Exception as e:
+            return await interaction.response.send_message(f"⚠️ Saved in DB, but failed to update message/reaction: `{e}`", ephemeral=True)
+
+    await interaction.response.send_message(
+        f"✅ Bound {e_raw} ➔ {role.mention} on the reaction-role post!",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="stats", description="View bot performance, cache health, and server metrics")
 async def stats_cmd(interaction: discord.Interaction):
     uptime_sec = int(time.time() - START_TIME)
@@ -7628,11 +7755,13 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     await process_starboard_reaction(payload, is_add=True)
+    await process_reaction_role_event(payload, is_add=True)
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     await process_starboard_reaction(payload, is_add=False)
+    await process_reaction_role_event(payload, is_add=False)
 
 
 @bot.event
