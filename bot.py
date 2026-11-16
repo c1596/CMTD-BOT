@@ -670,8 +670,6 @@ def parse_message_reference(raw: str, default_channel_id: int) -> Tuple[Optional
 # -------------------------------------------------------------
 # 3. Value List & Partner Signs System (Strict Prefix Resolver + Aliases)
 # -------------------------------------------------------------
-# Distinct variant/prefix tokens that MUST NOT be blurred with base units
-# (e.g., "Baker Titan Speakerman" != "Titan Speakerman", "Upgraded Titan TV Man" != "Titan TV Man")
 DISTINCT_VARIANT_TOKENS: Set[str] = {
     "baker", "upgraded", "hyper", "golden", "gold", "dark", "corrupted",
     "halloween", "hallow", "chef", "santa", "shiny", "devsigned", "signed",
@@ -806,13 +804,11 @@ def build_aliases_for_unit(name: str, existing_aliases: str = "") -> str:
 
 def rebuild_alias_map():
     VALUE_ALIAS_MAP.clear()
-    # First pass: register custom aliases
     for item_key, item in VALUE_ITEMS_CACHE.items():
         for alias in item.get("aliases", "").split(","):
             a_clean = normalize_unit_key(alias)
             if a_clean and a_clean != item_key:
                 VALUE_ALIAS_MAP[a_clean] = item_key
-    # Second pass: canonical item keys ALWAYS take highest priority over any alias
     for item_key in VALUE_ITEMS_CACHE:
         VALUE_ALIAS_MAP[item_key] = item_key
 
@@ -1323,7 +1319,6 @@ def _collect_message_full_text(msg: discord.Message) -> str:
 
 
 async def scan_signs_channel_history(channel: discord.TextChannel) -> Tuple[int, int]:
-    """Reads 100% of channel history from oldest to newest so latest changes always win."""
     messages_scanned = 0
     updated_partners: Set[str] = set()
     try:
@@ -1383,13 +1378,10 @@ def build_sign_partners_embed(guild: Optional[discord.Guild]) -> discord.Embed:
 
 
 def _is_variant_compatible(query_str: str, candidate_str: str) -> bool:
-    """Prevents 'Baker Titan Speakerman' from colliding with 'Titan Speakerman'."""
     q_vars = _extract_variant_tokens(query_str)
     c_vars = _extract_variant_tokens(candidate_str)
-    # Every distinctive prefix/variant in the query must exist in the candidate
     if not q_vars.issubset(c_vars):
         return False
-    # If query is a full multi-word unit name without extra variants, don't randomly map to a prefixed variant either
     if len(q_vars) == 0 and len(c_vars) > 0 and len(query_str.split()) >= 2:
         return False
     return True
@@ -1400,18 +1392,15 @@ def find_value_item(query: str, strict_exact: bool = False) -> Optional[Dict[str
     if not q:
         return None
 
-    # 1. Exact canonical key match (highest priority)
     if q in VALUE_ITEMS_CACHE:
         return VALUE_ITEMS_CACHE[q]
 
-    # 2. Exact alias match
     if q in VALUE_ALIAS_MAP:
         return VALUE_ITEMS_CACHE.get(VALUE_ALIAS_MAP[q])
 
     if strict_exact:
         return None
 
-    # 3. Prefix match (prefer longest matching alias/key, respecting variant prefixes)
     prefix_matches: List[Tuple[int, str]] = []
     for alias, key in VALUE_ALIAS_MAP.items():
         if alias.startswith(q) and _is_variant_compatible(q, alias):
@@ -1420,7 +1409,6 @@ def find_value_item(query: str, strict_exact: bool = False) -> Optional[Dict[str
         prefix_matches.sort(key=lambda x: x[0])
         return VALUE_ITEMS_CACHE.get(prefix_matches[0][1])
 
-    # 4. Substring match (only when query >= 4 chars and variant-compatible)
     if len(q) >= 4:
         sub_matches: List[Tuple[int, str]] = []
         for alias, key in VALUE_ALIAS_MAP.items():
@@ -1430,7 +1418,6 @@ def find_value_item(query: str, strict_exact: bool = False) -> Optional[Dict[str
             sub_matches.sort(key=lambda x: x[0])
             return VALUE_ITEMS_CACHE.get(sub_matches[0][1])
 
-    # 5. Typo fuzzy match (high cutoff + strict variant token check)
     if len(q) >= 5 and VALUE_ALIAS_MAP:
         close = difflib.get_close_matches(q, list(VALUE_ALIAS_MAP.keys()), n=5, cutoff=0.84)
         for c_alias in close:
@@ -1500,8 +1487,6 @@ def upsert_value_item(
     image_url: Optional[str] = None,
     source: str = "manual",
 ) -> Tuple[Dict[str, Any], bool]:
-    # Use strict_exact=True when creating/syncing by full name so "Baker Titan Speakerman"
-    # NEVER overwrites "Titan Speakerman" (2) and always creates/updates its own entry (3750)!
     clean_display = name.strip()
     exact_key = normalize_unit_key(clean_display)
     existing = VALUE_ITEMS_CACHE.get(exact_key)
@@ -1513,7 +1498,6 @@ def upsert_value_item(
 
     if existing:
         item_key = existing["item_key"]
-        # Update display name casing if website provides cleaner casing
         final_name = clean_display if (source == "auto-check" and clean_display) else existing["name"]
         final_aliases = build_aliases_for_unit(final_name, existing.get("aliases", ""))
         final_cat = category if category else existing["category"]
@@ -2209,7 +2193,6 @@ class TradeCalcModal(discord.ui.Modal, title="CMTD Trade Calculator"):
 
 
 def parse_freeform_trade_message(raw_text: str) -> Tuple[str, str]:
-    """Splits a chat trade message into (give_text, get_text) if separators exist."""
     cleaned = re.sub(r"<@!?\d+>|<@&\d+>|<#\d+>", " ", raw_text)
     cleaned = re.sub(
         r"\b(?:trading|lf|looking\s+for|offering|offer|my|me|their|them|for|w/f/l|wfl|worl|nlf|adds?|plz|pls|fast|quick)\b\s*:?",
@@ -2939,7 +2922,6 @@ async def handle_antiscam_check(message: discord.Message, settings: Dict[str, An
 # 6. Opt-In Server Clan Tag Reward (Disabled by Default)
 # -------------------------------------------------------------
 async def check_and_sync_member_clan_tag(member: discord.Member, settings: Dict[str, Any]):
-    """Checks if a member is wearing this server's Clan Tag (primary_guild) when enabled in /panel."""
     if not settings.get("clan_tag_enabled"):
         return
     role_id = settings.get("clan_tag_role_id")
@@ -3633,7 +3615,6 @@ def remove_temp_voice_record(channel_id: int):
 
 
 async def update_voice_channel_status_text(vc: discord.VoiceChannel, status_text: Optional[str]):
-    """Sets the live Voice Channel Status line visible directly under the channel name in Discord."""
     try:
         if hasattr(vc, "edit"):
             await vc.edit(status=status_text[:500] if status_text else None)
@@ -5840,6 +5821,9 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
                         pass
 
 
+# -------------------------------------------------------------
+# 13B. Exclusive Reaction Roles System (Polished Card UI)
+# -------------------------------------------------------------
 REACTION_ROLE_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
 
 
@@ -5872,30 +5856,80 @@ def build_reaction_role_embed(
     items: List[Tuple[str, str, int, str]],
     image_url: str = "",
     required_role_ids: Optional[List[int]] = None,
+    color: int = 0x5865F2,
 ) -> discord.Embed:
-    lines: List[str] = []
-    if description:
-        lines.append(description)
-    if items:
-        opts = []
-        for _, e_raw, rid, label in items:
-            suffix = f" — {label}" if label else ""
-            opts.append(f"{e_raw} ➔ <@&{rid}>{suffix}")
-        lines.append("\n".join(opts))
-    if required_role_ids:
-        req_str = ", ".join(f"<@&{rid}>" for rid in required_role_ids)
-        lines.append(f"\n🔒 **Required Role:** {req_str}")
+    """Renders a clean, structured reaction-role card with aligned badges, descriptions, and access rules."""
+    clean_title = (title or "Choose Your Role").strip()
+    if not clean_title[0:2].isascii():
+        display_title = clean_title
+    else:
+        display_title = f"🎭 {clean_title}"
+
+    desc_blocks: List[str] = []
+    if description and description.strip():
+        desc_blocks.append(description.strip())
+
+    desc_blocks.append(
+        "-# Click a reaction below to claim your role • Selecting another automatically switches it"
+    )
 
     embed = discord.Embed(
-        title=title or "🎭 Choose Your Role",
-        description="\n\n".join(lines),
-        color=0x5865F2,
+        title=display_title,
+        description="\n\n".join(desc_blocks),
+        color=color,
     )
+
+    if guild.icon:
+        embed.set_author(name=f"{guild.name} • Self-Assign Roles", icon_url=guild.icon.url)
+    else:
+        embed.set_author(name=f"{guild.name} • Self-Assign Roles")
+
+    if items:
+        role_rows: List[str] = []
+        for _, e_raw, rid, label in items:
+            if label and label.strip():
+                role_rows.append(f"> {e_raw} **┊** <@&{rid}> — *{label.strip()}*")
+            else:
+                role_rows.append(f"> {e_raw} **┊** <@&{rid}>")
+
+        # Split cleanly into columns if > 10 roles so the card never feels tall or cramped
+        if len(role_rows) > 10:
+            mid = (len(role_rows) + 1) // 2
+            embed.add_field(
+                name=f"✨ Available Roles ({len(role_rows)})",
+                value="\n".join(role_rows[:mid]),
+                inline=True,
+            )
+            embed.add_field(
+                name="\u200b",
+                value="\n".join(role_rows[mid:]),
+                inline=True,
+            )
+        else:
+            embed.add_field(
+                name=f"✨ Available Roles ({len(role_rows)})",
+                value="\n".join(role_rows),
+                inline=False,
+            )
+
+    if required_role_ids:
+        req_str = " or ".join(f"<@&{rid}>" for rid in required_role_ids)
+        embed.add_field(
+            name="🔒 Access Requirement",
+            value=f"> Must hold {req_str} to claim a role",
+            inline=False,
+        )
+
     if image_url and image_url.startswith(("http://", "https://")):
         embed.set_image(url=image_url)
-    embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
+
+    embed.set_footer(
+        text="Single-Selection Mode • Remove reaction to unequip",
+        icon_url=guild.icon.url if guild.icon else None,
+    )
     return embed
-    
+
+
 class ReactionRoleAddOptionModal(discord.ui.Modal, title="Bind Emoji to Selected Role"):
     emoji_input = discord.ui.TextInput(
         label="Emoji (Custom :name: or Standard Emoji)",
@@ -5909,7 +5943,7 @@ class ReactionRoleAddOptionModal(discord.ui.Modal, title="Bind Emoji to Selected
         style=discord.TextStyle.short,
         required=False,
         max_length=80,
-        placeholder="e.g. Updates Ping",
+        placeholder="e.g. Updates & Patch Notes Ping",
     )
 
     def __init__(self, builder: "ReactionRoleBuilderView", role: discord.Role):
@@ -5932,7 +5966,6 @@ class ReactionRoleAddOptionModal(discord.ui.Modal, title="Bind Emoji to Selected
         e_raw = str(emoji_obj)
         note = self.note_input.value.strip()
 
-        # Replace if same emoji or same role already exists in draft
         self.builder.items = [
             it for it in self.builder.items
             if it[0] != e_key and it[2] != self.role.id
@@ -5964,16 +5997,27 @@ class ReactionRoleEditTextModal(discord.ui.Modal, title="Edit Post Title & Descr
         required=False,
         max_length=1500,
     )
+    color_input = discord.ui.TextInput(
+        label="Accent Color Hex (Optional, e.g. #5865F2)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=10,
+        placeholder="#5865F2",
+    )
 
     def __init__(self, builder: "ReactionRoleBuilderView"):
         super().__init__()
         self.builder = builder
         self.title_input.default = builder.title
         self.desc_input.default = builder.description
+        self.color_input.default = f"#{builder.color:06X}"
 
     async def on_submit(self, interaction: discord.Interaction):
-        self.builder.title = self.title_input.value.strip() or "🎭 Choose Your Role"
+        self.builder.title = self.title_input.value.strip() or "Choose Your Role"
         self.builder.description = self.desc_input.value.strip()
+        raw_hex = self.color_input.value.strip().lstrip("#")
+        if re.fullmatch(r"[0-9a-fA-F]{6}", raw_hex):
+            self.builder.color = int(raw_hex, 16)
         await interaction.response.edit_message(
             content=self.builder.build_status_text(),
             embed=self.builder.build_preview_embed(),
@@ -5982,7 +6026,6 @@ class ReactionRoleEditTextModal(discord.ui.Modal, title="Edit Post Title & Descr
 
 
 class ReactionRoleQuickEmojiSelectView(discord.ui.View):
-    """Lets you pick a custom server emoji from a dropdown list instead of typing its name."""
     def __init__(self, builder: "ReactionRoleBuilderView", role: discord.Role, guild_emojis: List[discord.Emoji]):
         super().__init__(timeout=90)
         self.builder = builder
@@ -6006,7 +6049,7 @@ class ReactionRoleQuickEmojiSelectView(discord.ui.View):
         sel.callback = self.on_pick_emoji
         self.add_item(sel)
 
-    @discord.ui.button(label="Type Custom / Standard Emoji Instead", style=discord.ButtonStyle.secondary, emoji="⌨️", row=1)
+    @discord.ui.button(label="Type Emoji & Note Instead", style=discord.ButtonStyle.secondary, emoji="⌨️", row=1)
     async def type_instead_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ReactionRoleAddOptionModal(self.builder, self.role))
 
@@ -6027,7 +6070,7 @@ class ReactionRoleQuickEmojiSelectView(discord.ui.View):
 
         self.builder.items.append((e_key, e_raw, self.role.id, "", em_obj))
         await interaction.response.edit_message(
-            content=f"✅ Bound {e_raw} ➔ {self.role.mention}! (Return to the builder message above to add more or click **Publish**)",
+            content=f"✅ Bound {e_raw} ➔ {self.role.mention}! (Return to the builder preview above to add more or click **Publish**)",
             view=None,
         )
         if self.builder.panel_message:
@@ -6046,10 +6089,11 @@ class ReactionRoleBuilderView(discord.ui.View):
         self,
         guild: discord.Guild,
         target_channel: discord.TextChannel,
-        title: str = "🎭 Choose Your Role",
+        title: str = "Choose Your Role",
         description: str = "",
         image_url: str = "",
         required_role_ids: Optional[List[int]] = None,
+        color: int = 0x5865F2,
     ):
         super().__init__(timeout=300)
         self.guild = guild
@@ -6057,6 +6101,7 @@ class ReactionRoleBuilderView(discord.ui.View):
         self.title = title
         self.description = description
         self.image_url = image_url
+        self.color = color
         self.required_role_ids: List[int] = list(required_role_ids or [])
         self.items: List[Tuple[str, str, int, str, Any]] = []
         self.panel_message: Optional[discord.Message] = None
@@ -6069,24 +6114,29 @@ class ReactionRoleBuilderView(discord.ui.View):
         )
         return (
             f"🛠️ **Visual Reaction-Role Builder** ➔ Target: {self.target_channel.mention}\n"
-            f"• **Options added:** `{len(self.items)}/20` (Live preview below)\n"
+            f"• **Options added:** `{len(self.items)}/20` (Live card preview below)\n"
             f"• **Required Roles (any 1 needed):** {req_txt}\n"
-            "Pick a role from the **1st dropdown** to bind an emoji to it — no IDs needed!"
+            "Pick a role from the **1st dropdown** to bind an emoji & note to it:"
         )
 
     def build_preview_embed(self) -> discord.Embed:
         db_items = [(ek, er, rid, lbl) for ek, er, rid, lbl, _ in self.items]
         if not db_items:
-            preview = discord.Embed(
+            preview = build_reaction_role_embed(
+                guild=self.guild,
                 title=self.title,
-                description=(
-                    (self.description + "\n\n" if self.description else "")
-                    + "*No roles added yet — pick a role in the dropdown below to add your first button/reaction!*"
-                ),
-                color=0x5865F2,
+                description=self.description,
+                items=[],
+                image_url=self.image_url,
+                required_role_ids=self.required_role_ids,
+                color=self.color,
             )
-            if self.image_url and self.image_url.startswith(("http://", "https://")):
-                preview.set_image(url=self.image_url)
+            preview.insert_field_at(
+                0,
+                name="✨ Available Roles (0)",
+                value="> *No roles added yet — pick a role in the dropdown below!*",
+                inline=False,
+            )
             return preview
         return build_reaction_role_embed(
             guild=self.guild,
@@ -6095,6 +6145,7 @@ class ReactionRoleBuilderView(discord.ui.View):
             items=db_items,
             image_url=self.image_url,
             required_role_ids=self.required_role_ids,
+            color=self.color,
         )
 
     @discord.ui.select(
@@ -6117,7 +6168,7 @@ class ReactionRoleBuilderView(discord.ui.View):
         guild_emojis = list(self.guild.emojis)
         if guild_emojis:
             await interaction.response.send_message(
-                f"🎨 Choose an emoji for {role.mention} from your server list, or type any standard/custom emoji:",
+                f"🎨 Choose an emoji for {role.mention} from your server list, or type an emoji + custom label:",
                 view=ReactionRoleQuickEmojiSelectView(self, role, guild_emojis),
                 ephemeral=True,
             )
@@ -6139,7 +6190,7 @@ class ReactionRoleBuilderView(discord.ui.View):
             view=self,
         )
 
-    @discord.ui.button(label="Edit Title / Text", style=discord.ButtonStyle.secondary, emoji="✏️", row=2)
+    @discord.ui.button(label="Edit Title / Style", style=discord.ButtonStyle.secondary, emoji="✏️", row=2)
     async def edit_text_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ReactionRoleEditTextModal(self))
 
@@ -6180,6 +6231,7 @@ class ReactionRoleBuilderView(discord.ui.View):
             items=db_items,
             image_url=self.image_url,
             required_role_ids=self.required_role_ids,
+            color=self.color,
         )
 
         try:
@@ -6192,9 +6244,9 @@ class ReactionRoleBuilderView(discord.ui.View):
             conn.execute(
                 """
                 INSERT OR REPLACE INTO reaction_role_panels (
-                    message_id, channel_id, guild_id, title, description, image_url, required_role_ids
+                    message_id, channel_id, guild_id, title, description, image_url, color, required_role_ids
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sent.id,
@@ -6203,6 +6255,7 @@ class ReactionRoleBuilderView(discord.ui.View):
                     self.title,
                     self.description,
                     self.image_url,
+                    self.color,
                     req_packed,
                 ),
             )
@@ -6290,7 +6343,6 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
             target_role = guild.get_role(target_role_id)
 
             if not is_add:
-                # User removed their reaction -> remove that role
                 if target_role and target_role in member.roles:
                     try:
                         await member.remove_roles(target_role, reason="Reaction role unselected")
@@ -6298,7 +6350,6 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
                         pass
                 return
 
-            # Check if member holds AT LEAST ONE of the required roles (when configured)
             if required_ids:
                 member_role_ids = {r.id for r in member.roles}
                 if not any(rid in member_role_ids for rid in required_ids):
@@ -6313,7 +6364,6 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
                             pass
                     return
 
-            # User added a reaction -> keep ONLY this role and strip all other roles from this panel
             all_panel_role_ids = {rid for _, rid in panel_map.values()}
             roles_to_remove = [
                 r for r in member.roles
@@ -6331,7 +6381,6 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
                 except Exception:
                     pass
 
-            # Remove the user's previous reactions on this message so only the latest reaction stays
             ch = guild.get_channel(payload.channel_id)
             if isinstance(ch, discord.TextChannel):
                 try:
@@ -7437,7 +7486,8 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
         await msg_obj.edit(embed=embed)
 
     await interaction.response.send_message("✅ Event banner image updated!", ephemeral=True)
-    
+
+
 @bot.tree.command(name="reaction_roles", description="Open the visual builder to create an exclusive reaction-role post (no IDs needed!)")
 @app_commands.describe(
     channel="Channel where the reaction-role post will be sent",
@@ -7449,7 +7499,7 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
 async def reaction_roles_cmd(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
-    title: str = "🎭 Choose Your Role",
+    title: str = "Choose Your Role",
     description: str = "",
     image: Optional[discord.Attachment] = None,
 ):
@@ -7498,7 +7548,7 @@ async def reaction_role_add_cmd(
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT title, description, image_url, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
+            "SELECT title, description, image_url, color, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
             (msg_id,),
         )
         panel = c.fetchone()
@@ -7533,7 +7583,7 @@ async def reaction_role_add_cmd(
         all_items = c.fetchall()
         conn.commit()
 
-    req_ids = [int(x) for x in (panel[3] or "").split(",") if x.strip().isdigit()]
+    req_ids = [int(x) for x in (panel[4] or "").split(",") if x.strip().isdigit()]
     target_ch = interaction.guild.get_channel(ch_id)
     if isinstance(target_ch, discord.TextChannel):
         try:
@@ -7545,6 +7595,7 @@ async def reaction_role_add_cmd(
                 items=all_items,
                 image_url=panel[2] or "",
                 required_role_ids=req_ids,
+                color=panel[3] or 0x5865F2,
             )
             await msg_obj.edit(embed=embed)
             await msg_obj.add_reaction(emoji_obj)
@@ -7594,6 +7645,7 @@ class ReactionRoleRequiredView(discord.ui.View):
                     items=self.all_items,
                     image_url=self.panel_tuple[2] or "",
                     required_role_ids=req_ids,
+                    color=self.panel_tuple[3] or 0x5865F2,
                 )
                 await msg_obj.edit(embed=embed)
             except Exception:
@@ -7625,6 +7677,7 @@ class ReactionRoleRequiredView(discord.ui.View):
                     items=self.all_items,
                     image_url=self.panel_tuple[2] or "",
                     required_role_ids=[],
+                    color=self.panel_tuple[3] or 0x5865F2,
                 )
                 await msg_obj.edit(embed=embed)
             except Exception:
@@ -7649,7 +7702,7 @@ async def reaction_role_require_cmd(interaction: discord.Interaction, message: s
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT title, description, image_url, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
+            "SELECT title, description, image_url, color, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
             (msg_id,),
         )
         panel = c.fetchone()
@@ -7664,7 +7717,7 @@ async def reaction_role_require_cmd(interaction: discord.Interaction, message: s
         )
         all_items = c.fetchall()
 
-    cur_ids = [int(x) for x in (panel[3] or "").split(",") if x.strip().isdigit()]
+    cur_ids = [int(x) for x in (panel[4] or "").split(",") if x.strip().isdigit()]
     cur_txt = ", ".join(f"<@&{rid}>" for rid in cur_ids) if cur_ids else "`None (Everyone allowed)`"
     await interaction.response.send_message(
         f"🔒 **Configure Required Roles** (member needs **at least one** of the selected roles to react):\n"
@@ -7702,7 +7755,6 @@ async def stats_cmd(interaction: discord.Interaction):
 # --- Right-Click / Long-Press Context Menus ---
 @bot.tree.context_menu(name="⚖️ Check Trade Value")
 async def ctx_check_trade_value(interaction: discord.Interaction, message: discord.Message):
-    """Right-click / long-press any trade message in chat to calculate unit & partner sign values."""
     if not message.content or not message.content.strip():
         return await interaction.response.send_message(
             "❌ That message has no text to calculate. Use `/calc` to enter items manually.",
@@ -7723,7 +7775,6 @@ async def ctx_check_trade_value(interaction: discord.Interaction, message: disco
         embed = build_trade_comparison_embed(interaction.guild, interaction.user, give_side, get_side)
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
-        # Single-sided list (e.g. "Trading 2x Whatenix Baker, Pharaoh") -> show total value breakdown
         lines = []
         for unit, qty, partner in give_side["matched"]:
             base_min, base_max, base_oc = parse_value_range(unit["value_text"])
@@ -7752,7 +7803,6 @@ async def ctx_check_trade_value(interaction: discord.Interaction, message: disco
 
 @bot.tree.context_menu(name="🔊 Invite to Voice")
 async def ctx_invite_to_voice(interaction: discord.Interaction, member: discord.Member):
-    """Right-click / long-press any user in chat to invite them directly into your private voice room."""
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
     if member.bot or member.id == interaction.user.id:
