@@ -5798,6 +5798,104 @@ async def process_starboard_reaction(payload: discord.RawReactionActionEvent, is
                         ch = guild.get_channel(ideas_ch_id)
                         if isinstance(ch, discord.TextChannel):
                             orig_msg = await ch.fetch_message(orig_id)
+                            star_react = discord.utils.get(orig_msg.reactions, emoji="⭐")
+                            stars = star_react.count if star_react else threshold
+                            showcase_ch = guild.get_channel(showcase_ch_id)
+                            if isinstance(showcase_ch, discord.TextChannel):
+                                sc_msg = await showcase_ch.fetch_message(showcase_msg_id)
+                                await sc_msg.edit(
+                                    embed=build_showcase_embed(orig_msg, stars),
+                                    view=build_showcase_view(orig_msg.jump_url, stars),
+                                )
+                            c.execute(
+                                "UPDATE starboard_entries SET stars_count = ? WHERE orig_message_id = ?",
+                                (stars, orig_id),
+                            )
+                            conn.commit()
+                    except Exception:
+                        pass
+                elif not showcase_msg_id and is_add:
+                    try:
+                        ch = guild.get_channel(ideas_ch_id)
+                        showcase_ch = guild.get_channel(showcase_ch_id)
+                        if isinstance(ch, discord.TextChannel) and isinstance(showcase_ch, discord.TextChannel):
+                            orig_msg = await ch.fetch_message(orig_id)
+                            star_react = discord.utils.get(orig_msg.reactions, emoji="⭐")
+                            stars = star_react.count if star_react else 0
+                            if stars >= threshold:
+                                sent = await showcase_ch.send(
+                                    embed=build_showcase_embed(orig_msg, stars),
+                                    view=build_showcase_view(orig_msg.jump_url, stars),
+                                )
+                                c.execute(
+                                    """
+                                    INSERT OR REPLACE INTO starboard_entries
+                                    (orig_message_id, showcase_message_id, guild_id, channel_id, stars_count)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    """,
+                                    (orig_id, sent.id, guild.id, ideas_ch_id, stars),
+                                )
+                                conn.commit()
+                    except Exception:
+                        pass
+
+
+REACTION_ROLE_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def resolve_emoji_from_raw(guild: discord.Guild, raw: str) -> Optional[Any]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    m = re.match(r"^<a?:([a-zA-Z0-9_]+):(\d+)>$", raw)
+    if m:
+        em = guild.get_emoji(int(m.group(2))) or bot.get_emoji(int(m.group(2)))
+        return em or discord.PartialEmoji(name=m.group(1), id=int(m.group(2)), animated=raw.startswith("<a:"))
+    name_clean = raw.strip(":")
+    for em in guild.emojis:
+        if em.name.lower() == name_clean.lower():
+            return em
+    return raw
+
+
+def normalize_reaction_emoji_key(emoji: Any) -> str:
+    em_id = getattr(emoji, "id", None)
+    if em_id:
+        return f"id:{em_id}"
+    return f"str:{str(emoji)}"
+
+
+def build_reaction_role_embed(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    items: List[Tuple[str, str, int, str]],
+    image_url: str = "",
+    required_role_ids: Optional[List[int]] = None,
+) -> discord.Embed:
+    lines: List[str] = []
+    if description:
+        lines.append(description)
+    if items:
+        opts = []
+        for _, e_raw, rid, label in items:
+            suffix = f" — {label}" if label else ""
+            opts.append(f"{e_raw} ➔ <@&{rid}>{suffix}")
+        lines.append("\n".join(opts))
+    if required_role_ids:
+        req_str = ", ".join(f"<@&{rid}>" for rid in required_role_ids)
+        lines.append(f"\n🔒 **Required Role:** {req_str}")
+
+    embed = discord.Embed(
+        title=title or "🎭 Choose Your Role",
+        description="\n\n".join(lines),
+        color=0x5865F2,
+    )
+    if image_url and image_url.startswith(("http://", "https://")):
+        embed.set_image(url=image_url)
+    embed.set_footer(text=guild.name, icon_url=guild.icon.url if guild.icon else None)
+    return embed
+    
 class ReactionRoleAddOptionModal(discord.ui.Modal, title="Bind Emoji to Selected Role"):
     emoji_input = discord.ui.TextInput(
         label="Emoji (Custom :name: or Standard Emoji)",
@@ -7334,6 +7432,12 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
             start_ts=ev[3],
             followers_count=f_count,
             image_url=image.url,
+            started=bool(ev[4]),
+        )
+        await msg_obj.edit(embed=embed)
+
+    await interaction.response.send_message("✅ Event banner image updated!", ephemeral=True)
+    
 @bot.tree.command(name="reaction_roles", description="Open the visual builder to create an exclusive reaction-role post (no IDs needed!)")
 @app_commands.describe(
     channel="Channel where the reaction-role post will be sent",
