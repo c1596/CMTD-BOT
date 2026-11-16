@@ -6253,6 +6253,312 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
         finally:
             if len(REACTION_ROLE_LOCKS) > 2000:
                 REACTION_ROLE_LOCKS.clear()
+
+
+# -------------------------------------------------------------
+# 14. Admin Control Panel (/panel) & Setup Views
+# -------------------------------------------------------------
+class ValueUrlModal(discord.ui.Modal, title="Set Official Value List URL"):
+    url_input = discord.ui.TextInput(
+        label="Value List Website URL",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=300,
+        placeholder="https://cameraman-td.vaultedvaluesx.com/value-list",
+    )
+
+    def __init__(self, guild_id: int, current_url: str):
+        super().__init__()
+        self.guild_id = guild_id
+        self.url_input.default = current_url
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_url = self.url_input.value.strip()
+        if not raw_url.startswith(("http://", "https://")):
+            return await interaction.response.send_message(
+                "❌ URL must start with `http://` or `https://`.",
+                ephemeral=True,
+            )
+        update_guild_settings(self.guild_id, value_list_url=raw_url)
+        await interaction.response.defer(ephemeral=True)
+        checked, changed = await sync_value_list_from_website(raw_url)
+        await interaction.followup.send(
+            f"✅ Value List URL updated to `{raw_url}` and synced (**{checked}** units checked, **{changed}** updated)!",
+            ephemeral=True,
+        )
+
+
+class ValueSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📊 Select Value Changes Channel...",
+        row=0,
+    )
+    async def select_val_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        update_guild_settings(self.guild_id, value_channel_id=select.values[0].id)
+        await interaction.response.edit_message(
+            content=f"✅ Value Changes channel set to <#{select.values[0].id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="✍️ Select Signs Value Channel (Auto-Scans History)...",
+        row=1,
+    )
+    async def select_signs_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        ch_id = select.values[0].id
+        update_guild_settings(self.guild_id, signs_channel_id=ch_id)
+        await interaction.response.defer(ephemeral=True)
+        ch_obj = interaction.guild.get_channel(ch_id) if interaction.guild else None
+        scanned_msgs, synced_partners = (0, 0)
+        if isinstance(ch_obj, discord.TextChannel):
+            scanned_msgs, synced_partners = await scan_signs_channel_history(ch_obj)
+        await interaction.followup.send(
+            f"✅ Signs Value channel set to <#{ch_id}>!\n"
+            f"• Scanned **{scanned_msgs}** messages from history and updated **{synced_partners}** partner(s) (`{len(SIGN_PARTNERS_CACHE)}` total in DB).\n"
+            f"• New and edited posts in <#{ch_id}> will now auto-update sign percentages automatically!",
+            ephemeral=True,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🏷️ Select Value Changes Ping Role...",
+        row=2,
+    )
+    async def select_val_ping(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        update_guild_settings(self.guild_id, value_ping_role_id=select.values[0].id)
+        await interaction.response.edit_message(
+            content=f"✅ Value Changes ping role set to <@&{select.values[0].id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🛡️ Select Roles Allowed to Edit Values & Signs (Multi)...",
+        min_values=1,
+        max_values=10,
+        row=3,
+    )
+    async def select_val_managers(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        role_ids = [str(r.id) for r in select.values if not r.is_default()]
+        update_guild_settings(self.guild_id, value_manager_role_ids=",".join(role_ids))
+        mentions = ", ".join(f"<@&{rid}>" for rid in role_ids) if role_ids else "`Default (Manage Messages)`"
+        await interaction.response.edit_message(
+            content=f"✅ Allowed Value & Sign Team roles updated: {mentions}",
+            view=self,
+        )
+
+    @discord.ui.button(label="Post Value & Sign Hub", style=discord.ButtonStyle.success, emoji="📌", row=4)
+    async def post_hub_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        s = get_guild_settings(self.guild_id)
+        site_url = s["value_list_url"]
+        embed = discord.Embed(
+            title="💎 Official CMTD Value List, Signs & Trade Hub",
+            description=(
+                "Check live unit values, partner sign multipliers, and calculate trades without leaving Discord!\n\n"
+                "• **🔍 Check Unit Value** — Look up any unit or signed variant (e.g. `Whatenix Baker`, `UTTV`).\n"
+                "• **⚖️ Trade Calculator** — Compare **You Give** vs. **You Get** with live partner sign multipliers.\n"
+                "• **✍️ Sign Partners** — View all tracked partner sign percentages (`Whatenix`, `Meddyson`, `vivlos`, etc.).\n"
+                "• **🏆 Top Values / 📈 Recent Changes** — View top units & latest price/sign updates."
+            ),
+            color=0x3498DB,
+        )
+        embed.set_footer(
+            text=f"{interaction.guild.name} • {len(VALUE_ITEMS_CACHE)} Units • {len(SIGN_PARTNERS_CACHE)} Sign Partners",
+            icon_url=interaction.guild.icon.url if interaction.guild.icon else None,
+        )
+        sent = await interaction.channel.send(embed=embed, view=ValueHubView(site_url))
+        await interaction.response.send_message(
+            f"✅ Value & Sign Hub posted in {interaction.channel.mention}! [Jump to Hub]({sent.jump_url})",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Sync Web + Signs", style=discord.ButtonStyle.primary, emoji="🔄", row=4)
+    async def sync_now_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_guild_settings(self.guild_id)
+        await interaction.response.defer(ephemeral=True)
+        checked, changed = await sync_value_list_from_website(s["value_list_url"])
+        signs_note = ""
+        if s.get("signs_channel_id") and interaction.guild:
+            sch = interaction.guild.get_channel(s["signs_channel_id"])
+            if isinstance(sch, discord.TextChannel):
+                sc_msgs, sc_partners = await scan_signs_channel_history(sch)
+                signs_note = f"\n• **Signs Channel:** scanned `{sc_msgs}` messages, synced `{sc_partners}` partner(s)."
+        await interaction.followup.send(
+            f"🔄 **Sync Complete!**\n"
+            f"• **Website:** checked `{checked}` items, updated `{changed}` (`{len(VALUE_ITEMS_CACHE)}` total cached).{signs_note}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Set Website URL", style=discord.ButtonStyle.secondary, emoji="🌐", row=4)
+    async def set_url_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_guild_settings(self.guild_id)
+        await interaction.response.send_modal(ValueUrlModal(self.guild_id, s["value_list_url"]))
+
+
+class TempVoiceSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.voice],
+        placeholder="🔊 Select Join-to-Create Voice Channel...",
+        row=0,
+    )
+    async def select_jtc(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        vc_id = select.values[0].id
+        update_guild_settings(self.guild_id, jtc_channel_id=vc_id)
+        await interaction.response.edit_message(
+            content=f"✅ Join-to-Create channel set to <#{vc_id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📣 Select LFG Channel #1 (for Find Squad)...",
+        row=1,
+    )
+    async def select_lfg_1(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        ch_id = select.values[0].id
+        update_guild_settings(self.guild_id, lfg_channel_1_id=ch_id)
+        await interaction.response.edit_message(
+            content=f"✅ LFG Channel #1 set to <#{ch_id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📣 Select LFG Channel #2 (Optional second LFG)...",
+        row=2,
+    )
+    async def select_lfg_2(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        ch_id = select.values[0].id
+        update_guild_settings(self.guild_id, lfg_channel_2_id=ch_id)
+        await interaction.response.edit_message(
+            content=f"✅ LFG Channel #2 set to <#{ch_id}>.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Clear LFG #2", style=discord.ButtonStyle.secondary, emoji="🧹", row=3)
+    async def clear_lfg_2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, lfg_channel_2_id=None)
+        await interaction.response.edit_message(
+            content="🧹 LFG Channel #2 cleared.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Disable Temp Voice", style=discord.ButtonStyle.danger, emoji="🗑️", row=3)
+    async def disable_jtc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_guild_settings(self.guild_id, jtc_channel_id=None)
+        await interaction.response.edit_message(
+            content="⚪ Temporary Voice Rooms disabled.",
+            view=self,
+        )
+
+
+class AntiScamSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="📜 Select Security Log Channel...",
+        row=0,
+    )
+    async def select_log_ch(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        update_guild_settings(self.guild_id, antiscam_log_channel_id=select.values[0].id)
+        await interaction.response.edit_message(
+            content=f"✅ Anti-Scam log channel set to <#{select.values[0].id}>.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        placeholder="⏱️ Select Scammer Auto-Timeout Duration...",
+        options=[
+            discord.SelectOption(label="Delete Message Only (No Timeout)", value="0"),
+            discord.SelectOption(label="10 Minutes Timeout", value="10"),
+            discord.SelectOption(label="1 Hour Timeout (Recommended)", value="60"),
+            discord.SelectOption(label="24 Hours Timeout", value="1440"),
+        ],
+        row=1,
+    )
+    async def select_timeout_dur(self, interaction: discord.Interaction, select: discord.ui.Select):
+        mins = int(select.values[0])
+        update_guild_settings(self.guild_id, antiscam_timeout_mins=mins)
+        desc = "Delete only" if mins == 0 else f"{mins} minutes"
+        await interaction.response.edit_message(
+            content=f"✅ Auto-timeout duration set to **{desc}**.",
+            view=self,
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🏷️ Select Clan Tag Reward Role (Opt-In)...",
+        row=2,
+    )
+    async def select_clan_tag_role(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        update_guild_settings(self.guild_id, clan_tag_role_id=select.values[0].id)
+        await interaction.response.edit_message(
+            content=f"✅ Server Clan Tag reward role set to <@&{select.values[0].id}>.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Toggle Anti-Scam", style=discord.ButtonStyle.primary, emoji="🛡️", row=3)
+    async def toggle_shield_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_guild_settings(self.guild_id)
+        new_state = not s["antiscam_enabled"]
+        update_guild_settings(self.guild_id, antiscam_enabled=new_state)
+        state_word = "ENABLED 🟢" if new_state else "DISABLED ⚪"
+        await interaction.response.edit_message(
+            content=f"🛡️ Anti-Scam Phishing Shield is now **{state_word}**.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Toggle Clan Tag Role", style=discord.ButtonStyle.secondary, emoji="🏷️", row=3)
+    async def toggle_clan_tag_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = get_guild_settings(self.guild_id)
+        new_state = not s.get("clan_tag_enabled", False)
+        if new_state and not s.get("clan_tag_role_id"):
+            return await interaction.response.send_message(
+                "❌ Select a **Clan Tag Reward Role** in the dropdown above first!",
+                ephemeral=True,
+            )
+        update_guild_settings(self.guild_id, clan_tag_enabled=new_state)
+        state_word = "ENABLED 🟢" if new_state else "DISABLED ⚪"
+        await interaction.response.edit_message(
+            content=f"🏷️ Server Clan Tag Auto-Role is now **{state_word}**.",
+            view=self,
+        )
+
+
+class LockdownSetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[
+            discord.ChannelType.text,
+            discord.ChannelType.voice,
+            discord.ChannelType.category,
+            discord.ChannelType.forum,
+            discord.ChannelType.stage_voice,
         ],
         placeholder="📋 Toggle Channel or Category in Lockdown Whitelist...",
         row=0,
