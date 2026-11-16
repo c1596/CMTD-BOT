@@ -470,12 +470,7 @@ def init_db():
         )
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_starboard_showcase ON starboard_entries(showcase_message_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_polls_active ON polls(is_closed, ends_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_events_active ON scheduled_events(started, start_ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_value_history_ts ON value_history(changed_at DESC)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_lfg_vc ON lfg_posts(voice_channel_id)")
-
-        # Exclusive Reaction Roles (Last-Clicked Wins)
+        # Exclusive Reaction Roles (Last-Clicked Wins + Optional Required Roles)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS reaction_role_panels (
@@ -485,10 +480,16 @@ def init_db():
                 title TEXT,
                 description TEXT,
                 image_url TEXT,
-                color INTEGER DEFAULT 5793266
+                color INTEGER DEFAULT 5793266,
+                required_role_ids TEXT DEFAULT ''
             )
             """
         )
+        c.execute("PRAGMA table_info(reaction_role_panels)")
+        rr_cols = {row[1] for row in c.fetchall()}
+        if "required_role_ids" not in rr_cols:
+            c.execute("ALTER TABLE reaction_role_panels ADD COLUMN required_role_ids TEXT DEFAULT ''")
+
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS reaction_role_items (
@@ -5916,6 +5917,7 @@ def build_reaction_role_embed(
     description: str,
     items: List[Tuple[str, str, int, str]],
     image_url: str = "",
+    required_role_ids: Optional[List[int]] = None,
 ) -> discord.Embed:
     lines: List[str] = []
     if description.strip():
@@ -5925,6 +5927,10 @@ def build_reaction_role_embed(
     for _, emoji_raw, role_id, label in items:
         label_part = f" — *{label}*" if label.strip() else ""
         lines.append(f"{emoji_raw} ➔ <@&{role_id}>{label_part}")
+
+    if required_role_ids:
+        req_mentions = ", ".join(f"<@&{rid}>" for rid in required_role_ids)
+        lines.append(f"\n🔒 **Required Role (at least one):** {req_mentions}")
 
     lines.append("\n-# 💡 You can hold **only 1 role** from this list at a time — clicking a new reaction automatically replaces your previous choice.")
 
@@ -5965,11 +5971,20 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
         max_length=2000,
         placeholder=":w1_win: | 123456789012345678 | Updates Ping\n🔥 | @EventPing | Event Alerts",
     )
+    req_roles_input = discord.ui.TextInput(
+        label="Required Roles (Any 1 needed, IDs/@names)",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=300,
+        placeholder="Optional: 123456789012345678, Booster, Verified",
+    )
 
-    def __init__(self, target_channel: discord.TextChannel, image_url: str = ""):
+    def __init__(self, target_channel: discord.TextChannel, image_url: str = "", preselected_req_ids: Optional[List[int]] = None):
         super().__init__()
         self.target_channel = target_channel
         self.image_url = image_url
+        if preselected_req_ids:
+            self.req_roles_input.default = ", ".join(str(rid) for rid in preselected_req_ids)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
@@ -5979,6 +5994,29 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
         parsed_items: List[Tuple[str, str, int, str, Any]] = []
         seen_keys: Set[str] = set()
         errors: List[str] = []
+
+        # Parse optional required roles (member needs AT LEAST ONE of these)
+        req_role_ids: List[int] = []
+        raw_req = self.req_roles_input.value.strip()
+        if raw_req:
+            for token in re.split(r"[,;\n]+", raw_req):
+                t = token.strip()
+                if not t:
+                    continue
+                r_obj: Optional[discord.Role] = None
+                id_m = re.search(r"(\d{15,22})", t)
+                if id_m:
+                    r_obj = guild.get_role(int(id_m.group(1)))
+                if not r_obj:
+                    clean_n = t.lstrip("@").strip().lower()
+                    for r in guild.roles:
+                        if not r.is_default() and r.name.lower() == clean_n:
+                            r_obj = r
+                            break
+                if not r_obj:
+                    errors.append(f"Required role `{t}` not found (use Role ID or exact name).")
+                elif r_obj.id not in req_role_ids:
+                    req_role_ids.append(r_obj.id)
 
         for idx, raw_line in enumerate(self.mappings_input.value.splitlines(), start=1):
             line = raw_line.strip()
@@ -6044,6 +6082,7 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
             description=self.desc_input.value,
             items=db_items,
             image_url=self.image_url,
+            required_role_ids=req_role_ids,
         )
 
         try:
@@ -6051,13 +6090,14 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
         except Exception as e:
             return await interaction.followup.send(f"❌ Failed to send message: `{e}`", ephemeral=True)
 
+        req_packed = ",".join(str(rid) for rid in req_role_ids)
         with get_db() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO reaction_role_panels (
-                    message_id, channel_id, guild_id, title, description, image_url
+                    message_id, channel_id, guild_id, title, description, image_url, required_role_ids
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sent.id,
@@ -6066,6 +6106,7 @@ class ReactionRolePostModal(discord.ui.Modal, title="Create Reaction Role Post")
                     self.title_input.value.strip(),
                     self.desc_input.value.strip(),
                     self.image_url,
+                    req_packed,
                 ),
             )
             conn.executemany(
@@ -6108,6 +6149,13 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
+            "SELECT required_role_ids FROM reaction_role_panels WHERE message_id = ?",
+            (payload.message_id,),
+        )
+        panel_row = c.fetchone()
+        if not panel_row:
+            return
+        c.execute(
             "SELECT emoji_key, emoji_raw, role_id FROM reaction_role_items WHERE message_id = ?",
             (payload.message_id,),
         )
@@ -6133,6 +6181,9 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
     if clicked_key not in panel_map:
         return
 
+    raw_req_ids = panel_row[0] or ""
+    required_ids = [int(x) for x in raw_req_ids.split(",") if x.strip().isdigit()]
+
     lock_key = (payload.message_id, member.id)
     user_lock = REACTION_ROLE_LOCKS.setdefault(lock_key, asyncio.Lock())
     async with user_lock:
@@ -6148,6 +6199,21 @@ async def process_reaction_role_event(payload: discord.RawReactionActionEvent, i
                     except Exception:
                         pass
                 return
+
+            # Check if member holds AT LEAST ONE of the required roles (when configured)
+            if required_ids:
+                member_role_ids = {r.id for r in member.roles}
+                if not any(rid in member_role_ids for rid in required_ids):
+                    ch = guild.get_channel(payload.channel_id)
+                    if isinstance(ch, discord.TextChannel):
+                        try:
+                            msg = await ch.fetch_message(payload.message_id)
+                            em_obj = resolve_emoji_from_raw(guild, panel_map[clicked_key][0])
+                            if em_obj:
+                                await msg.remove_reaction(em_obj, member)
+                        except Exception:
+                            pass
+                    return
 
             # User added a reaction -> keep ONLY this role and strip all other roles from this panel
             all_panel_role_ids = {rid for _, rid in panel_map.values()}
@@ -6972,17 +7038,28 @@ async def event_image_cmd(interaction: discord.Interaction, message: str, image:
 @app_commands.describe(
     channel="Channel where the reaction-role post will be sent",
     image="Optional banner image for the post",
+    required_role_1="Optional required role #1 (user needs at least one of the required roles)",
+    required_role_2="Optional required role #2 (user needs at least one of the required roles)",
+    required_role_3="Optional required role #3 (user needs at least one of the required roles)",
 )
 @app_commands.default_permissions(manage_roles=True)
 async def reaction_roles_cmd(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     image: Optional[discord.Attachment] = None,
+    required_role_1: Optional[discord.Role] = None,
+    required_role_2: Optional[discord.Role] = None,
+    required_role_3: Optional[discord.Role] = None,
 ):
+    pre_ids: List[int] = []
+    for r in (required_role_1, required_role_2, required_role_3):
+        if r and r.id not in pre_ids:
+            pre_ids.append(r.id)
     await interaction.response.send_modal(
         ReactionRolePostModal(
             target_channel=channel,
             image_url=image.url if image else "",
+            preselected_req_ids=pre_ids,
         )
     )
 
@@ -7011,7 +7088,7 @@ async def reaction_role_add_cmd(
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
-            "SELECT title, description, image_url FROM reaction_role_panels WHERE message_id = ?",
+            "SELECT title, description, image_url, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
             (msg_id,),
         )
         panel = c.fetchone()
@@ -7046,6 +7123,7 @@ async def reaction_role_add_cmd(
         all_items = c.fetchall()
         conn.commit()
 
+    req_ids = [int(x) for x in (panel[3] or "").split(",") if x.strip().isdigit()]
     target_ch = interaction.guild.get_channel(ch_id)
     if isinstance(target_ch, discord.TextChannel):
         try:
@@ -7056,6 +7134,7 @@ async def reaction_role_add_cmd(
                 description=panel[1] or "",
                 items=all_items,
                 image_url=panel[2] or "",
+                required_role_ids=req_ids,
             )
             await msg_obj.edit(embed=embed)
             await msg_obj.add_reaction(emoji_obj)
@@ -7064,6 +7143,123 @@ async def reaction_role_add_cmd(
 
     await interaction.response.send_message(
         f"✅ Bound {e_raw} ➔ {role.mention} on the reaction-role post!",
+        ephemeral=True,
+    )
+
+
+class ReactionRoleRequiredView(discord.ui.View):
+    def __init__(self, message_id: int, channel_id: int, guild: discord.Guild, panel_tuple: tuple, all_items: list):
+        super().__init__(timeout=120)
+        self.message_id = message_id
+        self.channel_id = channel_id
+        self.guild = guild
+        self.panel_tuple = panel_tuple
+        self.all_items = all_items
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="🔒 Select required roles (user needs AT LEAST ONE)...",
+        min_values=1,
+        max_values=10,
+        row=0,
+    )
+    async def select_req_roles(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        req_ids = [r.id for r in select.values if not r.is_default()]
+        packed = ",".join(str(rid) for rid in req_ids)
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE reaction_role_panels SET required_role_ids = ? WHERE message_id = ?",
+                (packed, self.message_id),
+            )
+            conn.commit()
+
+        target_ch = self.guild.get_channel(self.channel_id)
+        if isinstance(target_ch, discord.TextChannel):
+            try:
+                msg_obj = await target_ch.fetch_message(self.message_id)
+                embed = build_reaction_role_embed(
+                    guild=self.guild,
+                    title=self.panel_tuple[0],
+                    description=self.panel_tuple[1] or "",
+                    items=self.all_items,
+                    image_url=self.panel_tuple[2] or "",
+                    required_role_ids=req_ids,
+                )
+                await msg_obj.edit(embed=embed)
+            except Exception:
+                pass
+
+        mentions = ", ".join(f"<@&{rid}>" for rid in req_ids) if req_ids else "`None`"
+        await interaction.response.edit_message(
+            content=f"✅ Updated required roles (any 1 needed): {mentions}",
+            view=None,
+        )
+
+    @discord.ui.button(label="Clear Requirement (Allow Everyone)", style=discord.ButtonStyle.secondary, emoji="🔓", row=1)
+    async def clear_req_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE reaction_role_panels SET required_role_ids = '' WHERE message_id = ?",
+                (self.message_id,),
+            )
+            conn.commit()
+
+        target_ch = self.guild.get_channel(self.channel_id)
+        if isinstance(target_ch, discord.TextChannel):
+            try:
+                msg_obj = await target_ch.fetch_message(self.message_id)
+                embed = build_reaction_role_embed(
+                    guild=self.guild,
+                    title=self.panel_tuple[0],
+                    description=self.panel_tuple[1] or "",
+                    items=self.all_items,
+                    image_url=self.panel_tuple[2] or "",
+                    required_role_ids=[],
+                )
+                await msg_obj.edit(embed=embed)
+            except Exception:
+                pass
+
+        await interaction.response.edit_message(
+            content="🔓 Required role restriction cleared — anyone can now claim roles from this post.",
+            view=None,
+        )
+
+
+@bot.tree.command(name="reaction_role_require", description="Set or clear required roles (at least 1 needed) for a reaction-role post")
+@app_commands.describe(message="Message ID or link of the reaction-role post")
+@app_commands.default_permissions(manage_roles=True)
+async def reaction_role_require_cmd(interaction: discord.Interaction, message: str):
+    if not interaction.guild or not interaction.channel:
+        return
+    ch_id, msg_id = parse_message_reference(message, interaction.channel.id)
+    if not ch_id or not msg_id:
+        return await interaction.response.send_message("❌ Invalid Message ID or Link.", ephemeral=True)
+
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT title, description, image_url, required_role_ids FROM reaction_role_panels WHERE message_id = ?",
+            (msg_id,),
+        )
+        panel = c.fetchone()
+        if not panel:
+            return await interaction.response.send_message(
+                "❌ That message is not a reaction-role post created with `/reaction_roles`.",
+                ephemeral=True,
+            )
+        c.execute(
+            "SELECT emoji_key, emoji_raw, role_id, label FROM reaction_role_items WHERE message_id = ?",
+            (msg_id,),
+        )
+        all_items = c.fetchall()
+
+    cur_ids = [int(x) for x in (panel[3] or "").split(",") if x.strip().isdigit()]
+    cur_txt = ", ".join(f"<@&{rid}>" for rid in cur_ids) if cur_ids else "`None (Everyone allowed)`"
+    await interaction.response.send_message(
+        f"🔒 **Configure Required Roles** (member needs **at least one** of the selected roles to react):\n"
+        f"**Current:** {cur_txt}",
+        view=ReactionRoleRequiredView(msg_id, ch_id, interaction.guild, panel, all_items),
         ephemeral=True,
     )
 
